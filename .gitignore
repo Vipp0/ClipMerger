@@ -1,0 +1,6 @@
+venv/
+build/
+dist/
+test_output/
+__pycache__/
+*.pyc
