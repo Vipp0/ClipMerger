@@ -12,6 +12,11 @@ Applicazione desktop per Windows che unisce automaticamente una **sigla iniziale
 - **Ottimizzazione per cartoni animati** (`tune animation`, solo codifica software H.264/H.265).
 - Gestione di **tracce audio multiple** e **sottotitoli** dell'episodio, mantenuti sincronizzati nel file finale.
 - **Verifica di integrità** automatica dell'output (controllo durata) al termine di ogni file.
+- **Codifica a 2 passaggi** (bitrate medio) per software H.264/H.265/AV1: stesso bitrate target, qualità distribuita meglio tra le scene.
+- **Tempo rimanente stimato**, per singolo file e per l'intero batch.
+- **Riepilogo di controllo** (durate, risoluzioni, avvisi) prima di avviare il batch, con possibilità di annullare.
+- **Dettaglio errore consultabile**: doppio click su una riga in coda per vedere lo stato/errore completo.
+- **Controllo aggiornamenti** automatico rispetto all'ultima release GitHub.
 - Elaborazioni **parallele** configurabili, con possibilità di annullare il batch in corso.
 - Tema **chiaro / scuro / automatico** (segue le impostazioni di Windows).
 
@@ -37,6 +42,11 @@ build.bat
 ```
 
 Produce l'eseguibile in `dist\ClipMerger\ClipMerger.exe` (modalità PyInstaller `--onedir`: eseguibile + cartella `_internal` con le dipendenze, da tenere insieme).
+
+## Roadmap (idee per versioni future)
+
+- Preset di codifica salvabili/richiamabili, in stile HandBrake (al posto del semplice "ricorda le ultime impostazioni").
+- Preset più veloce dedicato al primo passaggio della codifica a 2 passaggi, per ridurre il tempo totale (oggi entrambi i passaggi usano lo stesso preset, quindi il 2-pass costa quasi il doppio del tempo di un singolo passaggio).
 
 ## Struttura del progetto
 
