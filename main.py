@@ -4,8 +4,11 @@ Avvio: python main.py
 """
 from __future__ import annotations
 
+import json
 import sys
 import threading
+import time
+import urllib.request
 from pathlib import Path
 
 from PySide6.QtCore import Qt, QObject, Signal, QRunnable, QThreadPool, QThread, QSettings
@@ -23,6 +26,9 @@ import merger
 from merger import MergeSettings, MergeResult
 
 APP_TITLE = "ClipMerger"
+APP_VERSION = "0.1.0"
+GITHUB_LATEST_RELEASE_API = "https://api.github.com/repos/Vipp0/ClipMerger/releases/latest"
+GITHUB_RELEASES_PAGE = "https://github.com/Vipp0/ClipMerger/releases/latest"
 
 PRESET_LABELS = [("Veloce", "fast"), ("Bilanciato", "medium"), ("Qualità", "slow")]
 CODEC_LABELS = [("H.264", "h264"), ("H.265 (HEVC)", "h265"), ("AV1", "av1")]
@@ -262,6 +268,26 @@ class HwDetectWorker(QThread):
         self.done.emit(result)
 
 
+class UpdateCheckWorker(QThread):
+    """Queries the GitHub API for the latest release tag. Never raises: any
+    network/parsing failure just results in an empty string (silently ignored)."""
+
+    checked = Signal(str)
+
+    def run(self):
+        tag = ""
+        try:
+            req = urllib.request.Request(
+                GITHUB_LATEST_RELEASE_API, headers={"User-Agent": "ClipMerger"},
+            )
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+            tag = data.get("tag_name", "") or ""
+        except Exception:
+            tag = ""
+        self.checked.emit(tag)
+
+
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -304,6 +330,10 @@ class MainWindow(QMainWindow):
             self.hw_thread.done.connect(self._on_hw_detected)
             self.hw_thread.start()
 
+        self.update_thread = UpdateCheckWorker()
+        self.update_thread.checked.connect(self._on_update_checked)
+        self.update_thread.start()
+
     # ---------------------------------------------------------------- UI build
     def _build_ui(self):
         central = QWidget()
@@ -313,6 +343,12 @@ class MainWindow(QMainWindow):
 
         # Theme toggle: single minimal button, cycles auto -> light -> dark -> auto...
         theme_row = QHBoxLayout()
+
+        self.update_label = QLabel("")
+        self.update_label.setOpenExternalLinks(True)
+        self.update_label.hide()
+        theme_row.addWidget(self.update_label)
+
         theme_row.addStretch(1)
 
         self.theme_toggle_btn = QToolButton()
@@ -444,11 +480,17 @@ class MainWindow(QMainWindow):
         self.tune_check = QCheckBox("Ottimizza per cartoni animati (tune animation, solo codifica software H.264/H.265)")
         enc_grid.addWidget(self.tune_check, 3, 0, 1, 4)
 
+        self.two_pass_check = QCheckBox(
+            "Codifica a 2 passaggi (qualità migliore a parità di dimensione, più lento — solo software, bitrate costante/originale)"
+        )
+        enc_grid.addWidget(self.two_pass_check, 4, 0, 1, 4)
+
         enc_box = QGroupBox("Codifica")
         enc_box.setLayout(enc_grid)
         root.addWidget(enc_box)
 
         self._update_tune_checkbox()
+        self._update_two_pass_checkbox()
 
         # Queue table
         self.table = DropTableWidget()
@@ -459,6 +501,9 @@ class MainWindow(QMainWindow):
         self.global_progress = QProgressBar()
         self.global_progress.setRange(0, 100)
         bottom.addWidget(self.global_progress, stretch=1)
+
+        self.eta_label = QLabel("")
+        bottom.addWidget(self.eta_label)
 
         self.summary_label = QLabel("")
         bottom.addWidget(self.summary_label)
@@ -487,8 +532,12 @@ class MainWindow(QMainWindow):
         self.outro_edit.file_dropped.connect(self.outro_edit.setText)
         self.codec_combo.currentIndexChanged.connect(self._update_gpu_checkbox)
         self.codec_combo.currentIndexChanged.connect(self._update_tune_checkbox)
+        self.codec_combo.currentIndexChanged.connect(self._update_two_pass_checkbox)
         self.gpu_check.toggled.connect(self._update_tune_checkbox)
+        self.gpu_check.toggled.connect(self._update_two_pass_checkbox)
         self.bitrate_group.idClicked.connect(self.bitrate_stack.setCurrentIndex)
+        self.bitrate_group.idClicked.connect(self._update_two_pass_checkbox)
+        self.table.cellDoubleClicked.connect(self._show_row_detail)
         self.start_btn.clicked.connect(self._start_batch)
         self.cancel_btn.clicked.connect(self._cancel_batch)
         self.reset_btn.clicked.connect(self._reset_all)
@@ -540,6 +589,16 @@ class MainWindow(QMainWindow):
         self.hw_encoders = result
         self._update_gpu_checkbox()
 
+    def _on_update_checked(self, latest_tag: str):
+        if not latest_tag:
+            return
+        latest = latest_tag.lstrip("vV")
+        if latest and latest != APP_VERSION:
+            self.update_label.setText(
+                f'<a href="{GITHUB_RELEASES_PAGE}">Nuova versione disponibile: {latest_tag}</a>'
+            )
+            self.update_label.show()
+
     def _update_gpu_checkbox(self):
         if not hasattr(self, "hw_thread"):
             return
@@ -555,6 +614,7 @@ class MainWindow(QMainWindow):
             self.gpu_check.setChecked(False)
             self.gpu_check.setText("Usa GPU se disponibile (nessun encoder hardware rilevato)")
         self._update_tune_checkbox()
+        self._update_two_pass_checkbox()
 
     def _update_tune_checkbox(self):
         if not hasattr(self, "tune_check"):
@@ -564,6 +624,15 @@ class MainWindow(QMainWindow):
         self.tune_check.setEnabled(eligible)
         if not eligible:
             self.tune_check.setChecked(False)
+
+    def _update_two_pass_checkbox(self):
+        if not hasattr(self, "two_pass_check"):
+            return
+        using_hw = self.gpu_check.isChecked() and self.gpu_check.isEnabled()
+        eligible = (not using_hw) and not self.crf_radio.isChecked()
+        self.two_pass_check.setEnabled(eligible)
+        if not eligible:
+            self.two_pass_check.setChecked(False)
 
     def _browse_folder(self):
         folder = QFileDialog.getExistingDirectory(self, "Seleziona cartella puntate")
@@ -610,7 +679,7 @@ class MainWindow(QMainWindow):
         bar.setRange(0, 100)
         bar.setValue(0)
         self.table.setCellWidget(row, COL_PROGRESS, bar)
-        self.rows.append({"path": path, "output": None})
+        self.rows.append({"path": path, "output": None, "last_status": "In coda"})
 
     def _browse_file(self, target: DropLineEdit):
         path, _ = QFileDialog.getOpenFileName(self, "Seleziona video", "", "Video (*.*)")
@@ -624,10 +693,19 @@ class MainWindow(QMainWindow):
 
     def _set_row_status(self, row: int, status: str):
         self.table.item(row, COL_STATUS).setText(status)
+        if row < len(self.rows):
+            self.rows[row]["last_status"] = status
 
     def _set_row_progress(self, row: int, pct: float):
         bar: QProgressBar = self.table.cellWidget(row, COL_PROGRESS)
         bar.setValue(int(pct * 100))
+
+    def _show_row_detail(self, row: int, _column: int):
+        if row >= len(self.rows):
+            return
+        name = self.rows[row]["path"].name
+        status = self.rows[row].get("last_status", "")
+        QMessageBox.information(self, name, status or "Nessun dettaglio disponibile.")
 
     # ---------------------------------------------------------------- batch run
     def _validate(self) -> str | None:
@@ -641,10 +719,61 @@ class MainWindow(QMainWindow):
             return "Seleziona la cartella di output."
         return None
 
+    def _build_preflight_summary(self) -> tuple[str, str]:
+        ffprobe = self.ffmpeg_status.ffprobe_path
+        lines = [f"Episodi in coda: {len(self.rows)}"]
+        warnings = []
+
+        try:
+            intro = merger.probe(ffprobe, Path(self.intro_edit.text()))
+            outro = merger.probe(ffprobe, Path(self.outro_edit.text()))
+            lines.append(
+                f"Sigla iniziale: {utils.format_duration(intro.duration)}  ·  "
+                f"Sigla finale: {utils.format_duration(outro.duration)}"
+            )
+        except merger.MergeError as exc:
+            warnings.append(f"Impossibile analizzare le sigle: {exc}")
+
+        resolutions = set()
+        durations = []
+        for item in self.rows:
+            try:
+                info = merger.probe(ffprobe, item["path"])
+            except merger.MergeError as exc:
+                warnings.append(f"{item['path'].name}: {exc}")
+                continue
+            resolutions.add((info.width, info.height))
+            durations.append(info.duration)
+
+        if durations:
+            lines.append(
+                f"Durata episodi: da {utils.format_duration(min(durations))} "
+                f"a {utils.format_duration(max(durations))}"
+            )
+        if resolutions:
+            res_str = ", ".join(f"{w}x{h}" for w, h in sorted(resolutions))
+            lines.append(f"Risoluzioni rilevate: {res_str}")
+            if len(resolutions) > 1:
+                warnings.append(
+                    "Gli episodi non hanno tutti la stessa risoluzione "
+                    "(verranno comunque adattati singolarmente)."
+                )
+
+        return "\n".join(lines), "\n".join(warnings)
+
     def _start_batch(self):
         error = self._validate()
         if error:
             QMessageBox.warning(self, "Dati mancanti", error)
+            return
+
+        summary, warnings = self._build_preflight_summary()
+        message = summary + (f"\n\nAvvisi:\n{warnings}" if warnings else "")
+        reply = QMessageBox.question(
+            self, "Riepilogo prima di avviare", message,
+            QMessageBox.Yes | QMessageBox.Cancel, QMessageBox.Yes,
+        )
+        if reply != QMessageBox.Yes:
             return
 
         codec = self._current_codec()
@@ -666,6 +795,7 @@ class MainWindow(QMainWindow):
             preset=self._current_preset(), bitrate_mode=bitrate_mode,
             crf=self.crf_spin.value(), cbr_kbps=self.cbr_spin.value(),
             tune_animation=self.tune_check.isChecked() and self.tune_check.isEnabled(),
+            two_pass=self.two_pass_check.isChecked() and self.two_pass_check.isEnabled(),
         )
 
         output_dir = Path(self.output_edit.text())
@@ -687,6 +817,10 @@ class MainWindow(QMainWindow):
         self.ok_count = self.skip_count = self.err_count = 0
         self.summary_label.setText("")
         self.global_progress.setValue(0)
+        self.batch_start_time = time.monotonic()
+        self.row_pct = {row: 0.0 for row in range(self.total_count)}
+        self.row_start_time = {}
+        self.eta_label.setText("")
 
         for row, item in enumerate(self.rows):
             episode_path = item["path"]
@@ -712,7 +846,7 @@ class MainWindow(QMainWindow):
         self.reset_btn.setEnabled(enabled)
         for w in (self.codec_combo, self.gpu_check, self.preset_combo, self.parallel_spin,
                   self.crf_radio, self.cbr_radio, self.orig_radio, self.crf_spin, self.cbr_spin,
-                  self.tune_check):
+                  self.tune_check, self.two_pass_check):
             w.setEnabled(enabled)
         if enabled:
             self._update_gpu_checkbox()
@@ -726,14 +860,35 @@ class MainWindow(QMainWindow):
         self.table.setRowCount(0)
         self.global_progress.setValue(0)
         self.summary_label.setText("")
+        self.eta_label.setText("")
 
     def _on_progress(self, row: int, pct: float):
         self._set_row_progress(row, pct)
+        self.row_pct[row] = pct
+        start = self.row_start_time.get(row)
+        if start is not None and pct > 0.02:
+            elapsed = time.monotonic() - start
+            remaining = elapsed * (1 - pct) / pct
+            self._set_row_status(row, f"In elaborazione (~{utils.format_duration(remaining)} rimanenti)")
+        self._update_batch_eta()
 
     def _on_status(self, row: int, status: str):
         self._set_row_status(row, status)
+        if status == "In elaborazione":
+            self.row_start_time[row] = time.monotonic()
+
+    def _update_batch_eta(self):
+        if not self.total_count:
+            return
+        overall = sum(self.row_pct.values()) / self.total_count
+        self.global_progress.setValue(int(overall * 100))
+        if overall > 0.02:
+            elapsed = time.monotonic() - self.batch_start_time
+            remaining = elapsed * (1 - overall) / overall
+            self.eta_label.setText(f"Tempo rimanente stimato: {utils.format_duration(remaining)}")
 
     def _on_finished(self, row: int, result: MergeResult):
+        self.row_pct[row] = 1.0
         if result.skipped:
             self._set_row_status(row, "Già presente, saltato")
             self._set_row_progress(row, 1.0)
@@ -747,11 +902,13 @@ class MainWindow(QMainWindow):
             self.err_count += 1
 
         self.finished_count += 1
-        self.global_progress.setValue(int(100 * self.finished_count / max(1, self.total_count)))
+        self._update_batch_eta()
 
         if self.finished_count >= self.total_count:
             self.running = False
             self._set_controls_enabled(True)
+            self.global_progress.setValue(100)
+            self.eta_label.setText("")
             self.summary_label.setText(
                 f"Completati: {self.ok_count}  Saltati: {self.skip_count}  Falliti: {self.err_count}"
             )

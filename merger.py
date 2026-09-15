@@ -8,6 +8,7 @@ way around).
 from __future__ import annotations
 
 import json
+import os
 import re
 import subprocess
 import threading
@@ -21,6 +22,7 @@ TARGET_SAMPLE_RATE = 48000
 TARGET_CHANNEL_LAYOUT = "stereo"
 AUDIO_BITRATE = "192k"
 DURATION_TOLERANCE = 0.02  # 2%
+TWO_PASS_ENCODERS = ("libx264", "libx265", "libsvtav1")  # software encoders that support -pass
 
 
 class MergeError(Exception):
@@ -65,6 +67,7 @@ class MergeSettings:
     crf: int = 20
     cbr_kbps: int = 2000
     tune_animation: bool = False  # -tune animation; only meaningful for libx264/libx265
+    two_pass: bool = False  # average-bitrate 2-pass; only for software encoders + cbr/original
 
 
 @dataclass
@@ -173,9 +176,12 @@ def _rate_control_args(settings: MergeSettings, bitrate_kbps: int | None) -> lis
 
 
 def _build_filter_complex(
-    intro: ProbeResult, episode: ProbeResult, outro: ProbeResult,
+    intro: ProbeResult, episode: ProbeResult, outro: ProbeResult, include_audio: bool = True,
 ) -> tuple[str, list[str]]:
-    """Returns (filter_complex_string, output_audio_labels)."""
+    """Returns (filter_complex_string, output_audio_labels). A filtergraph output
+    that isn't mapped makes ffmpeg fail ("unconnected"), so when the caller won't
+    map audio (e.g. the -an first pass of a 2-pass encode) the audio chains must be
+    left out entirely rather than just built-and-ignored."""
     W, H, FPS = episode.width, episode.height, episode.fps
     parts: list[str] = []
 
@@ -186,6 +192,9 @@ def _build_filter_complex(
             f"pad={W}:{H}:(ow-iw)/2:(oh-ih)/2:color=black,setsar=1,fps={FPS}[v{i}]"
         )
     parts.append("[v0][v1][v2]concat=n=3:v=1:a=0[outv]")
+
+    if not include_audio:
+        return ";".join(parts), []
 
     # Audio: one output track per episode audio track; intro/outro reuse/duplicate
     # their own track(s), or generate silence if they have none at all.
@@ -222,8 +231,10 @@ def build_command(
     ffmpeg_path: str, intro_path: Path, episode_path: Path, outro_path: Path,
     output_path: Path, intro: ProbeResult, episode: ProbeResult, outro: ProbeResult,
     settings: MergeSettings,
+    pass_num: int | None = None, passlog_prefix: str | None = None,
 ) -> list[str]:
-    filter_complex, audio_labels = _build_filter_complex(intro, episode, outro)
+    is_first_pass = pass_num == 1
+    filter_complex, audio_labels = _build_filter_complex(intro, episode, outro, include_audio=not is_first_pass)
 
     cmd = [
         ffmpeg_path, "-y", "-hide_banner", "-loglevel", "error",
@@ -231,8 +242,9 @@ def build_command(
         "-filter_complex", filter_complex,
         "-map", "[outv]",
     ]
-    for label in audio_labels:
-        cmd += ["-map", f"[{label}]"]
+    if not is_first_pass:
+        for label in audio_labels:
+            cmd += ["-map", f"[{label}]"]
 
     cmd += ["-c:v", settings.encoder, "-preset", settings.preset]
     if settings.tune_animation and settings.encoder in ("libx264", "libx265"):
@@ -243,12 +255,19 @@ def build_command(
         bitrate_kbps = (episode.video_bitrate // 1000) if episode.video_bitrate else settings.cbr_kbps
     cmd += _rate_control_args(settings, bitrate_kbps)
 
-    cmd += ["-c:a", "aac", "-b:a", AUDIO_BITRATE]
-    for j, audio_stream in enumerate(episode.audio or [AudioStream(0, None)]):
-        lang = audio_stream.language or "und"
-        cmd += [f"-metadata:s:a:{j}", f"language={lang}"]
+    if pass_num is not None:
+        cmd += ["-pass", str(pass_num), "-passlogfile", passlog_prefix]
 
-    cmd += ["-progress", "pipe:1", "-nostats", str(output_path)]
+    if is_first_pass:
+        # First pass only needs the video analysis; skip audio and discard the output.
+        cmd += ["-an", "-progress", "pipe:1", "-nostats", "-f", "null", os.devnull]
+    else:
+        cmd += ["-c:a", "aac", "-b:a", AUDIO_BITRATE]
+        for j, audio_stream in enumerate(episode.audio or [AudioStream(0, None)]):
+            lang = audio_stream.language or "und"
+            cmd += [f"-metadata:s:a:{j}", f"language={lang}"]
+        cmd += ["-progress", "pipe:1", "-nostats", str(output_path)]
+
     return cmd
 
 
@@ -333,6 +352,13 @@ def merge_episode(
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     tmp_output = output_path.with_name(f".{output_path.stem}.part{output_path.suffix}")
+    passlog_prefix = str(output_path.with_name(f".{output_path.stem}.2pass"))
+
+    use_two_pass = (
+        settings.two_pass
+        and settings.bitrate_mode in ("cbr", "original")
+        and settings.encoder in TWO_PASS_ENCODERS
+    )
 
     try:
         intro = probe(ffprobe_path, intro_path)
@@ -340,11 +366,31 @@ def merge_episode(
         outro = probe(ffprobe_path, outro_path)
         expected_duration = intro.duration + episode.duration + outro.duration
 
-        cmd = build_command(
-            ffmpeg_path, intro_path, episode_path, outro_path, tmp_output,
-            intro, episode, outro, settings,
-        )
-        run_merge_pass(cmd, expected_duration, progress_cb, cancel_event)
+        if use_two_pass:
+            cmd1 = build_command(
+                ffmpeg_path, intro_path, episode_path, outro_path, tmp_output,
+                intro, episode, outro, settings, pass_num=1, passlog_prefix=passlog_prefix,
+            )
+            run_merge_pass(
+                cmd1, expected_duration,
+                (lambda pct: progress_cb(pct * 0.5)) if progress_cb else None,
+                cancel_event,
+            )
+            cmd2 = build_command(
+                ffmpeg_path, intro_path, episode_path, outro_path, tmp_output,
+                intro, episode, outro, settings, pass_num=2, passlog_prefix=passlog_prefix,
+            )
+            run_merge_pass(
+                cmd2, expected_duration,
+                (lambda pct: progress_cb(0.5 + pct * 0.5)) if progress_cb else None,
+                cancel_event,
+            )
+        else:
+            cmd = build_command(
+                ffmpeg_path, intro_path, episode_path, outro_path, tmp_output,
+                intro, episode, outro, settings,
+            )
+            run_merge_pass(cmd, expected_duration, progress_cb, cancel_event)
 
         if episode.subtitles:
             remux_subtitles(
@@ -366,3 +412,7 @@ def merge_episode(
         tmp_output.unlink(missing_ok=True)
         output_path.unlink(missing_ok=True)
         return MergeResult(output_path=output_path, success=False, error=str(exc))
+    finally:
+        if use_two_pass:
+            for logfile in output_path.parent.glob(Path(passlog_prefix).name + "*"):
+                logfile.unlink(missing_ok=True)
