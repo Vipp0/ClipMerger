@@ -26,7 +26,7 @@ import merger
 from merger import MergeSettings, MergeResult
 
 APP_TITLE = "ClipMerger"
-APP_VERSION = "0.2.1"
+APP_VERSION = "0.2.2"
 GITHUB_LATEST_RELEASE_API = "https://api.github.com/repos/Vipp0/ClipMerger/releases/latest"
 GITHUB_RELEASES_PAGE = "https://github.com/Vipp0/ClipMerger/releases/latest"
 
@@ -75,6 +75,7 @@ QGroupBox::title {{ subcontrol-origin: margin; left: 10px; padding: 0 4px; color
 QLineEdit, QComboBox, QSpinBox {{ background-color: {c['input_bg']}; border: 1px solid {c['input_border']}; border-radius: 4px; padding: 5px; color: {c['text']}; }}
 QLineEdit:read-only {{ color: {c['muted']}; }}
 QComboBox::drop-down {{ border: none; width: 22px; }}
+QComboBox::down-arrow {{ image: url({down_icon}); width: 9px; height: 6px; }}
 QSpinBox {{ padding-right: 2px; }}
 QSpinBox::up-button, QSpinBox::down-button {{
     subcontrol-origin: border; width: 16px; border: none;
