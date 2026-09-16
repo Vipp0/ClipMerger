@@ -18,7 +18,7 @@ from PySide6.QtWidgets import (
     QGroupBox, QLabel, QLineEdit, QPushButton, QFileDialog, QTableWidget,
     QTableWidgetItem, QProgressBar, QComboBox, QRadioButton, QButtonGroup,
     QStackedWidget, QSpinBox, QMessageBox, QCheckBox, QHeaderView, QAbstractItemView,
-    QToolButton,
+    QToolButton, QMenu,
 )
 
 import utils
@@ -524,11 +524,6 @@ class MainWindow(QMainWindow):
         self.reset_btn.setObjectName("secondary")
         bottom.addWidget(self.reset_btn)
 
-        self.cancel_btn = QPushButton("Annulla")
-        self.cancel_btn.setObjectName("danger")
-        self.cancel_btn.setEnabled(False)
-        bottom.addWidget(self.cancel_btn)
-
         self.start_btn = QPushButton("Avvia")
         bottom.addWidget(self.start_btn)
 
@@ -550,8 +545,9 @@ class MainWindow(QMainWindow):
         self.bitrate_group.idClicked.connect(self.bitrate_stack.setCurrentIndex)
         self.bitrate_group.idClicked.connect(self._update_two_pass_checkbox)
         self.table.cellDoubleClicked.connect(self._show_row_detail)
-        self.start_btn.clicked.connect(self._start_batch)
-        self.cancel_btn.clicked.connect(self._cancel_batch)
+        self.table.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.table.customContextMenuRequested.connect(self._show_queue_context_menu)
+        self.start_btn.clicked.connect(self._on_start_stop_clicked)
         self.reset_btn.clicked.connect(self._reset_all)
         self.signals.progress.connect(self._on_progress)
         self.signals.status.connect(self._on_status)
@@ -722,6 +718,19 @@ class MainWindow(QMainWindow):
         status = self.rows[row].get("last_status", "")
         QMessageBox.information(self, name, status or "Nessun dettaglio disponibile.")
 
+    def _show_queue_context_menu(self, pos):
+        if self.running:
+            return
+        row = self.table.rowAt(pos.y())
+        if row < 0 or row >= len(self.rows):
+            return
+        menu = QMenu(self)
+        remove_action = menu.addAction("Rimuovi dalla coda")
+        chosen = menu.exec(self.table.viewport().mapToGlobal(pos))
+        if chosen == remove_action:
+            self.table.removeRow(row)
+            del self.rows[row]
+
     # ---------------------------------------------------------------- batch run
     def _validate(self) -> str | None:
         if not self.rows:
@@ -825,8 +834,8 @@ class MainWindow(QMainWindow):
 
         self.cancel_event = threading.Event()
         self.pool.setMaxThreadCount(self.parallel_spin.value())
-        self._set_controls_enabled(False)
         self.running = True
+        self._set_controls_enabled(False)
         self.finished_count = 0
         self.total_count = len(self.rows)
         self.ok_count = self.skip_count = self.err_count = 0
@@ -852,14 +861,43 @@ class MainWindow(QMainWindow):
             )
             self.pool.start(task)
 
+    def _on_start_stop_clicked(self):
+        if self.running:
+            self._cancel_batch()
+        else:
+            self._start_batch()
+
+    def _update_start_stop_button(self):
+        if self.running:
+            self.start_btn.setText("Stop")
+            self.start_btn.setObjectName("danger")
+        else:
+            self.start_btn.setText("Avvia")
+            self.start_btn.setObjectName("")
+        self.start_btn.style().unpolish(self.start_btn)
+        self.start_btn.style().polish(self.start_btn)
+
     def _cancel_batch(self):
         self.cancel_event.set()
         self.pool.clear()
-        self.cancel_btn.setEnabled(False)
+        # Tasks still queued (not yet started) are silently discarded by pool.clear()
+        # and never run, so they'd never emit `finished` - without this, finished_count
+        # never reaches total_count and every control (including Reset) stays disabled.
+        for row in range(self.total_count):
+            if row not in self.row_start_time:
+                self._set_row_status(row, "Annullato")
+                self.row_pct[row] = 1.0
+                self.finished_count += 1
+        self._update_batch_eta()
+        if self.finished_count >= self.total_count:
+            self.running = False
+            self._set_controls_enabled(True)
+            self.eta_label.setText("")
+            self.summary_label.setText(
+                f"Completati: {self.ok_count}  Saltati: {self.skip_count}  Falliti: {self.err_count}"
+            )
 
     def _set_controls_enabled(self, enabled: bool):
-        self.start_btn.setEnabled(enabled)
-        self.cancel_btn.setEnabled(not enabled)
         self.reset_btn.setEnabled(enabled)
         for w in (self.codec_combo, self.gpu_check, self.preset_combo, self.parallel_spin,
                   self.crf_radio, self.cbr_radio, self.orig_radio, self.crf_spin, self.cbr_spin,
@@ -867,6 +905,7 @@ class MainWindow(QMainWindow):
             w.setEnabled(enabled)
         if enabled:
             self._update_gpu_checkbox()
+        self._update_start_stop_button()
 
     def _reset_all(self):
         self.folder_edit.clear()

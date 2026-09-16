@@ -288,6 +288,11 @@ def run_merge_pass(
         for line in proc.stdout:
             if cancel_event is not None and cancel_event.is_set():
                 proc.terminate()
+                try:
+                    proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                    proc.wait()
                 raise Cancelled()
             m = TIME_RE.search(line)
             if m and progress_cb and expected_duration > 0:
@@ -297,6 +302,11 @@ def run_merge_pass(
     finally:
         if proc.poll() is None:
             proc.terminate()
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait()
 
     if proc.returncode != 0:
         stderr = proc.stderr.read() if proc.stderr else ""
