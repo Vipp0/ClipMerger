@@ -414,5 +414,13 @@ def merge_episode(
         return MergeResult(output_path=output_path, success=False, error=str(exc))
     finally:
         if use_two_pass:
-            for logfile in output_path.parent.glob(Path(passlog_prefix).name + "*"):
-                logfile.unlink(missing_ok=True)
+            # A plain prefix match, not Path.glob(): episode filenames routinely
+            # contain "[...]" (quality tags, etc.), which glob() would parse as a
+            # character class instead of literal text, silently missing the files.
+            prefix = Path(passlog_prefix).name
+            for entry in os.scandir(output_path.parent):
+                if entry.is_file() and entry.name.startswith(prefix):
+                    try:
+                        os.unlink(entry.path)
+                    except OSError:
+                        pass

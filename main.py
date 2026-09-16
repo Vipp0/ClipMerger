@@ -26,7 +26,7 @@ import merger
 from merger import MergeSettings, MergeResult
 
 APP_TITLE = "ClipMerger"
-APP_VERSION = "0.2.0"
+APP_VERSION = "0.2.1"
 GITHUB_LATEST_RELEASE_API = "https://api.github.com/repos/Vipp0/ClipMerger/releases/latest"
 GITHUB_RELEASES_PAGE = "https://github.com/Vipp0/ClipMerger/releases/latest"
 
@@ -255,7 +255,7 @@ class MergeTask(QRunnable):
 
 
 class HwDetectWorker(QThread):
-    done = Signal(dict)
+    done = Signal(dict, dict)
 
     def __init__(self, ffmpeg_path: str):
         super().__init__()
@@ -263,9 +263,12 @@ class HwDetectWorker(QThread):
 
     def run(self):
         result = {}
+        reasons = {}
         for _, codec in CODEC_LABELS:
-            result[codec] = utils.detect_hw_encoder(self.ffmpeg_path, codec)
-        self.done.emit(result)
+            encoder, reason = utils.detect_hw_encoder_verbose(self.ffmpeg_path, codec)
+            result[codec] = encoder
+            reasons[codec] = reason
+        self.done.emit(result, reasons)
 
 
 class UpdateCheckWorker(QThread):
@@ -302,6 +305,7 @@ class MainWindow(QMainWindow):
 
         self.ffmpeg_status = utils.check_ffmpeg()
         self.hw_encoders: dict[str, str | None] = {c: None for _, c in CODEC_LABELS}
+        self.hw_reasons: dict[str, str] = {c: "" for _, c in CODEC_LABELS}
         self.rows: list[dict] = []  # {path, output}
         self.pool = QThreadPool()
         self.signals = MergeSignals()
@@ -485,6 +489,14 @@ class MainWindow(QMainWindow):
         )
         enc_grid.addWidget(self.two_pass_check, 4, 0, 1, 4)
 
+        enc_grid.addWidget(QLabel("Contenitore output:"), 5, 0)
+        self.container_combo = QComboBox()
+        self.container_combo.addItem("Come originale (stessa estensione dell'episodio)", "")
+        self.container_combo.addItem(".mp4", ".mp4")
+        self.container_combo.addItem(".mkv", ".mkv")
+        self.container_combo.addItem(".avi", ".avi")
+        enc_grid.addWidget(self.container_combo, 5, 1)
+
         enc_box = QGroupBox("Codifica")
         enc_box.setLayout(enc_grid)
         root.addWidget(enc_box)
@@ -585,8 +597,9 @@ class MainWindow(QMainWindow):
     def _current_preset(self) -> str:
         return PRESET_LABELS[self.preset_combo.currentIndex()][1]
 
-    def _on_hw_detected(self, result: dict):
+    def _on_hw_detected(self, result: dict, reasons: dict):
         self.hw_encoders = result
+        self.hw_reasons = reasons
         self._update_gpu_checkbox()
 
     def _on_update_checked(self, latest_tag: str):
@@ -609,10 +622,12 @@ class MainWindow(QMainWindow):
         if encoder:
             self.gpu_check.setEnabled(True)
             self.gpu_check.setText(f"Usa GPU se disponibile (rilevato: {encoder})")
+            self.gpu_check.setToolTip("")
         else:
             self.gpu_check.setEnabled(False)
             self.gpu_check.setChecked(False)
             self.gpu_check.setText("Usa GPU se disponibile (nessun encoder hardware rilevato)")
+            self.gpu_check.setToolTip(self.hw_reasons.get(codec, ""))
         self._update_tune_checkbox()
         self._update_two_pass_checkbox()
 
@@ -822,9 +837,11 @@ class MainWindow(QMainWindow):
         self.row_start_time = {}
         self.eta_label.setText("")
 
+        container_suffix = self.container_combo.currentData()
         for row, item in enumerate(self.rows):
             episode_path = item["path"]
-            output_path = output_dir / episode_path.name
+            suffix = container_suffix or episode_path.suffix
+            output_path = output_dir / (episode_path.stem + suffix)
             item["output"] = output_path
             self._set_row_status(row, "In coda")
             self._set_row_progress(row, 0.0)
@@ -846,7 +863,7 @@ class MainWindow(QMainWindow):
         self.reset_btn.setEnabled(enabled)
         for w in (self.codec_combo, self.gpu_check, self.preset_combo, self.parallel_spin,
                   self.crf_radio, self.cbr_radio, self.orig_radio, self.crf_spin, self.cbr_spin,
-                  self.tune_check, self.two_pass_check):
+                  self.tune_check, self.two_pass_check, self.container_combo):
             w.setEnabled(enabled)
         if enabled:
             self._update_gpu_checkbox()
