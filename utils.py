@@ -80,9 +80,10 @@ def detect_hw_encoder_verbose(ffmpeg_path: str, codec: str) -> tuple[str | None,
     except (subprocess.SubprocessError, OSError) as exc:
         return None, f"impossibile interrogare ffmpeg -encoders: {exc}"
 
-    reason = "nessuno di questi encoder risulta compilato in questo ffmpeg: " + ", ".join(hw_map.values())
+    notes = []
     for encoder_name in hw_map.values():
         if encoder_name not in listed:
+            notes.append(f"{encoder_name}: non compilato in questo ffmpeg")
             continue
         try:
             test = _run_quiet([
@@ -91,12 +92,12 @@ def detect_hw_encoder_verbose(ffmpeg_path: str, codec: str) -> tuple[str | None,
                 "-c:v", encoder_name, "-f", "null", "-",
             ], timeout=10.0)
         except (subprocess.SubprocessError, OSError) as exc:
-            reason = f"{encoder_name}: {exc}"
+            notes.append(f"{encoder_name}: {exc}")
             continue
         if test.returncode == 0:
             return encoder_name, ""
-        reason = f"{encoder_name} non ha funzionato: {(test.stderr or '').strip()[-300:] or 'errore sconosciuto'}"
-    return None, reason
+        notes.append(f"{encoder_name}: {(test.stderr or '').strip()[-200:] or 'errore sconosciuto'}")
+    return None, " | ".join(notes)
 
 
 def pick_encoder(ffmpeg_path: str, codec: str, use_gpu: bool) -> tuple[str, bool]:
