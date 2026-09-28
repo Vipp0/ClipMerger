@@ -88,7 +88,7 @@ def detect_hw_encoder_verbose(ffmpeg_path: str, codec: str) -> tuple[str | None,
         try:
             test = _run_quiet([
                 ffmpeg_path, "-hide_banner", "-loglevel", "error",
-                "-f", "lavfi", "-i", "color=c=black:s=64x64:d=0.5",
+                "-f", "lavfi", "-i", "color=c=black:s=320x240:d=0.5",
                 "-c:v", encoder_name, "-f", "null", "-",
             ], timeout=10.0)
         except (subprocess.SubprocessError, OSError) as exc:
@@ -96,7 +96,7 @@ def detect_hw_encoder_verbose(ffmpeg_path: str, codec: str) -> tuple[str | None,
             continue
         if test.returncode == 0:
             return encoder_name, ""
-        notes.append(f"{encoder_name}: {(test.stderr or '').strip()[-200:] or 'errore sconosciuto'}")
+        notes.append(f"{encoder_name}: {(test.stderr or '').strip()[:200] or 'errore sconosciuto'}")
     return None, " | ".join(notes)
 
 
