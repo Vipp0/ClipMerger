@@ -26,7 +26,7 @@ import merger
 from merger import MergeSettings, MergeResult
 
 APP_TITLE = "ClipMerger"
-APP_VERSION = "0.2.4"
+APP_VERSION = "0.2.5"
 GITHUB_LATEST_RELEASE_API = "https://api.github.com/repos/Vipp0/ClipMerger/releases/latest"
 GITHUB_RELEASES_PAGE = "https://github.com/Vipp0/ClipMerger/releases/latest"
 
@@ -228,7 +228,7 @@ class MergeSignals(QObject):
 
 
 class MergeTask(QRunnable):
-    def __init__(self, row: int, intro: Path, episode: Path, outro: Path, output: Path,
+    def __init__(self, row: int, intro: Path | None, episode: Path, outro: Path | None, output: Path,
                  settings: MergeSettings, ffmpeg_path: str, ffprobe_path: str,
                  signals: MergeSignals, cancel_event: threading.Event):
         super().__init__()
@@ -669,14 +669,17 @@ class MainWindow(QMainWindow):
             self._add_row(f)
 
     def _auto_assign_sigle(self, files: list[Path]) -> list[Path]:
-        """Pull out files whose name contains "sigla iniziale"/"sigla finale" and
-        assign them straight to the intro/outro fields, instead of queueing them."""
+        """Pull out files whose name contains both "sigla" and "iniziale"/"finale"
+        and assign them straight to the intro/outro fields, instead of queueing
+        them. Matched as separate words rather than one exact phrase, so filenames
+        with brackets or other text between them (e.g. "Sigla [1080p] Iniziale.mkv")
+        are still recognized."""
         remaining = []
         for f in files:
             name = f.name.lower()
-            if "sigla iniziale" in name:
+            if "sigla" in name and "iniziale" in name:
                 self.intro_edit.setText(str(f))
-            elif "sigla finale" in name:
+            elif "sigla" in name and "finale" in name:
                 self.outro_edit.setText(str(f))
             else:
                 remaining.append(f)
@@ -736,10 +739,8 @@ class MainWindow(QMainWindow):
     def _validate(self) -> str | None:
         if not self.rows:
             return "Seleziona prima una cartella con dei video."
-        if not self.intro_edit.text():
-            return "Seleziona il file della sigla iniziale."
-        if not self.outro_edit.text():
-            return "Seleziona il file della sigla finale."
+        if not self.intro_edit.text() and not self.outro_edit.text():
+            return "Seleziona almeno una sigla (iniziale o finale)."
         if not self.output_edit.text():
             return "Seleziona la cartella di output."
         return None
@@ -749,15 +750,21 @@ class MainWindow(QMainWindow):
         lines = [f"Episodi in coda: {len(self.rows)}"]
         warnings = []
 
-        try:
-            intro = merger.probe(ffprobe, Path(self.intro_edit.text()))
-            outro = merger.probe(ffprobe, Path(self.outro_edit.text()))
-            lines.append(
-                f"Sigla iniziale: {utils.format_duration(intro.duration)}  ·  "
-                f"Sigla finale: {utils.format_duration(outro.duration)}"
-            )
-        except merger.MergeError as exc:
-            warnings.append(f"Impossibile analizzare le sigle: {exc}")
+        sigle_parts = []
+        if self.intro_edit.text():
+            try:
+                intro = merger.probe(ffprobe, Path(self.intro_edit.text()))
+                sigle_parts.append(f"Sigla iniziale: {utils.format_duration(intro.duration)}")
+            except merger.MergeError as exc:
+                warnings.append(f"Impossibile analizzare la sigla iniziale: {exc}")
+        if self.outro_edit.text():
+            try:
+                outro = merger.probe(ffprobe, Path(self.outro_edit.text()))
+                sigle_parts.append(f"Sigla finale: {utils.format_duration(outro.duration)}")
+            except merger.MergeError as exc:
+                warnings.append(f"Impossibile analizzare la sigla finale: {exc}")
+        if sigle_parts:
+            lines.append("  ·  ".join(sigle_parts))
 
         resolutions = set()
         durations = []
@@ -830,8 +837,8 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, "Errore output", f"Impossibile creare la cartella output: {exc}")
             return
 
-        intro_path = Path(self.intro_edit.text())
-        outro_path = Path(self.outro_edit.text())
+        intro_path = Path(self.intro_edit.text()) if self.intro_edit.text() else None
+        outro_path = Path(self.outro_edit.text()) if self.outro_edit.text() else None
 
         self.cancel_event = threading.Event()
         self.pool.setMaxThreadCount(self.parallel_spin.value())

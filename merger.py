@@ -176,36 +176,40 @@ def _rate_control_args(settings: MergeSettings, bitrate_kbps: int | None) -> lis
 
 
 def _build_filter_complex(
-    intro: ProbeResult, episode: ProbeResult, outro: ProbeResult, include_audio: bool = True,
+    segments: list[ProbeResult], episode_idx: int, include_audio: bool = True,
 ) -> tuple[str, list[str]]:
-    """Returns (filter_complex_string, output_audio_labels). A filtergraph output
-    that isn't mapped makes ffmpeg fail ("unconnected"), so when the caller won't
-    map audio (e.g. the -an first pass of a 2-pass encode) the audio chains must be
-    left out entirely rather than just built-and-ignored."""
+    """Returns (filter_complex_string, output_audio_labels). `segments` holds every
+    clip being concatenated, in input order - sigla iniziale and sigla finale are
+    each optional, so this is 2 or 3 items; `episode_idx` says which one is the real
+    episode, whose resolution/fps/audio-track-count drives the output. A filtergraph
+    output that isn't mapped makes ffmpeg fail ("unconnected"), so when the caller
+    won't map audio (e.g. the -an first pass of a 2-pass encode) the audio chains
+    must be left out entirely rather than just built-and-ignored."""
+    episode = segments[episode_idx]
     W, H, FPS = episode.width, episode.height, episode.fps
+    n = len(segments)
     parts: list[str] = []
 
-    # Video: scale/pad/fps-normalize each of the 3 inputs to the episode's own params.
-    for i in range(3):
+    # Video: scale/pad/fps-normalize each input to the episode's own params.
+    for i in range(n):
         parts.append(
             f"[{i}:v:0]scale=w={W}:h={H}:force_original_aspect_ratio=decrease,"
             f"pad={W}:{H}:(ow-iw)/2:(oh-ih)/2:color=black,setsar=1,fps={FPS}[v{i}]"
         )
-    parts.append("[v0][v1][v2]concat=n=3:v=1:a=0[outv]")
+    parts.append("".join(f"[v{i}]" for i in range(n)) + f"concat=n={n}:v=1:a=0[outv]")
 
     if not include_audio:
         return ";".join(parts), []
 
-    # Audio: one output track per episode audio track; intro/outro reuse/duplicate
-    # their own track(s), or generate silence if they have none at all.
+    # Audio: one output track per episode audio track; sigle reuse/duplicate their
+    # own track(s), or generate silence if they have none at all.
     output_audio_labels: list[str] = []
     n_tracks = max(1, len(episode.audio))
-    inputs = (intro, None, outro)  # episode itself provides real streams via index 1
     for j in range(n_tracks):
         seg_labels = []
-        for seg_i, seg_probe in enumerate((intro, episode, outro)):
-            if seg_i == 1:
-                src = f"[1:a:{j}]" if j < len(episode.audio) else None
+        for seg_i, seg_probe in enumerate(segments):
+            if seg_i == episode_idx:
+                src = f"[{seg_i}:a:{j}]" if j < len(episode.audio) else None
             else:
                 src = f"[{seg_i}:a:{min(j, len(seg_probe.audio) - 1)}]" if seg_probe.audio else None
             label = f"a{seg_i}_{j}"
@@ -221,27 +225,26 @@ def _build_filter_complex(
                 )
             seg_labels.append(f"[{label}]")
         out_label = f"outa{j}"
-        parts.append("".join(seg_labels) + f"concat=n=3:v=0:a=1[{out_label}]")
+        parts.append("".join(seg_labels) + f"concat=n={n}:v=0:a=1[{out_label}]")
         output_audio_labels.append(out_label)
 
     return ";".join(parts), output_audio_labels
 
 
 def build_command(
-    ffmpeg_path: str, intro_path: Path, episode_path: Path, outro_path: Path,
-    output_path: Path, intro: ProbeResult, episode: ProbeResult, outro: ProbeResult,
-    settings: MergeSettings,
+    ffmpeg_path: str, segments: list[tuple[Path, ProbeResult]], episode_idx: int,
+    output_path: Path, settings: MergeSettings,
     pass_num: int | None = None, passlog_prefix: str | None = None,
 ) -> list[str]:
     is_first_pass = pass_num == 1
-    filter_complex, audio_labels = _build_filter_complex(intro, episode, outro, include_audio=not is_first_pass)
+    probes = [p for _, p in segments]
+    filter_complex, audio_labels = _build_filter_complex(probes, episode_idx, include_audio=not is_first_pass)
+    episode = probes[episode_idx]
 
-    cmd = [
-        ffmpeg_path, "-y", "-hide_banner", "-loglevel", "error",
-        "-i", str(intro_path), "-i", str(episode_path), "-i", str(outro_path),
-        "-filter_complex", filter_complex,
-        "-map", "[outv]",
-    ]
+    cmd = [ffmpeg_path, "-y", "-hide_banner", "-loglevel", "error"]
+    for path, _ in segments:
+        cmd += ["-i", str(path)]
+    cmd += ["-filter_complex", filter_complex, "-map", "[outv]"]
     if not is_first_pass:
         for label in audio_labels:
             cmd += ["-map", f"[{label}]"]
@@ -352,7 +355,7 @@ def verify_output(ffprobe_path: str, output_path: Path, expected_duration: float
 
 def merge_episode(
     ffmpeg_path: str, ffprobe_path: str,
-    intro_path: Path, episode_path: Path, outro_path: Path, output_path: Path,
+    intro_path: Path | None, episode_path: Path, outro_path: Path | None, output_path: Path,
     settings: MergeSettings,
     progress_cb: Callable[[float], None] | None = None,
     cancel_event: threading.Event | None = None,
@@ -371,15 +374,19 @@ def merge_episode(
     )
 
     try:
-        intro = probe(ffprobe_path, intro_path)
-        episode = probe(ffprobe_path, episode_path)
-        outro = probe(ffprobe_path, outro_path)
-        expected_duration = intro.duration + episode.duration + outro.duration
+        # Sigla iniziale/finale are each optional: build the input list from whichever
+        # are actually set, and remember where the episode itself landed in it.
+        paths = [p for p in (intro_path, episode_path, outro_path) if p is not None]
+        episode_idx = 1 if intro_path is not None else 0
+        probes = [probe(ffprobe_path, p) for p in paths]
+        segments = list(zip(paths, probes))
+        episode = probes[episode_idx]
+        expected_duration = sum(p.duration for p in probes)
 
         if use_two_pass:
             cmd1 = build_command(
-                ffmpeg_path, intro_path, episode_path, outro_path, tmp_output,
-                intro, episode, outro, settings, pass_num=1, passlog_prefix=passlog_prefix,
+                ffmpeg_path, segments, episode_idx, tmp_output, settings,
+                pass_num=1, passlog_prefix=passlog_prefix,
             )
             run_merge_pass(
                 cmd1, expected_duration,
@@ -387,8 +394,8 @@ def merge_episode(
                 cancel_event,
             )
             cmd2 = build_command(
-                ffmpeg_path, intro_path, episode_path, outro_path, tmp_output,
-                intro, episode, outro, settings, pass_num=2, passlog_prefix=passlog_prefix,
+                ffmpeg_path, segments, episode_idx, tmp_output, settings,
+                pass_num=2, passlog_prefix=passlog_prefix,
             )
             run_merge_pass(
                 cmd2, expected_duration,
@@ -396,15 +403,16 @@ def merge_episode(
                 cancel_event,
             )
         else:
-            cmd = build_command(
-                ffmpeg_path, intro_path, episode_path, outro_path, tmp_output,
-                intro, episode, outro, settings,
-            )
+            cmd = build_command(ffmpeg_path, segments, episode_idx, tmp_output, settings)
             run_merge_pass(cmd, expected_duration, progress_cb, cancel_event)
 
         if episode.subtitles:
+            # Subtitle timestamps need shifting only by whatever precedes the episode
+            # in the final timeline - that's the sigla iniziale's duration, or 0 if
+            # there isn't one.
+            intro_duration = probes[0].duration if episode_idx > 0 else 0.0
             remux_subtitles(
-                ffmpeg_path, tmp_output, episode_path, intro.duration,
+                ffmpeg_path, tmp_output, episode_path, intro_duration,
                 episode.subtitles, output_path,
             )
             tmp_output.unlink(missing_ok=True)
