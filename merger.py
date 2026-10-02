@@ -14,16 +14,17 @@ import subprocess
 import threading
 from dataclasses import dataclass, field
 from fractions import Fraction
+from functools import lru_cache
 from pathlib import Path
 from typing import Callable
 
 from utils import CREATE_NO_WINDOW, CODEC_ENCODERS
 
 TARGET_SAMPLE_RATE = 48000
-TARGET_CHANNEL_LAYOUT = "stereo"
-AUDIO_BITRATE = "192k"
+STEREO_AAC_KBPS = 192
 DURATION_TOLERANCE = 0.02  # 2%
 TWO_PASS_ENCODERS = ("libx264", "libx265", "libsvtav1")  # software encoders that support -pass
+MP4_LIKE_SUFFIXES = (".mp4", ".mov", ".m4v")  # these store track names in handler_name, not title
 
 
 class MergeError(Exception):
@@ -38,6 +39,14 @@ class Cancelled(Exception):
 class AudioStream:
     index: int
     language: str | None
+    title: str | None = None
+    default: bool = False
+    codec: str = ""
+    channels: int = 0
+    channel_layout: str | None = None
+    sample_rate: int = 0
+    bits: int = 0  # bit depth (0 = unknown)
+    bitrate: int | None = None  # bits/s
 
 
 @dataclass
@@ -45,6 +54,14 @@ class SubtitleStream:
     index: int
     codec: str
     language: str | None
+    title: str | None = None
+
+
+@dataclass
+class Chapter:
+    start: float  # seconds
+    end: float
+    title: str | None
 
 
 @dataclass
@@ -57,6 +74,7 @@ class ProbeResult:
     audio: list[AudioStream] = field(default_factory=list)
     subtitles: list[SubtitleStream] = field(default_factory=list)
     sar: Fraction = Fraction(1)  # pixel (sample) aspect ratio; != 1 means anamorphic
+    chapters: list[Chapter] = field(default_factory=list)
 
 
 @dataclass
@@ -70,6 +88,7 @@ class MergeSettings:
     cbr_kbps: int = 2000
     tune_animation: bool = False  # -tune animation; only meaningful for libx264/libx265
     two_pass: bool = False  # average-bitrate 2-pass; only for software encoders + cbr/original
+    audio_mode: str = "original"  # "original" | "aac_keep" | "aac_stereo" | "flac"
 
 
 @dataclass
@@ -83,11 +102,14 @@ class MergeResult:
 def _run_ffprobe(ffprobe_path: str, path: Path) -> dict:
     args = [
         ffprobe_path, "-v", "error", "-print_format", "json",
-        "-show_format", "-show_streams", str(path),
+        "-show_format", "-show_streams", "-show_chapters", str(path),
     ]
     try:
         proc = subprocess.run(
             args, capture_output=True, text=True, timeout=30,
+            # ffprobe's JSON is UTF-8; the default Windows codec would garble accents
+            # in track titles ("è" -> "Ã¨"), and they're passed back to ffmpeg later.
+            encoding="utf-8", errors="replace",
             creationflags=CREATE_NO_WINDOW,
         )
     except (subprocess.SubprocessError, OSError) as exc:
@@ -121,6 +143,14 @@ def _parse_sar(sar_str: str | None) -> Fraction:
     return Fraction(num, den) if num > 0 and den > 0 else Fraction(1)
 
 
+def _to_int(value) -> int | None:
+    try:
+        n = int(value)
+    except (TypeError, ValueError):
+        return None
+    return n if n > 0 else None
+
+
 def probe(ffprobe_path: str, path: Path) -> ProbeResult:
     data = _run_ffprobe(ffprobe_path, path)
     fmt = data.get("format", {})
@@ -135,12 +165,23 @@ def probe(ffprobe_path: str, path: Path) -> ProbeResult:
         if codec_type == "video" and video_stream is None:
             video_stream = s
         elif codec_type == "audio":
-            lang = (s.get("tags") or {}).get("language")
-            audio_streams.append(AudioStream(index=len(audio_streams), language=lang))
+            tags = s.get("tags") or {}
+            audio_streams.append(AudioStream(
+                index=len(audio_streams), language=tags.get("language"),
+                title=tags.get("title"), default=bool((s.get("disposition") or {}).get("default")),
+                codec=s.get("codec_name", ""),
+                channels=_to_int(s.get("channels")) or 0,
+                channel_layout=s.get("channel_layout"),
+                sample_rate=_to_int(s.get("sample_rate")) or 0,
+                bits=_to_int(s.get("bits_per_raw_sample")) or _to_int(s.get("bits_per_sample")) or 0,
+                # mkv usually has no per-stream bit_rate, but mkvmerge writes a BPS tag
+                bitrate=_to_int(s.get("bit_rate")) or _to_int(tags.get("BPS")),
+            ))
         elif codec_type == "subtitle":
-            lang = (s.get("tags") or {}).get("language")
+            tags = s.get("tags") or {}
             subtitle_streams.append(SubtitleStream(
-                index=len(subtitle_streams), codec=s.get("codec_name", ""), language=lang,
+                index=len(subtitle_streams), codec=s.get("codec_name", ""),
+                language=tags.get("language"), title=tags.get("title"),
             ))
 
     if video_stream is None:
@@ -158,10 +199,19 @@ def probe(ffprobe_path: str, path: Path) -> ProbeResult:
     if width <= 0 or height <= 0:
         raise MergeError(f"{path.name}: risoluzione non rilevabile.")
 
+    chapters = []
+    for c in data.get("chapters", []):
+        try:
+            start, end = float(c["start_time"]), float(c["end_time"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if end > start:
+            chapters.append(Chapter(start=start, end=end, title=(c.get("tags") or {}).get("title")))
+
     return ProbeResult(
         duration=duration, width=width, height=height, fps=fps,
         video_bitrate=video_bitrate, audio=audio_streams, subtitles=subtitle_streams,
-        sar=_parse_sar(video_stream.get("sample_aspect_ratio")),
+        sar=_parse_sar(video_stream.get("sample_aspect_ratio")), chapters=chapters,
     )
 
 
@@ -189,8 +239,127 @@ def _rate_control_args(settings: MergeSettings, bitrate_kbps: int | None) -> lis
     return ["-crf", str(crf)]
 
 
+@dataclass
+class AudioPlan:
+    """How one output audio track is produced (the episode's track j drives it)."""
+    encoder: str
+    layout: str
+    sample_rate: int
+    bitrate_k: int | None  # None for lossless encoders
+    sample_fmt: str | None = None  # forced only for flac, to keep 16 vs 24 bit
+
+
+_SAFE_LAYOUTS = {"mono", "stereo", "3.0", "4.0", "quad", "5.0", "5.1", "6.1", "7.1"}
+_LAYOUT_BY_CHANNELS = {1: "mono", 2: "stereo", 3: "3.0", 4: "4.0", 5: "5.0", 6: "5.1", 7: "6.1", 8: "7.1"}
+_AC3_LAYOUTS = {"mono", "stereo", "3.0", "5.0", "5.1"}
+_LOSSLESS_SOURCE_CODECS = {"truehd", "mlp", "alac", "wavpack", "flac"}
+# source codec -> (ffmpeg encoder, max channels, max kbps)
+_SAME_CODEC_ENCODERS = {
+    "aac": ("aac", 8, None),
+    "ac3": ("ac3", 6, 640),
+    "eac3": ("eac3", 8, 1536),
+    "mp3": ("libmp3lame", 2, 320),
+    "opus": ("libopus", 2, 510),
+    "vorbis": ("libvorbis", 2, None),
+}
+
+
+@lru_cache(maxsize=4)
+def _available_encoders(ffmpeg_path: str) -> frozenset[str]:
+    try:
+        out = subprocess.run(
+            [ffmpeg_path, "-hide_banner", "-encoders"], capture_output=True, text=True,
+            encoding="utf-8", errors="replace", timeout=15, creationflags=CREATE_NO_WINDOW,
+        ).stdout
+    except (subprocess.SubprocessError, OSError):
+        return frozenset()
+    names = set()
+    for line in out.splitlines():
+        parts = line.split()
+        if len(parts) >= 2 and len(parts[0]) == 6 and parts[0][0] in "VAS":
+            names.add(parts[1])
+    return frozenset(names)
+
+
+def _container_allows_audio(suffix: str, codec: str) -> bool:
+    if suffix == ".mkv":
+        return True
+    if suffix in MP4_LIKE_SUFFIXES:
+        return codec in ("aac", "ac3", "eac3", "mp3", "opus", "flac")
+    return codec in ("aac", "ac3", "mp3")  # avi and anything else: stay conservative
+
+
+def _layout_for(track: AudioStream | None) -> tuple[int, str]:
+    """(channel count, layout name) to use for a track. "(side)" variants are folded
+    into the plain layout (the encoders accept those, and swr maps side->back)."""
+    if track is None or track.channels <= 0:
+        return 2, "stereo"
+    layout = (track.channel_layout or "").replace("(side)", "")
+    if layout in _SAFE_LAYOUTS:
+        return track.channels, layout
+    layout = _LAYOUT_BY_CHANNELS.get(track.channels)
+    return (track.channels, layout) if layout else (2, "stereo")
+
+
+def _aac_kbps(channels: int) -> int:
+    return 96 * channels if channels <= 2 else 64 * channels
+
+
+def _coerce_rate(encoder: str, rate: int) -> int:
+    if rate <= 0 or encoder == "libopus":
+        return TARGET_SAMPLE_RATE
+    if encoder in ("ac3", "eac3") and rate not in (32000, 44100, 48000):
+        return TARGET_SAMPLE_RATE
+    if encoder == "libmp3lame" and rate > 48000:
+        return TARGET_SAMPLE_RATE
+    return rate
+
+
+def _plan_audio(
+    ffmpeg_path: str, settings: MergeSettings, track: AudioStream | None, suffix: str,
+) -> AudioPlan:
+    mode = settings.audio_mode
+    if mode == "aac_stereo":
+        return AudioPlan("aac", "stereo", TARGET_SAMPLE_RATE, STEREO_AAC_KBPS)
+
+    channels, layout = _layout_for(track)
+    rate = track.sample_rate if track and track.sample_rate else TARGET_SAMPLE_RATE
+    aac_keep = AudioPlan("aac", layout, _coerce_rate("aac", rate), _aac_kbps(channels))
+    if mode == "aac_keep" or track is None:
+        return aac_keep
+
+    available = _available_encoders(ffmpeg_path)
+    lossless_source = track.codec in _LOSSLESS_SOURCE_CODECS or track.codec.startswith("pcm_")
+    if mode == "flac" or lossless_source:
+        if _container_allows_audio(suffix, "flac") and "flac" in available:
+            return AudioPlan(
+                "flac", layout, rate, None, sample_fmt="s32" if track.bits > 16 else "s16",
+            )
+        return aac_keep
+
+    spec = _SAME_CODEC_ENCODERS.get(track.codec)
+    if spec is None:
+        return aac_keep
+    encoder, max_channels, max_kbps = spec
+    if (
+        channels > max_channels
+        or encoder not in available
+        or not _container_allows_audio(suffix, track.codec)
+        or (encoder in ("ac3", "eac3") and layout not in _AC3_LAYOUTS)
+    ):
+        return aac_keep
+    kbps = round(track.bitrate / 1000) if track.bitrate else _aac_kbps(channels)
+    kbps = max(32, min(kbps, max_kbps)) if max_kbps else max(32, kbps)
+    return AudioPlan(encoder, layout, _coerce_rate(encoder, rate), kbps)
+
+
+def _plan_audios(ffmpeg_path: str, settings: MergeSettings, episode: ProbeResult, suffix: str) -> list[AudioPlan]:
+    tracks = episode.audio or [None]
+    return [_plan_audio(ffmpeg_path, settings, t, suffix) for t in tracks]
+
+
 def _build_filter_complex(
-    segments: list[ProbeResult], episode_idx: int, include_audio: bool = True,
+    segments: list[ProbeResult], episode_idx: int, plans: list[AudioPlan], include_audio: bool = True,
 ) -> tuple[str, list[str]]:
     """Returns (filter_complex_string, output_audio_labels). `segments` holds every
     clip being concatenated, in input order - sigla iniziale and sigla finale are
@@ -232,10 +401,13 @@ def _build_filter_complex(
         return ";".join(parts), []
 
     # Audio: one output track per episode audio track; sigle reuse/duplicate their
-    # own track(s), or generate silence if they have none at all.
+    # own track(s), or generate silence if they have none at all. Every segment is
+    # converted to that track's plan (sample rate, channel layout) so concat accepts them.
     output_audio_labels: list[str] = []
     n_tracks = max(1, len(episode.audio))
     for j in range(n_tracks):
+        plan = plans[j]
+        fmt = f":sample_fmts={plan.sample_fmt}" if plan.sample_fmt else ""
         seg_labels = []
         for seg_i, seg_probe in enumerate(segments):
             if seg_i == episode_idx:
@@ -245,13 +417,15 @@ def _build_filter_complex(
             label = f"a{seg_i}_{j}"
             if src is None:
                 parts.append(
-                    f"anullsrc=r={TARGET_SAMPLE_RATE}:cl={TARGET_CHANNEL_LAYOUT}:"
-                    f"d={seg_probe.duration:.3f}[{label}]"
+                    f"anullsrc=r={plan.sample_rate}:cl={plan.layout}:"
+                    f"d={seg_probe.duration:.3f}"
+                    + (f",aformat=sample_fmts={plan.sample_fmt}" if plan.sample_fmt else "")
+                    + f"[{label}]"
                 )
             else:
                 parts.append(
-                    f"{src}aresample={TARGET_SAMPLE_RATE},"
-                    f"aformat=channel_layouts={TARGET_CHANNEL_LAYOUT}[{label}]"
+                    f"{src}aresample={plan.sample_rate},"
+                    f"aformat=channel_layouts={plan.layout}{fmt}[{label}]"
                 )
             seg_labels.append(f"[{label}]")
         out_label = f"outa{j}"
@@ -261,23 +435,56 @@ def _build_filter_complex(
     return ";".join(parts), output_audio_labels
 
 
+def _ffmetadata_escape(text: str) -> str:
+    for ch in ("\\", "=", ";", "#", "\n"):
+        text = text.replace(ch, "\\" + ch)
+    return text
+
+
+def write_chapters_file(path: Path, chapters: list[Chapter], offset: float) -> None:
+    """ffmetadata file holding the episode's chapters shifted by `offset` seconds
+    (the sigla iniziale's duration), so they still point at the right scenes."""
+    lines = [";FFMETADATA1"]
+    for c in chapters:
+        lines += [
+            "[CHAPTER]", "TIMEBASE=1/1000",
+            f"START={round((c.start + offset) * 1000)}", f"END={round((c.end + offset) * 1000)}",
+        ]
+        if c.title:
+            lines.append(f"title={_ffmetadata_escape(c.title)}")
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
 def build_command(
     ffmpeg_path: str, segments: list[tuple[Path, ProbeResult]], episode_idx: int,
     output_path: Path, settings: MergeSettings,
     pass_num: int | None = None, passlog_prefix: str | None = None,
+    chapters_file: Path | None = None,
 ) -> list[str]:
     is_first_pass = pass_num == 1
     probes = [p for _, p in segments]
-    filter_complex, audio_labels = _build_filter_complex(probes, episode_idx, include_audio=not is_first_pass)
     episode = probes[episode_idx]
+    plans = _plan_audios(ffmpeg_path, settings, episode, output_path.suffix.lower())
+    filter_complex, audio_labels = _build_filter_complex(
+        probes, episode_idx, plans, include_audio=not is_first_pass,
+    )
 
     cmd = [ffmpeg_path, "-y", "-hide_banner", "-loglevel", "error"]
     for path, _ in segments:
         cmd += ["-i", str(path)]
+    chapters_input_idx = None
+    if chapters_file is not None and not is_first_pass:
+        chapters_input_idx = len(segments)
+        cmd += ["-f", "ffmetadata", "-i", str(chapters_file)]
     cmd += ["-filter_complex", filter_complex, "-map", "[outv]"]
     if not is_first_pass:
         for label in audio_labels:
             cmd += ["-map", f"[{label}]"]
+        # Container-level info (file title etc.) comes from the episode, not from
+        # whichever clip happens to be the first input; chapters come from the
+        # time-shifted list, or none at all (never from a sigla).
+        cmd += ["-map_metadata", str(episode_idx)]
+        cmd += ["-map_chapters", str(chapters_input_idx) if chapters_input_idx is not None else "-1"]
 
     cmd += ["-c:v", settings.encoder, "-preset", settings.preset]
     if settings.tune_animation and settings.encoder in ("libx264", "libx265"):
@@ -295,10 +502,22 @@ def build_command(
         # First pass only needs the video analysis; skip audio and discard the output.
         cmd += ["-an", "-progress", "pipe:1", "-nostats", "-f", "null", os.devnull]
     else:
-        cmd += ["-c:a", "aac", "-b:a", AUDIO_BITRATE]
+        for j, plan in enumerate(plans):
+            cmd += [f"-c:a:{j}", plan.encoder]
+            if plan.bitrate_k:
+                cmd += [f"-b:a:{j}", f"{plan.bitrate_k}k"]
+        # The audio is re-encoded through the filtergraph, so ffmpeg doesn't carry the
+        # episode's per-track labels over by itself: set them explicitly.
+        set_default_flag = any(a.default for a in episode.audio)
         for j, audio_stream in enumerate(episode.audio or [AudioStream(0, None)]):
             lang = audio_stream.language or "und"
             cmd += [f"-metadata:s:a:{j}", f"language={lang}"]
+            if audio_stream.title:
+                cmd += [f"-metadata:s:a:{j}", f"title={audio_stream.title}"]
+                if output_path.suffix.lower() in MP4_LIKE_SUFFIXES:
+                    cmd += [f"-metadata:s:a:{j}", f"handler_name={audio_stream.title}"]
+            if set_default_flag:
+                cmd += [f"-disposition:a:{j}", "default" if audio_stream.default else "0"]
         cmd += ["-progress", "pipe:1", "-nostats", str(output_path)]
 
     return cmd
@@ -356,14 +575,19 @@ def remux_subtitles(
         ffmpeg_path, "-y", "-hide_banner", "-loglevel", "error",
         "-i", str(av_output),
         "-itsoffset", f"{intro_duration:.3f}", "-i", str(episode_path),
-        "-map", "0",
+        # Only video+audio from the first file: a blanket "-map 0" would also copy
+        # mp4's chapter data track, which the chapters re-create (duplicate track).
+        "-map", "0:v", "-map", "0:a", "-map_chapters", "0",
     ]
     for s in subtitles:
         cmd += ["-map", f"1:s:{s.index}"]
     cmd += ["-c", "copy"]
     # mp4/mov containers only support the mov_text subtitle codec via copy-compatible path.
-    if final_output.suffix.lower() in (".mp4", ".mov", ".m4v"):
+    if final_output.suffix.lower() in MP4_LIKE_SUFFIXES:
         cmd += ["-c:s", "mov_text"]
+        for k, s in enumerate(subtitles):
+            if s.title:
+                cmd += [f"-metadata:s:s:{k}", f"handler_name={s.title}"]
     cmd += [str(final_output)]
 
     proc = subprocess.run(cmd, capture_output=True, text=True, creationflags=CREATE_NO_WINDOW)
@@ -396,6 +620,7 @@ def merge_episode(
     output_path.parent.mkdir(parents=True, exist_ok=True)
     tmp_output = output_path.with_name(f".{output_path.stem}.part{output_path.suffix}")
     passlog_prefix = str(output_path.with_name(f".{output_path.stem}.2pass"))
+    chapters_path = output_path.with_name(f".{output_path.stem}.chapters.txt")
 
     use_two_pass = (
         settings.two_pass
@@ -413,6 +638,14 @@ def merge_episode(
         episode = probes[episode_idx]
         expected_duration = sum(p.duration for p in probes)
 
+        chapters_file = None
+        if episode.chapters:
+            write_chapters_file(
+                chapters_path, episode.chapters,
+                offset=sum(p.duration for p in probes[:episode_idx]),
+            )
+            chapters_file = chapters_path
+
         if use_two_pass:
             cmd1 = build_command(
                 ffmpeg_path, segments, episode_idx, tmp_output, settings,
@@ -425,7 +658,7 @@ def merge_episode(
             )
             cmd2 = build_command(
                 ffmpeg_path, segments, episode_idx, tmp_output, settings,
-                pass_num=2, passlog_prefix=passlog_prefix,
+                pass_num=2, passlog_prefix=passlog_prefix, chapters_file=chapters_file,
             )
             run_merge_pass(
                 cmd2, expected_duration,
@@ -433,7 +666,10 @@ def merge_episode(
                 cancel_event,
             )
         else:
-            cmd = build_command(ffmpeg_path, segments, episode_idx, tmp_output, settings)
+            cmd = build_command(
+                ffmpeg_path, segments, episode_idx, tmp_output, settings,
+                chapters_file=chapters_file,
+            )
             run_merge_pass(cmd, expected_duration, progress_cb, cancel_event)
 
         if episode.subtitles:
@@ -461,6 +697,7 @@ def merge_episode(
         output_path.unlink(missing_ok=True)
         return MergeResult(output_path=output_path, success=False, error=str(exc))
     finally:
+        chapters_path.unlink(missing_ok=True)
         if use_two_pass:
             # A plain prefix match, not Path.glob(): episode filenames routinely
             # contain "[...]" (quality tags, etc.), which glob() would parse as a

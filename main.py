@@ -26,7 +26,7 @@ import merger
 from merger import MergeSettings, MergeResult
 
 APP_TITLE = "ClipMerger"
-APP_VERSION = "0.2.6"
+APP_VERSION = "0.2.7"
 GITHUB_LATEST_RELEASE_API = "https://api.github.com/repos/Vipp0/ClipMerger/releases/latest"
 GITHUB_RELEASES_PAGE = "https://github.com/Vipp0/ClipMerger/releases/latest"
 
@@ -498,6 +498,18 @@ class MainWindow(QMainWindow):
         self.container_combo.addItem(".avi", ".avi")
         enc_grid.addWidget(self.container_combo, 5, 1)
 
+        enc_grid.addWidget(QLabel("Audio:"), 6, 0)
+        self.audio_combo = QComboBox()
+        self.audio_combo.addItem("Come originale (stesso codec, canali e bitrate dell'episodio)", "original")
+        self.audio_combo.addItem("AAC, mantieni i canali originali (es. 5.1 resta 5.1)", "aac_keep")
+        self.audio_combo.addItem("AAC stereo 192k (compatto)", "aac_stereo")
+        self.audio_combo.addItem("FLAC senza perdita (file più grandi, canali originali)", "flac")
+        self.audio_combo.setToolTip(
+            "Se il formato originale non è ammesso dal contenitore scelto, "
+            "viene usato automaticamente l'AAC con i canali originali."
+        )
+        enc_grid.addWidget(self.audio_combo, 6, 1, 1, 3)
+
         enc_box = QGroupBox("Codifica")
         enc_box.setLayout(enc_grid)
         root.addWidget(enc_box)
@@ -828,6 +840,7 @@ class MainWindow(QMainWindow):
             crf=self.crf_spin.value(), cbr_kbps=self.cbr_spin.value(),
             tune_animation=self.tune_check.isChecked() and self.tune_check.isEnabled(),
             two_pass=self.two_pass_check.isChecked() and self.two_pass_check.isEnabled(),
+            audio_mode=self.audio_combo.currentData(),
         )
 
         output_dir = Path(self.output_edit.text())
@@ -909,7 +922,7 @@ class MainWindow(QMainWindow):
         self.reset_btn.setEnabled(enabled)
         for w in (self.codec_combo, self.gpu_check, self.preset_combo, self.parallel_spin,
                   self.crf_radio, self.cbr_radio, self.orig_radio, self.crf_spin, self.cbr_spin,
-                  self.tune_check, self.two_pass_check, self.container_combo):
+                  self.tune_check, self.two_pass_check, self.container_combo, self.audio_combo):
             w.setEnabled(enabled)
         if enabled:
             self._update_gpu_checkbox()
