@@ -18,7 +18,7 @@ Applicazione desktop per Windows che unisce automaticamente una **sigla iniziale
 - **Verifica di integrità** automatica dell'output (controllo durata) al termine di ogni file.
 - **Codifica a 2 passaggi** (bitrate medio) per software H.264/H.265/AV1: stesso bitrate target, qualità distribuita meglio tra le scene.
 - **Tempo rimanente stimato**, per singolo file e per l'intero batch.
-- **Riepilogo di controllo** (durate, risoluzioni, avvisi) prima di avviare il batch, con possibilità di annullare.
+- **Riepilogo di controllo** (durate, risoluzioni, avvisi) prima di avviare il batch, con possibilità di annullare. L'analisi dei file avviene in background con un contatore ("Analisi dei file: 3/25") e si può interrompere.
 - **Dettaglio errore consultabile**: doppio click su una riga in coda per vedere lo stato/errore completo.
 - **Controllo aggiornamenti** automatico rispetto all'ultima release GitHub.
 - Elaborazioni **parallele** configurabili, con possibilità di annullare il batch in corso.

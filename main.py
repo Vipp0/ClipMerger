@@ -26,7 +26,7 @@ import merger
 from merger import MergeSettings, MergeResult
 
 APP_TITLE = "ClipMerger"
-APP_VERSION = "0.2.8"
+APP_VERSION = "0.2.9"
 GITHUB_LATEST_RELEASE_API = "https://api.github.com/repos/Vipp0/ClipMerger/releases/latest"
 GITHUB_RELEASES_PAGE = "https://github.com/Vipp0/ClipMerger/releases/latest"
 
@@ -292,6 +292,75 @@ class UpdateCheckWorker(QThread):
         self.checked.emit(tag)
 
 
+class PreflightWorker(QThread):
+    """Probes the sigle and every episode off the GUI thread (so the window stays
+    responsive and can show progress), then emits the text of the pre-start summary."""
+
+    progress = Signal(int, int)  # files analyzed so far, total
+    done = Signal(str, str)  # summary, warnings
+
+    def __init__(self, ffprobe_path: str, intro: str, outro: str, episodes: list[Path]):
+        super().__init__()
+        self.ffprobe_path = ffprobe_path
+        self.intro, self.outro = intro, outro
+        self.episodes = episodes
+
+    def run(self):
+        total = bool(self.intro) + bool(self.outro) + len(self.episodes)
+        analyzed = 0
+        lines = [f"Episodi in coda: {len(self.episodes)}"]
+        warnings = []
+
+        def tick():
+            nonlocal analyzed
+            analyzed += 1
+            self.progress.emit(analyzed, total)
+
+        sigle_parts = []
+        for label, path in (("iniziale", self.intro), ("finale", self.outro)):
+            if not path:
+                continue
+            if self.isInterruptionRequested():
+                return
+            try:
+                info = merger.probe(self.ffprobe_path, Path(path))
+                sigle_parts.append(f"Sigla {label}: {utils.format_duration(info.duration)}")
+            except merger.MergeError as exc:
+                warnings.append(f"Impossibile analizzare la sigla {label}: {exc}")
+            tick()
+        if sigle_parts:
+            lines.append("  ·  ".join(sigle_parts))
+
+        resolutions = set()
+        durations = []
+        for episode in self.episodes:
+            if self.isInterruptionRequested():
+                return
+            try:
+                info = merger.probe(self.ffprobe_path, episode)
+                resolutions.add((info.width, info.height))
+                durations.append(info.duration)
+            except merger.MergeError as exc:
+                warnings.append(f"{episode.name}: {exc}")
+            tick()
+
+        if durations:
+            lines.append(
+                f"Durata episodi: da {utils.format_duration(min(durations))} "
+                f"a {utils.format_duration(max(durations))}"
+            )
+        if resolutions:
+            res_str = ", ".join(f"{w}x{h}" for w, h in sorted(resolutions))
+            lines.append(f"Risoluzioni rilevate: {res_str}")
+            if len(resolutions) > 1:
+                warnings.append(
+                    "Gli episodi non hanno tutti la stessa risoluzione "
+                    "(verranno comunque adattati singolarmente)."
+                )
+
+        self.done.emit("\n".join(lines), "\n".join(warnings))
+
+
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -312,6 +381,10 @@ class MainWindow(QMainWindow):
         self.signals = MergeSignals()
         self.cancel_event = threading.Event()
         self.running = False
+        self.analyzing = False  # pre-start file analysis in progress
+        self.preflight_worker: PreflightWorker | None = None
+        self.retired_workers: list[PreflightWorker] = []  # cancelled but possibly still finishing
+        self.preflight_paths: list[Path] = []
 
         self.theme_choice = self.qsettings.value("theme", "auto")
         if self.theme_choice not in ("light", "dark", "auto"):
@@ -597,6 +670,10 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event):
         self.qsettings.setValue("window_geometry", self.saveGeometry())
+        for worker in [self.preflight_worker, *self.retired_workers]:
+            if worker is not None and worker.isRunning():
+                worker.requestInterruption()
+                worker.wait(5000)
         super().closeEvent(event)
 
     # ---------------------------------------------------------------- helpers
@@ -757,69 +834,63 @@ class MainWindow(QMainWindow):
             return "Seleziona la cartella di output."
         return None
 
-    def _build_preflight_summary(self) -> tuple[str, str]:
-        ffprobe = self.ffmpeg_status.ffprobe_path
-        lines = [f"Episodi in coda: {len(self.rows)}"]
-        warnings = []
-
-        sigle_parts = []
-        if self.intro_edit.text():
-            try:
-                intro = merger.probe(ffprobe, Path(self.intro_edit.text()))
-                sigle_parts.append(f"Sigla iniziale: {utils.format_duration(intro.duration)}")
-            except merger.MergeError as exc:
-                warnings.append(f"Impossibile analizzare la sigla iniziale: {exc}")
-        if self.outro_edit.text():
-            try:
-                outro = merger.probe(ffprobe, Path(self.outro_edit.text()))
-                sigle_parts.append(f"Sigla finale: {utils.format_duration(outro.duration)}")
-            except merger.MergeError as exc:
-                warnings.append(f"Impossibile analizzare la sigla finale: {exc}")
-        if sigle_parts:
-            lines.append("  ·  ".join(sigle_parts))
-
-        resolutions = set()
-        durations = []
-        for item in self.rows:
-            try:
-                info = merger.probe(ffprobe, item["path"])
-            except merger.MergeError as exc:
-                warnings.append(f"{item['path'].name}: {exc}")
-                continue
-            resolutions.add((info.width, info.height))
-            durations.append(info.duration)
-
-        if durations:
-            lines.append(
-                f"Durata episodi: da {utils.format_duration(min(durations))} "
-                f"a {utils.format_duration(max(durations))}"
-            )
-        if resolutions:
-            res_str = ", ".join(f"{w}x{h}" for w, h in sorted(resolutions))
-            lines.append(f"Risoluzioni rilevate: {res_str}")
-            if len(resolutions) > 1:
-                warnings.append(
-                    "Gli episodi non hanno tutti la stessa risoluzione "
-                    "(verranno comunque adattati singolarmente)."
-                )
-
-        return "\n".join(lines), "\n".join(warnings)
-
     def _start_batch(self):
         error = self._validate()
         if error:
             QMessageBox.warning(self, "Dati mancanti", error)
             return
 
-        summary, warnings = self._build_preflight_summary()
+        self.retired_workers = [w for w in self.retired_workers if w.isRunning()]
+        self.preflight_paths = [item["path"] for item in self.rows]
+        total = bool(self.intro_edit.text()) + bool(self.outro_edit.text()) + len(self.preflight_paths)
+        self.analyzing = True
+        self._set_controls_enabled(False)
+        self.summary_label.setText("")
+        self.global_progress.setValue(0)
+        self.eta_label.setText(f"Analisi dei file: 0/{total}")
+        self.preflight_worker = PreflightWorker(
+            self.ffmpeg_status.ffprobe_path, self.intro_edit.text(), self.outro_edit.text(),
+            self.preflight_paths,
+        )
+        self.preflight_worker.progress.connect(self._on_preflight_progress)
+        self.preflight_worker.done.connect(self._on_preflight_done)
+        self.preflight_worker.start()
+
+    def _on_preflight_progress(self, analyzed: int, total: int):
+        self.eta_label.setText(f"Analisi dei file: {analyzed}/{total}")
+        self.global_progress.setValue(int(analyzed * 100 / total) if total else 0)
+
+    def _end_preflight(self):
+        self.analyzing = False
+        self.global_progress.setValue(0)
+        self.eta_label.setText("")
+        self._set_controls_enabled(True)
+
+    def _cancel_preflight(self):
+        if self.preflight_worker is not None:
+            self.preflight_worker.progress.disconnect(self._on_preflight_progress)
+            self.preflight_worker.done.disconnect(self._on_preflight_done)
+            self.preflight_worker.requestInterruption()
+            self.retired_workers.append(self.preflight_worker)
+        self._end_preflight()
+
+    def _on_preflight_done(self, summary: str, warnings: str):
+        if not self.analyzing:
+            return
+        self._end_preflight()
+        if [item["path"] for item in self.rows] != self.preflight_paths:
+            self.summary_label.setText("L'elenco dei file è cambiato durante l'analisi: premi di nuovo Avvia.")
+            return
+
         message = summary + (f"\n\nAvvisi:\n{warnings}" if warnings else "")
         reply = QMessageBox.question(
             self, "Riepilogo prima di avviare", message,
             QMessageBox.Yes | QMessageBox.Cancel, QMessageBox.Yes,
         )
-        if reply != QMessageBox.Yes:
-            return
+        if reply == QMessageBox.Yes:
+            self._launch_batch()
 
+    def _launch_batch(self):
         codec = self._current_codec()
         use_gpu = self.gpu_check.isChecked() and self.gpu_check.isEnabled()
         encoder = self.hw_encoders.get(codec) if use_gpu else None
@@ -883,14 +954,16 @@ class MainWindow(QMainWindow):
             self.pool.start(task)
 
     def _on_start_stop_clicked(self):
-        if self.running:
+        if self.analyzing:
+            self._cancel_preflight()
+        elif self.running:
             self._cancel_batch()
         else:
             self._start_batch()
 
     def _update_start_stop_button(self):
-        if self.running:
-            self.start_btn.setText("Stop")
+        if self.running or self.analyzing:
+            self.start_btn.setText("Stop" if self.running else "Annulla")
             self.start_btn.setObjectName("danger")
         else:
             self.start_btn.setText("Avvia")
