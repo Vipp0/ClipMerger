@@ -13,6 +13,7 @@ import re
 import subprocess
 import threading
 from dataclasses import dataclass, field
+from fractions import Fraction
 from pathlib import Path
 from typing import Callable
 
@@ -55,6 +56,7 @@ class ProbeResult:
     video_bitrate: int | None
     audio: list[AudioStream] = field(default_factory=list)
     subtitles: list[SubtitleStream] = field(default_factory=list)
+    sar: Fraction = Fraction(1)  # pixel (sample) aspect ratio; != 1 means anamorphic
 
 
 @dataclass
@@ -108,6 +110,17 @@ def _parse_fps(rate_str: str) -> float:
     return float(rate_str)
 
 
+def _parse_sar(sar_str: str | None) -> Fraction:
+    """ffprobe reports e.g. "64:45", or "N/A" / "0:1" when unspecified (= square pixels)."""
+    if not sar_str or ":" not in sar_str:
+        return Fraction(1)
+    try:
+        num, den = (int(x) for x in sar_str.split(":"))
+    except ValueError:
+        return Fraction(1)
+    return Fraction(num, den) if num > 0 and den > 0 else Fraction(1)
+
+
 def probe(ffprobe_path: str, path: Path) -> ProbeResult:
     data = _run_ffprobe(ffprobe_path, path)
     fmt = data.get("format", {})
@@ -148,6 +161,7 @@ def probe(ffprobe_path: str, path: Path) -> ProbeResult:
     return ProbeResult(
         duration=duration, width=width, height=height, fps=fps,
         video_bitrate=video_bitrate, audio=audio_streams, subtitles=subtitle_streams,
+        sar=_parse_sar(video_stream.get("sample_aspect_ratio")),
     )
 
 
@@ -190,12 +204,28 @@ def _build_filter_complex(
     n = len(segments)
     parts: list[str] = []
 
-    # Video: scale/pad/fps-normalize each input to the episode's own params.
-    for i in range(n):
-        parts.append(
-            f"[{i}:v:0]scale=w={W}:h={H}:force_original_aspect_ratio=decrease,"
-            f"pad={W}:{H}:(ow-iw)/2:(oh-ih)/2:color=black,setsar=1,fps={FPS}[v{i}]"
-        )
+    # Video: scale/pad/fps-normalize each input to the episode's own params, keeping
+    # the episode's pixel aspect ratio so its on-screen shape isn't altered.
+    sar = episode.sar
+    sar_expr = f"{sar.numerator}/{sar.denominator}"
+    for i, seg in enumerate(segments):
+        if i == episode_idx or seg.sar == sar:
+            parts.append(
+                f"[{i}:v:0]scale=w={W}:h={H}:force_original_aspect_ratio=decrease,"
+                f"pad={W}:{H}:(ow-iw)/2:(oh-ih)/2:color=black,setsar={sar_expr},fps={FPS}[v{i}]"
+            )
+        else:
+            # Different pixel shape than the episode: fit the clip in square-pixel
+            # (on-screen) terms into the episode's on-screen box, then convert back
+            # to the episode's stored size and pixel aspect ratio.
+            dw = round(W * sar)
+            dw += dw % 2
+            parts.append(
+                f"[{i}:v:0]scale=w='iw*sar':h=ih,setsar=1,"
+                f"scale=w={dw}:h={H}:force_original_aspect_ratio=decrease,"
+                f"pad={dw}:{H}:(ow-iw)/2:(oh-ih)/2:color=black,"
+                f"scale=w={W}:h={H},setsar={sar_expr},fps={FPS}[v{i}]"
+            )
     parts.append("".join(f"[v{i}]" for i in range(n)) + f"concat=n={n}:v=1:a=0[outv]")
 
     if not include_audio:
