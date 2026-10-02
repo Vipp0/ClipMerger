@@ -65,6 +65,21 @@ class Chapter:
 
 
 @dataclass
+class Cover:
+    pos: int  # ffmpeg "v:N" position of this cover-art stream in its source file
+    codec: str
+    filename: str | None
+
+
+@dataclass
+class CoverFile:
+    """A cover image extracted to disk so it can be re-attached to an mkv as a real attachment."""
+    path: Path
+    mimetype: str
+    filename: str
+
+
+@dataclass
 class ProbeResult:
     duration: float
     width: int
@@ -75,6 +90,9 @@ class ProbeResult:
     subtitles: list[SubtitleStream] = field(default_factory=list)
     sar: Fraction = Fraction(1)  # pixel (sample) aspect ratio; != 1 means anamorphic
     chapters: list[Chapter] = field(default_factory=list)
+    video_index: int = 0  # position of the real video among the file's video-type streams
+    covers: list[Cover] = field(default_factory=list)  # embedded cover art (shows up as a "video")
+    attachment_count: int = 0  # mkv attachments proper (e.g. subtitle fonts)
 
 
 @dataclass
@@ -160,10 +178,25 @@ def probe(ffprobe_path: str, path: Path) -> ProbeResult:
     audio_streams: list[AudioStream] = []
     subtitle_streams: list[SubtitleStream] = []
 
+    video_pos = 0  # ffmpeg's "v:N" numbering counts every video-type stream, covers included
+    video_index = 0
+    covers: list[Cover] = []
+    attachment_count = 0
+
     for s in data.get("streams", []):
         codec_type = s.get("codec_type")
-        if codec_type == "video" and video_stream is None:
-            video_stream = s
+        if codec_type == "video":
+            if (s.get("disposition") or {}).get("attached_pic"):
+                covers.append(Cover(
+                    pos=video_pos, codec=s.get("codec_name", ""),
+                    filename=(s.get("tags") or {}).get("filename"),
+                ))
+            elif video_stream is None:
+                video_stream = s
+                video_index = video_pos
+            video_pos += 1
+        elif codec_type == "attachment":
+            attachment_count += 1
         elif codec_type == "audio":
             tags = s.get("tags") or {}
             audio_streams.append(AudioStream(
@@ -212,6 +245,7 @@ def probe(ffprobe_path: str, path: Path) -> ProbeResult:
         duration=duration, width=width, height=height, fps=fps,
         video_bitrate=video_bitrate, audio=audio_streams, subtitles=subtitle_streams,
         sar=_parse_sar(video_stream.get("sample_aspect_ratio")), chapters=chapters,
+        video_index=video_index, covers=covers, attachment_count=attachment_count,
     )
 
 
@@ -380,7 +414,7 @@ def _build_filter_complex(
     for i, seg in enumerate(segments):
         if i == episode_idx or seg.sar == sar:
             parts.append(
-                f"[{i}:v:0]scale=w={W}:h={H}:force_original_aspect_ratio=decrease,"
+                f"[{i}:v:{seg.video_index}]scale=w={W}:h={H}:force_original_aspect_ratio=decrease,"
                 f"pad={W}:{H}:(ow-iw)/2:(oh-ih)/2:color=black,setsar={sar_expr},fps={FPS}[v{i}]"
             )
         else:
@@ -390,7 +424,7 @@ def _build_filter_complex(
             dw = round(W * sar)
             dw += dw % 2
             parts.append(
-                f"[{i}:v:0]scale=w='iw*sar':h=ih,setsar=1,"
+                f"[{i}:v:{seg.video_index}]scale=w='iw*sar':h=ih,setsar=1,"
                 f"scale=w={dw}:h={H}:force_original_aspect_ratio=decrease,"
                 f"pad={dw}:{H}:(ow-iw)/2:(oh-ih)/2:color=black,"
                 f"scale=w={W}:h={H},setsar={sar_expr},fps={FPS}[v{i}]"
@@ -459,7 +493,7 @@ def build_command(
     ffmpeg_path: str, segments: list[tuple[Path, ProbeResult]], episode_idx: int,
     output_path: Path, settings: MergeSettings,
     pass_num: int | None = None, passlog_prefix: str | None = None,
-    chapters_file: Path | None = None,
+    chapters_file: Path | None = None, cover_files: list[CoverFile] = (),
 ) -> list[str]:
     is_first_pass = pass_num == 1
     probes = [p for _, p in segments]
@@ -506,6 +540,28 @@ def build_command(
             cmd += [f"-c:a:{j}", plan.encoder]
             if plan.bitrate_k:
                 cmd += [f"-b:a:{j}", f"{plan.bitrate_k}k"]
+        # Carry over the episode's attachments (mkv: subtitle fonts) and cover art.
+        # Containers that can't hold them just skip. In mkv the attachment streams must
+        # come last, and a cover has to be re-attached as a real attachment (copying it
+        # as a video stream would turn it into a stray extra video track); mp4 holds
+        # cover art as a flagged picture stream, which can be copied directly.
+        suffix = output_path.suffix.lower()
+        if suffix == ".mkv":
+            if episode.attachment_count:
+                cmd += ["-map", f"{episode_idx}:t?"]
+            for k, cf in enumerate(cover_files):
+                t = episode.attachment_count + k
+                cmd += [
+                    "-attach", str(cf.path),
+                    f"-metadata:s:t:{t}", f"mimetype={cf.mimetype}",
+                    f"-metadata:s:t:{t}", f"filename={cf.filename}",
+                ]
+        elif suffix in MP4_LIKE_SUFFIXES:
+            for n, cover in enumerate(episode.covers, start=1):
+                cmd += [
+                    "-map", f"{episode_idx}:v:{cover.pos}",
+                    f"-c:v:{n}", "copy", f"-disposition:v:{n}", "attached_pic",
+                ]
         # The audio is re-encoded through the filtergraph, so ffmpeg doesn't carry the
         # episode's per-track labels over by itself: set them explicitly.
         set_default_flag = any(a.default for a in episode.audio)
@@ -568,22 +624,40 @@ def run_merge_pass(
 def remux_subtitles(
     ffmpeg_path: str, av_output: Path, episode_path: Path,
     intro_duration: float, subtitles: list[SubtitleStream], final_output: Path,
+    attachment_count: int = 0, cover_count: int = 0, cover_files: list[CoverFile] = (),
 ) -> None:
     """Second lightweight pass: copy the episode's subtitle tracks into the final
-    file, shifted by the intro's duration so they stay in sync, no re-encode."""
+    file, shifted by the intro's duration so they stay in sync, no re-encode. The
+    first file's attachments and cover art are carried across the same way they
+    were put there (see build_command)."""
+    suffix = final_output.suffix.lower()
     cmd = [
         ffmpeg_path, "-y", "-hide_banner", "-loglevel", "error",
         "-i", str(av_output),
         "-itsoffset", f"{intro_duration:.3f}", "-i", str(episode_path),
-        # Only video+audio from the first file: a blanket "-map 0" would also copy
-        # mp4's chapter data track, which the chapters re-create (duplicate track).
-        "-map", "0:v", "-map", "0:a", "-map_chapters", "0",
+        # Explicit maps instead of a blanket "-map 0": that would also copy mp4's
+        # chapter data track (the chapters re-create it, giving a duplicate) and
+        # turn an mkv cover into a stray extra video track.
+        "-map", "0:v:0", "-map", "0:a", "-map_chapters", "0",
     ]
+    if suffix in MP4_LIKE_SUFFIXES:
+        for n in range(1, cover_count + 1):
+            cmd += ["-map", f"0:v:{n}"]
     for s in subtitles:
         cmd += ["-map", f"1:s:{s.index}"]
+    if suffix == ".mkv":  # attachment streams have to come last
+        if attachment_count:
+            cmd += ["-map", "0:t?"]
+        for k, cf in enumerate(cover_files):
+            t = attachment_count + k
+            cmd += [
+                "-attach", str(cf.path),
+                f"-metadata:s:t:{t}", f"mimetype={cf.mimetype}",
+                f"-metadata:s:t:{t}", f"filename={cf.filename}",
+            ]
     cmd += ["-c", "copy"]
     # mp4/mov containers only support the mov_text subtitle codec via copy-compatible path.
-    if final_output.suffix.lower() in MP4_LIKE_SUFFIXES:
+    if suffix in MP4_LIKE_SUFFIXES:
         cmd += ["-c:s", "mov_text"]
         for k, s in enumerate(subtitles):
             if s.title:
@@ -607,6 +681,37 @@ def verify_output(ffprobe_path: str, output_path: Path, expected_duration: float
         )
 
 
+_COVER_FORMATS = {  # codec -> (file extension, mimetype)
+    "mjpeg": (".jpg", "image/jpeg"), "png": (".png", "image/png"),
+    "bmp": (".bmp", "image/bmp"), "webp": (".webp", "image/webp"),
+}
+
+
+def _extract_cover(
+    ffmpeg_path: str, episode_path: Path, cover: Cover, n: int, output_path: Path,
+) -> CoverFile | None:
+    """Dump an embedded cover image next to the output so it can be attached to an mkv.
+    Cover art is a nicety, so any failure here just means no cover, never a failed merge."""
+    fmt = _COVER_FORMATS.get(cover.codec)
+    if fmt is None:
+        return None
+    ext, mimetype = fmt
+    target = output_path.with_name(f".{output_path.stem}.cover{n}{ext}")
+    try:
+        proc = subprocess.run(
+            [ffmpeg_path, "-y", "-hide_banner", "-loglevel", "error", "-i", str(episode_path),
+             "-map", f"0:v:{cover.pos}", "-c", "copy", "-frames:v", "1", "-f", "image2", str(target)],
+            capture_output=True, timeout=60, creationflags=CREATE_NO_WINDOW,
+        )
+    except (subprocess.SubprocessError, OSError):
+        target.unlink(missing_ok=True)
+        return None
+    if proc.returncode != 0 or not target.exists() or target.stat().st_size == 0:
+        target.unlink(missing_ok=True)
+        return None
+    return CoverFile(path=target, mimetype=mimetype, filename=cover.filename or f"cover{ext}")
+
+
 def merge_episode(
     ffmpeg_path: str, ffprobe_path: str,
     intro_path: Path | None, episode_path: Path, outro_path: Path | None, output_path: Path,
@@ -621,6 +726,7 @@ def merge_episode(
     tmp_output = output_path.with_name(f".{output_path.stem}.part{output_path.suffix}")
     passlog_prefix = str(output_path.with_name(f".{output_path.stem}.2pass"))
     chapters_path = output_path.with_name(f".{output_path.stem}.chapters.txt")
+    cover_files: list[CoverFile] = []
 
     use_two_pass = (
         settings.two_pass
@@ -646,6 +752,12 @@ def merge_episode(
             )
             chapters_file = chapters_path
 
+        if output_path.suffix.lower() == ".mkv":
+            for n, cover in enumerate(episode.covers):
+                cover_file = _extract_cover(ffmpeg_path, episode_path, cover, n, output_path)
+                if cover_file is not None:
+                    cover_files.append(cover_file)
+
         if use_two_pass:
             cmd1 = build_command(
                 ffmpeg_path, segments, episode_idx, tmp_output, settings,
@@ -659,6 +771,7 @@ def merge_episode(
             cmd2 = build_command(
                 ffmpeg_path, segments, episode_idx, tmp_output, settings,
                 pass_num=2, passlog_prefix=passlog_prefix, chapters_file=chapters_file,
+                cover_files=cover_files,
             )
             run_merge_pass(
                 cmd2, expected_duration,
@@ -668,7 +781,7 @@ def merge_episode(
         else:
             cmd = build_command(
                 ffmpeg_path, segments, episode_idx, tmp_output, settings,
-                chapters_file=chapters_file,
+                chapters_file=chapters_file, cover_files=cover_files,
             )
             run_merge_pass(cmd, expected_duration, progress_cb, cancel_event)
 
@@ -680,6 +793,8 @@ def merge_episode(
             remux_subtitles(
                 ffmpeg_path, tmp_output, episode_path, intro_duration,
                 episode.subtitles, output_path,
+                attachment_count=episode.attachment_count,
+                cover_count=len(episode.covers), cover_files=cover_files,
             )
             tmp_output.unlink(missing_ok=True)
         else:
@@ -698,6 +813,8 @@ def merge_episode(
         return MergeResult(output_path=output_path, success=False, error=str(exc))
     finally:
         chapters_path.unlink(missing_ok=True)
+        for cf in cover_files:
+            cf.path.unlink(missing_ok=True)
         if use_two_pass:
             # A plain prefix match, not Path.glob(): episode filenames routinely
             # contain "[...]" (quality tags, etc.), which glob() would parse as a
