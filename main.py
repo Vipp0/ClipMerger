@@ -26,7 +26,7 @@ import merger
 from merger import MergeSettings, MergeResult
 
 APP_TITLE = "ClipMerger"
-APP_VERSION = "0.2.9"
+APP_VERSION = "0.2.10"
 GITHUB_LATEST_RELEASE_API = "https://api.github.com/repos/Vipp0/ClipMerger/releases/latest"
 GITHUB_RELEASES_PAGE = "https://github.com/Vipp0/ClipMerger/releases/latest"
 
@@ -189,6 +189,7 @@ class DropTableWidget(QTableWidget):
 
     folder_dropped = Signal(str)
     files_dropped = Signal(list)
+    delete_requested = Signal()
 
     def __init__(self):
         super().__init__(0, 3)
@@ -202,6 +203,17 @@ class DropTableWidget(QTableWidget):
         self.setColumnWidth(COL_PROGRESS, 160)
         self.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.setSelectionMode(QAbstractItemView.ExtendedSelection)
+        self.setToolTip(
+            "Seleziona più file con Ctrl o Maiusc (Ctrl+A per tutti), "
+            "poi premi Canc o tasto destro per rimuoverli dalla coda."
+        )
+
+    def keyPressEvent(self, event):
+        if event.key() == Qt.Key_Delete:
+            self.delete_requested.emit()
+            return
+        super().keyPressEvent(event)
 
     def dragEnterEvent(self, event: QDragEnterEvent):
         if event.mimeData().hasUrls():
@@ -633,6 +645,7 @@ class MainWindow(QMainWindow):
         self.table.cellDoubleClicked.connect(self._show_row_detail)
         self.table.setContextMenuPolicy(Qt.CustomContextMenu)
         self.table.customContextMenuRequested.connect(self._show_queue_context_menu)
+        self.table.delete_requested.connect(self._remove_selected_rows)
         self.start_btn.clicked.connect(self._on_start_stop_clicked)
         self.reset_btn.clicked.connect(self._reset_all)
         self.signals.progress.connect(self._on_progress)
@@ -811,18 +824,37 @@ class MainWindow(QMainWindow):
         status = self.rows[row].get("last_status", "")
         QMessageBox.information(self, name, status or "Nessun dettaglio disponibile.")
 
+    def _selected_rows(self) -> list[int]:
+        return sorted({idx.row() for idx in self.table.selectionModel().selectedRows()})
+
+    def _remove_selected_rows(self):
+        if self.running or self.analyzing:
+            return
+        rows = [r for r in self._selected_rows() if r < len(self.rows)]
+        for row in reversed(rows):  # bottom-up, so earlier indices stay valid
+            self.table.removeRow(row)
+            del self.rows[row]
+
     def _show_queue_context_menu(self, pos):
-        if self.running:
+        if self.running or self.analyzing:
             return
         row = self.table.rowAt(pos.y())
         if row < 0 or row >= len(self.rows):
             return
+        if row not in self._selected_rows():  # right-clicking outside the selection acts on that row alone
+            self.table.clearSelection()
+            self.table.selectRow(row)
+        count = len(self._selected_rows())
         menu = QMenu(self)
-        remove_action = menu.addAction("Rimuovi dalla coda")
+        remove_action = menu.addAction(
+            "Rimuovi dalla coda" if count == 1 else f"Rimuovi {count} elementi dalla coda"
+        )
+        select_all_action = menu.addAction("Seleziona tutto")
         chosen = menu.exec(self.table.viewport().mapToGlobal(pos))
         if chosen == remove_action:
-            self.table.removeRow(row)
-            del self.rows[row]
+            self._remove_selected_rows()
+        elif chosen == select_all_action:
+            self.table.selectAll()
 
     # ---------------------------------------------------------------- batch run
     def _validate(self) -> str | None:

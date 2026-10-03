@@ -4,7 +4,7 @@ Applicazione desktop per Windows che unisce automaticamente una **sigla iniziale
 
 ## Funzionalità
 
-- **Coda batch** con drag & drop di una cartella intera (o di singoli file video) e barra di avanzamento per ogni video.
+- **Coda batch** con drag & drop di una cartella intera (o di singoli file video) e barra di avanzamento per ogni video. Si possono rimuovere più file alla volta: selezione con Ctrl/Maiusc (Ctrl+A per tutti), poi Canc o tasto destro.
 - **Riconoscimento automatico delle sigle**: se nella cartella trascinata un file contiene "sigla" insieme a "iniziale" o "finale" nel nome (anche separate da parentesi o altro testo), viene assegnato da solo ai campi corrispondenti invece di finire in coda come episodio.
 - **Ricodifica robusta**: episodio, sigla iniziale e sigla finale possono avere risoluzione, framerate o codec diversi tra loro — l'episodio fa sempre da riferimento e le sigle vengono adattate.
 - **Codec**: H.264, H.265 (HEVC), AV1, con rilevamento automatico e uso opzionale dell'accelerazione hardware (NVIDIA NVENC, Intel QuickSync, AMD AMF) se disponibile.

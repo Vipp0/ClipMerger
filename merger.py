@@ -224,8 +224,14 @@ def probe(ffprobe_path: str, path: Path) -> ProbeResult:
     height = int(video_stream.get("height") or 0)
     fps = _parse_fps(video_stream.get("avg_frame_rate") or video_stream.get("r_frame_rate") or "25/1")
 
-    v_bitrate = video_stream.get("bit_rate")
-    video_bitrate = int(v_bitrate) if v_bitrate else (int(fmt["bit_rate"]) if fmt.get("bit_rate") else None)
+    # Video-only bitrate. Many containers (mkv especially) don't declare it per stream;
+    # the file's overall bit_rate then includes the audio, so using it as-is would make
+    # "keep original bitrate" aim too high by the audio's share - subtract the audio.
+    video_bitrate = _to_int(video_stream.get("bit_rate")) or _to_int((video_stream.get("tags") or {}).get("BPS"))
+    if video_bitrate is None and _to_int(fmt.get("bit_rate")):
+        total = int(fmt["bit_rate"])
+        audio_bits = sum(a.bitrate or 64000 * max(a.channels, 1) for a in audio_streams)
+        video_bitrate = max(total - audio_bits, total // 2)
 
     if duration <= 0:
         raise MergeError(f"{path.name}: durata non rilevabile.")
