@@ -5,6 +5,7 @@ Avvio: python main.py
 from __future__ import annotations
 
 import json
+import re
 import sys
 import threading
 import time
@@ -26,9 +27,14 @@ import merger
 from merger import MergeSettings, MergeResult
 
 APP_TITLE = "ClipMerger"
-APP_VERSION = "0.3.0"
+APP_VERSION = "0.3.1"
 GITHUB_LATEST_RELEASE_API = "https://api.github.com/repos/Vipp0/ClipMerger/releases/latest"
 GITHUB_RELEASES_PAGE = "https://github.com/Vipp0/ClipMerger/releases/latest"
+
+def version_tuple(version: str) -> tuple[int, ...]:
+    """"v0.2.10" -> (0, 2, 10), so versions compare numerically (0.2.10 is newer than 0.2.9)."""
+    return tuple(int(n) for n in re.findall(r"\d+", version.split("-")[0]))
+
 
 PRESET_LABELS = [("Veloce", "fast"), ("Bilanciato", "medium"), ("Qualità", "slow")]
 CODEC_LABELS = [("H.264", "h264"), ("H.265 (HEVC)", "h265"), ("AV1", "av1")]
@@ -736,7 +742,9 @@ class MainWindow(QMainWindow):
         if not latest_tag:
             return
         latest = latest_tag.lstrip("vV")
-        if latest and latest != APP_VERSION:
+        # Only when the published release is NEWER: a build ahead of the latest release
+        # (e.g. one being tested before it is published) must not be told to "update".
+        if latest and version_tuple(latest) > version_tuple(APP_VERSION):
             self.update_label.setText(
                 f'<a href="{GITHUB_RELEASES_PAGE}">Nuova versione disponibile: {latest_tag}</a>'
             )
