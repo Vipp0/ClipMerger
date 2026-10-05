@@ -14,6 +14,11 @@ Applicazione desktop per Windows che unisce automaticamente una **sigla iniziale
 - **Audio a scelta**: come originale (stesso codec, canali e bitrate dell'episodio, con ripiego automatico su AAC se il contenitore o ffmpeg non lo supportano), AAC con i canali originali (5.1 resta 5.1), AAC stereo 192k, oppure FLAC senza perdita.
 - **Capitoli** dell'episodio mantenuti e riallineati alla durata della sigla iniziale; **titolo interno del file** preso dall'episodio.
 - **Allegati e copertine** dell'episodio portati nel file finale: font dei sottotitoli e copertine in MKV, copertina incorporata in MP4 (un MP4 non può contenere font allegati).
+- **Sincronia audio/video** garantita attorno alle sigle anche con file "sporchi" (audio più lungo o in ritardo rispetto al video): video e audio si concatenano insieme.
+- **Video ruotati** (metadato di rotazione, tipico dei video da telefono) gestiti correttamente.
+- **Deinterlaccia automatica** dei video segnalati come interlacciati (vecchi DVD/TV), disattivabile; **10 bit mantenuti** per H.265/AV1 software se l'episodio è a 10 bit.
+- **Contenitore di ripiego**: con "come originale", se l'estensione dell'episodio non può contenere il codec scelto (es. `.webm`, `.mpg`) il file viene salvato come `.mkv`; nomi di output duplicati vengono numerati. I sottotitoli non supportati dal formato di uscita vengono saltati (con nota nello stato) invece di far fallire il file.
+- **Chiusura sicura**: chiudere la finestra durante la codifica chiede conferma, ferma ffmpeg ed elimina i file parziali.
 - **Proporzione dei pixel (SAR)** dell'episodio preservata, così i video "anamorfici" (vecchi DVD/AVI, TV registrata) non risultano più stretti.
 - **Verifica di integrità** automatica dell'output (controllo durata) al termine di ogni file.
 - **Codifica a 2 passaggi** (bitrate medio) per software H.264/H.265/AV1: stesso bitrate target, qualità distribuita meglio tra le scene.
@@ -52,21 +57,13 @@ Produce l'eseguibile in `dist\ClipMerger\ClipMerger.exe` (modalità PyInstaller 
 - Preset di codifica salvabili/richiamabili, in stile HandBrake (al posto del semplice "ricorda le ultime impostazioni").
 - Preset più veloce dedicato al primo passaggio della codifica a 2 passaggi, per ridurre il tempo totale (oggi entrambi i passaggi usano lo stesso preset, quindi il 2-pass costa quasi il doppio del tempo di un singolo passaggio).
 
-## Problemi noti (bug check del 2026-10-05, da sistemare)
+## Limiti noti
 
-Tutti riprodotti con file di prova, tranne dove indicato.
-
-- **Sincronia audio/video attorno alle sigle**: video e audio vengono concatenati con due filtri separati, quindi se nell'episodio l'audio è più lungo/corto del video (o parte in ritardo) la differenza si accumula e l'audio della sigla finale esce sfasato (provato: audio più lungo di 2 s → sfasamento di 2 s). Con file ben fatti la differenza è di decine di ms. Correzione provata a mano: un solo `concat` con `v=1:a=N`.
-- **Coda modificata durante la codifica**: caricare/trascinare una nuova cartella o dei file mentre un batch è in corso, e poi premere Stop, lascia il programma bloccato per sempre (`running` resta vero). Mancano blocchi su drop/sfoglia durante l'esecuzione e l'analisi.
-- **AV1 software (libsvtav1) non parte mai**: il preset passato è `fast/medium/slow` ma libsvtav1 vuole un numero (-2..13). I 2 passaggi funzionano con preset numerico.
-- **"Contenitore: come originale"** fallisce per episodi `.webm`, `.mpg`, `.mpeg` (muxer incompatibile con H.264/AAC); H.265 fallisce anche in `.wmv`. Il messaggio d'errore è criptico.
-- **Sottotitoli in contenitori che non li supportano** (`.avi`, `.flv`, `.wmv`): l'errore arriva solo dopo l'intera codifica (tempo sprecato). Con `.mov`, copertina + sottotitoli fallisce nel secondo passaggio (cerca un flusso `0:v:1` che non c'è). I sottotitoli a immagine (PGS/VobSub) verso MP4 non sono stati testati ma falliranno per lo stesso motivo.
-- **Video ruotati** (metadato di rotazione, tipico dei video da telefono): le dimensioni di riferimento sono quelle "grezze", quindi l'episodio esce come striscia stretta con grandi bande nere. Correzione provata: scambiare larghezza/altezza se la rotazione è 90/270.
-- **Video interlacciati** (vecchi DVD/TV): in uscita il flag di interlacciamento si perde (`progressive`), quindi il lettore non deinterlaccia più e si vede l'effetto "pettine" nei movimenti.
-- **Video a 10 bit**: l'uscita è sempre a 8 bit (rischio banding sui gradienti, comune nei cartoni a 10 bit); il materiale HDR perde la sua gamma.
-- **Stesso nome, estensione diversa** (`Puntata 1.mp4` e `Puntata 1.avi`) con un contenitore fisso: i due lavori usano lo stesso file di output e lo stesso file temporaneo, uno dei due fallisce con errore criptico.
-- **Chiudere la finestra durante la codifica** non annulla pulitamente: ffmpeg si interrompe da solo ma lascia nella cartella di output il file nascosto `.part` (e i file del 2 passaggi).
-- Non verificati (solo lettura del codice o impossibile qui): `avg_frame_rate` "0/0" fa ignorare `r_frame_rate` (si ripiega su 25 fps); con la GPU un numero di elaborazioni parallele superiore al limite delle sessioni NVENC può far fallire alcuni file; più file "sigla iniziale" nella stessa cartella: vince l'ultimo, gli altri spariscono dalla coda senza avviso; cartella di output uguale alla sorgente: una nuova esecuzione ricodifica anche i file prodotti.
+- **Materiale HDR**: viene ricodificato senza conversione della gamma di colori (il 10 bit si conserva, ma i metadati HDR no).
+- **Interlacciamento non dichiarato**: viene riconosciuto solo se il file lo segnala (`field_order`); un video interlacciato senza flag non viene deinterlacciato.
+- **Con la scheda video** (non verificato qui, nessuna NVIDIA/AMD disponibile): un numero di elaborazioni parallele superiore al limite delle sessioni NVENC può far fallire alcuni file, e su AMD il preset scelto non ha effetto (AMF non usa `-preset`).
+- **Copertine in MP4** conservate come immagine incorporata; i font allegati dei MKV non possono stare in un MP4.
+- **Sottotitoli a immagine** (PGS/VobSub) si copiano solo in MKV; verso altri formati vengono saltati e lo stato della riga lo segnala.
 
 ## Struttura del progetto
 

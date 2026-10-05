@@ -25,6 +25,17 @@ STEREO_AAC_KBPS = 192
 DURATION_TOLERANCE = 0.02  # 2%
 TWO_PASS_ENCODERS = ("libx264", "libx265", "libsvtav1")  # software encoders that support -pass
 MP4_LIKE_SUFFIXES = (".mp4", ".mov", ".m4v")  # these store track names in handler_name, not title
+TEN_BIT_ENCODERS = ("libx265", "libsvtav1")  # software encoders whose 10-bit mode is used for 10-bit sources
+# SVT-AV1 takes a number (-2..13) for -preset, not the fast/medium/slow words the others accept.
+_SVTAV1_PRESETS = {"fast": "8", "medium": "6", "slow": "4"}
+# Video codec -> containers that accept it, only used to pick a safe container when the
+# user asks for "same as the original" and the source's own extension can't hold the output.
+_CONTAINERS_FOR_CODEC = {
+    "h264": {".mp4", ".mkv", ".mov", ".avi", ".ts", ".m2ts", ".flv", ".wmv"},
+    "h265": {".mp4", ".mkv", ".mov", ".avi", ".ts", ".m2ts", ".flv"},
+    "av1": {".mp4", ".mkv", ".avi", ".ts", ".m2ts", ".flv", ".wmv"},
+}
+_TEXT_SUBTITLE_CODECS = {"subrip", "srt", "ass", "ssa", "mov_text", "webvtt", "text"}
 
 
 class MergeError(Exception):
@@ -93,6 +104,8 @@ class ProbeResult:
     video_index: int = 0  # position of the real video among the file's video-type streams
     covers: list[Cover] = field(default_factory=list)  # embedded cover art (shows up as a "video")
     attachment_count: int = 0  # mkv attachments proper (e.g. subtitle fonts)
+    interlaced: bool = False  # field_order says the video is interlaced
+    bit_depth: int = 8
 
 
 @dataclass
@@ -107,6 +120,8 @@ class MergeSettings:
     tune_animation: bool = False  # -tune animation; only meaningful for libx264/libx265
     two_pass: bool = False  # average-bitrate 2-pass; only for software encoders + cbr/original
     audio_mode: str = "original"  # "original" | "aac_keep" | "aac_stereo" | "flac"
+    deinterlace: bool = True  # deinterlace sources flagged as interlaced (the flag can't survive re-encoding)
+    keep_10bit: bool = True  # keep 10-bit sources 10-bit (software H.265/AV1 only)
 
 
 @dataclass
@@ -115,6 +130,7 @@ class MergeResult:
     success: bool
     skipped: bool = False
     error: str | None = None
+    note: str | None = None  # something worth telling the user about a successful merge
 
 
 def _run_ffprobe(ffprobe_path: str, path: Path) -> dict:
@@ -167,6 +183,26 @@ def _to_int(value) -> int | None:
     except (TypeError, ValueError):
         return None
     return n if n > 0 else None
+
+
+def _rotation_degrees(video_stream: dict) -> int:
+    """Display rotation (0/90/180/270) from the display-matrix side data or the legacy
+    "rotate" tag. ffmpeg auto-rotates the picture, so size computations must follow."""
+    for side in video_stream.get("side_data_list") or []:
+        if "rotation" in side:
+            try:
+                return int(round(float(side["rotation"]))) % 360
+            except (TypeError, ValueError):
+                pass
+    try:
+        return int((video_stream.get("tags") or {}).get("rotate", 0)) % 360
+    except (TypeError, ValueError):
+        return 0
+
+
+def _bit_depth(video_stream: dict) -> int:
+    m = re.search(r"(\d+)(?:le|be)$", video_stream.get("pix_fmt") or "")
+    return int(m.group(1)) if m else 8
 
 
 def probe(ffprobe_path: str, path: Path) -> ProbeResult:
@@ -222,7 +258,12 @@ def probe(ffprobe_path: str, path: Path) -> ProbeResult:
 
     width = int(video_stream.get("width") or 0)
     height = int(video_stream.get("height") or 0)
-    fps = _parse_fps(video_stream.get("avg_frame_rate") or video_stream.get("r_frame_rate") or "25/1")
+    if _rotation_degrees(video_stream) in (90, 270):
+        width, height = height, width
+    # "0/0" is truthy but means "unknown": fall through to r_frame_rate in that case
+    rate = next((r for r in (video_stream.get("avg_frame_rate"), video_stream.get("r_frame_rate"))
+                 if r and r != "0/0"), "25/1")
+    fps = _parse_fps(rate)
 
     # Video-only bitrate. Many containers (mkv especially) don't declare it per stream;
     # the file's overall bit_rate then includes the audio, so using it as-is would make
@@ -252,6 +293,8 @@ def probe(ffprobe_path: str, path: Path) -> ProbeResult:
         video_bitrate=video_bitrate, audio=audio_streams, subtitles=subtitle_streams,
         sar=_parse_sar(video_stream.get("sample_aspect_ratio")), chapters=chapters,
         video_index=video_index, covers=covers, attachment_count=attachment_count,
+        interlaced=video_stream.get("field_order") in ("tt", "bb", "tb", "bt"),
+        bit_depth=_bit_depth(video_stream),
     )
 
 
@@ -262,6 +305,9 @@ def _rate_control_args(settings: MergeSettings, bitrate_kbps: int | None) -> lis
 
     if mode in ("cbr", "original"):
         kbps = bitrate_kbps or settings.cbr_kbps
+        if enc == "libsvtav1":
+            # SVT-AV1 rejects -maxrate/-bufsize outside CRF mode ("Max Bitrate only supported with CRF mode")
+            return ["-b:v", f"{kbps}k"]
         args = [f"-b:v", f"{kbps}k", "-maxrate", f"{kbps}k", "-bufsize", f"{kbps * 2}k"]
         if "_nvenc" in enc or "_amf" in enc:
             args = ["-rc", "cbr"] + args
@@ -277,6 +323,36 @@ def _rate_control_args(settings: MergeSettings, bitrate_kbps: int | None) -> lis
         return ["-rc", "cqp", "-qp_i", str(crf), "-qp_p", str(crf), "-qp_b", str(crf)]
     # libx264 / libx265 / libsvtav1
     return ["-crf", str(crf)]
+
+
+def _encoder_preset(settings: MergeSettings) -> str:
+    if settings.encoder == "libsvtav1":
+        return _SVTAV1_PRESETS.get(settings.preset, "6")
+    return settings.preset
+
+
+def pick_container(source_suffix: str, codec: str, forced: str = "") -> tuple[str, bool]:
+    """Output extension for an episode. An explicit choice is honored as-is. For "same as
+    the original" the source's extension is used when it can hold the chosen video codec
+    (not true for e.g. .webm or .mpg); otherwise .mkv is used. Returns (suffix, changed)."""
+    if forced:
+        return forced, False
+    suffix = source_suffix.lower()
+    if suffix in _CONTAINERS_FOR_CODEC.get(codec, set()):
+        return source_suffix, False
+    return ".mkv", True
+
+
+def subtitles_for_container(suffix: str, subtitles: list[SubtitleStream]) -> list[SubtitleStream]:
+    """The subtitle tracks that can actually be carried into a `suffix` file: everything
+    in mkv, text-based ones (converted to mov_text) in mp4/mov, nothing elsewhere (avi,
+    flv, wmv reject them, and ts/m2ts would turn them into an unusable data stream)."""
+    suffix = suffix.lower()
+    if suffix == ".mkv":
+        return list(subtitles)
+    if suffix in MP4_LIKE_SUFFIXES:
+        return [s for s in subtitles if s.codec in _TEXT_SUBTITLE_CODECS]
+    return []
 
 
 @dataclass
@@ -399,15 +475,14 @@ def _plan_audios(ffmpeg_path: str, settings: MergeSettings, episode: ProbeResult
 
 
 def _build_filter_complex(
-    segments: list[ProbeResult], episode_idx: int, plans: list[AudioPlan], include_audio: bool = True,
+    segments: list[ProbeResult], episode_idx: int, plans: list[AudioPlan], deinterlace: bool = True,
 ) -> tuple[str, list[str]]:
     """Returns (filter_complex_string, output_audio_labels). `segments` holds every
     clip being concatenated, in input order - sigla iniziale and sigla finale are
     each optional, so this is 2 or 3 items; `episode_idx` says which one is the real
-    episode, whose resolution/fps/audio-track-count drives the output. A filtergraph
-    output that isn't mapped makes ffmpeg fail ("unconnected"), so when the caller
-    won't map audio (e.g. the -an first pass of a 2-pass encode) the audio chains
-    must be left out entirely rather than just built-and-ignored."""
+    episode, whose resolution/fps/audio-track-count drives the output. Every output of
+    the graph (video and each audio track) has to be mapped by the caller, otherwise
+    ffmpeg fails with an "unconnected" output."""
     episode = segments[episode_idx]
     W, H, FPS = episode.width, episode.height, episode.fps
     n = len(segments)
@@ -418,9 +493,12 @@ def _build_filter_complex(
     sar = episode.sar
     sar_expr = f"{sar.numerator}/{sar.denominator}"
     for i, seg in enumerate(segments):
+        # The interlaced flag can't survive re-encoding, so unless it's switched off the
+        # fields are merged here (one output frame per input frame, parity auto-detected).
+        deint = "yadif=mode=0:parity=-1:deint=0," if deinterlace and seg.interlaced else ""
         if i == episode_idx or seg.sar == sar:
             parts.append(
-                f"[{i}:v:{seg.video_index}]scale=w={W}:h={H}:force_original_aspect_ratio=decrease,"
+                f"[{i}:v:{seg.video_index}]{deint}scale=w={W}:h={H}:force_original_aspect_ratio=decrease,"
                 f"pad={W}:{H}:(ow-iw)/2:(oh-ih)/2:color=black,setsar={sar_expr},fps={FPS}[v{i}]"
             )
         else:
@@ -430,25 +508,20 @@ def _build_filter_complex(
             dw = round(W * sar)
             dw += dw % 2
             parts.append(
-                f"[{i}:v:{seg.video_index}]scale=w='iw*sar':h=ih,setsar=1,"
+                f"[{i}:v:{seg.video_index}]{deint}scale=w='iw*sar':h=ih,setsar=1,"
                 f"scale=w={dw}:h={H}:force_original_aspect_ratio=decrease,"
                 f"pad={dw}:{H}:(ow-iw)/2:(oh-ih)/2:color=black,"
                 f"scale=w={W}:h={H},setsar={sar_expr},fps={FPS}[v{i}]"
             )
-    parts.append("".join(f"[v{i}]" for i in range(n)) + f"concat=n={n}:v=1:a=0[outv]")
-
-    if not include_audio:
-        return ";".join(parts), []
 
     # Audio: one output track per episode audio track; sigle reuse/duplicate their
     # own track(s), or generate silence if they have none at all. Every segment is
     # converted to that track's plan (sample rate, channel layout) so concat accepts them.
-    output_audio_labels: list[str] = []
     n_tracks = max(1, len(episode.audio))
+    output_audio_labels = [f"outa{j}" for j in range(n_tracks)]
     for j in range(n_tracks):
         plan = plans[j]
         fmt = f":sample_fmts={plan.sample_fmt}" if plan.sample_fmt else ""
-        seg_labels = []
         for seg_i, seg_probe in enumerate(segments):
             if seg_i == episode_idx:
                 src = f"[{seg_i}:a:{j}]" if j < len(episode.audio) else None
@@ -467,10 +540,16 @@ def _build_filter_complex(
                     f"{src}aresample={plan.sample_rate},"
                     f"aformat=channel_layouts={plan.layout}{fmt}[{label}]"
                 )
-            seg_labels.append(f"[{label}]")
-        out_label = f"outa{j}"
-        parts.append("".join(seg_labels) + f"concat=n={n}:v=0:a=1[{out_label}]")
-        output_audio_labels.append(out_label)
+
+    # ONE concat for picture and sound together. Separate concats for video and audio
+    # let any per-segment length mismatch (audio a bit longer/shorter than the video, or
+    # starting late) pile up, so the sigla finale's sound drifted away from its picture;
+    # the joint filter lines every segment up on its longest stream instead.
+    segment_inputs = "".join(
+        f"[v{i}]" + "".join(f"[a{i}_{j}]" for j in range(n_tracks)) for i in range(n)
+    )
+    outputs = "[outv]" + "".join(f"[{label}]" for label in output_audio_labels)
+    parts.append(f"{segment_inputs}concat=n={n}:v=1:a={n_tracks}{outputs}")
 
     return ";".join(parts), output_audio_labels
 
@@ -506,7 +585,7 @@ def build_command(
     episode = probes[episode_idx]
     plans = _plan_audios(ffmpeg_path, settings, episode, output_path.suffix.lower())
     filter_complex, audio_labels = _build_filter_complex(
-        probes, episode_idx, plans, include_audio=not is_first_pass,
+        probes, episode_idx, plans, deinterlace=settings.deinterlace,
     )
 
     cmd = [ffmpeg_path, "-y", "-hide_banner", "-loglevel", "error"]
@@ -517,18 +596,23 @@ def build_command(
         chapters_input_idx = len(segments)
         cmd += ["-f", "ffmetadata", "-i", str(chapters_file)]
     cmd += ["-filter_complex", filter_complex, "-map", "[outv]"]
+    # The audio outputs are mapped in the first pass too (and thrown away there): the
+    # filtergraph - and with it the video timeline the pass-1 statistics describe - has
+    # to be identical in both passes, and an unmapped graph output makes ffmpeg fail.
+    for label in audio_labels:
+        cmd += ["-map", f"[{label}]"]
     if not is_first_pass:
-        for label in audio_labels:
-            cmd += ["-map", f"[{label}]"]
         # Container-level info (file title etc.) comes from the episode, not from
         # whichever clip happens to be the first input; chapters come from the
         # time-shifted list, or none at all (never from a sigla).
         cmd += ["-map_metadata", str(episode_idx)]
         cmd += ["-map_chapters", str(chapters_input_idx) if chapters_input_idx is not None else "-1"]
 
-    cmd += ["-c:v", settings.encoder, "-preset", settings.preset]
+    cmd += ["-c:v", settings.encoder, "-preset", _encoder_preset(settings)]
     if settings.tune_animation and settings.encoder in ("libx264", "libx265"):
         cmd += ["-tune", "animation"]
+    if settings.keep_10bit and episode.bit_depth >= 10 and settings.encoder in TEN_BIT_ENCODERS:
+        cmd += ["-pix_fmt", "yuv420p10le"]
 
     bitrate_kbps = None
     if settings.bitrate_mode == "original":
@@ -539,8 +623,9 @@ def build_command(
         cmd += ["-pass", str(pass_num), "-passlogfile", passlog_prefix]
 
     if is_first_pass:
-        # First pass only needs the video analysis; skip audio and discard the output.
-        cmd += ["-an", "-progress", "pipe:1", "-nostats", "-f", "null", os.devnull]
+        # First pass only needs the video analysis: the audio is cheap raw PCM and the
+        # whole output is discarded.
+        cmd += ["-c:a", "pcm_s16le", "-progress", "pipe:1", "-nostats", "-f", "null", os.devnull]
     else:
         for j, plan in enumerate(plans):
             cmd += [f"-c:a:{j}", plan.encoder]
@@ -791,23 +876,39 @@ def merge_episode(
             )
             run_merge_pass(cmd, expected_duration, progress_cb, cancel_event)
 
-        if episode.subtitles:
+        notes = []
+        if settings.deinterlace and any(p.interlaced for p in probes):
+            notes.append("video interlacciato: deinterlacciato")
+
+        # Only carry over the subtitle tracks the output container can really hold; an
+        # unsupported one would fail the remux, after the whole encode had been done.
+        kept_subs = subtitles_for_container(output_path.suffix, episode.subtitles)
+        if len(kept_subs) < len(episode.subtitles):
+            dropped = len(episode.subtitles) - len(kept_subs)
+            notes.append(
+                f"{dropped} traccia/e sottotitoli non copiata/e (non supportate dal formato {output_path.suffix})"
+            )
+
+        if kept_subs:
             # Subtitle timestamps need shifting only by whatever precedes the episode
             # in the final timeline - that's the sigla iniziale's duration, or 0 if
             # there isn't one.
             intro_duration = probes[0].duration if episode_idx > 0 else 0.0
+            # What the intermediate file really contains (a container may have dropped
+            # a cover or attachment), rather than what the episode had.
+            part = probe(ffprobe_path, tmp_output)
             remux_subtitles(
                 ffmpeg_path, tmp_output, episode_path, intro_duration,
-                episode.subtitles, output_path,
-                attachment_count=episode.attachment_count,
-                cover_count=len(episode.covers), cover_files=cover_files,
+                kept_subs, output_path,
+                attachment_count=part.attachment_count,
+                cover_count=len(part.covers), cover_files=cover_files,
             )
             tmp_output.unlink(missing_ok=True)
         else:
             tmp_output.replace(output_path)
 
         verify_output(ffprobe_path, output_path, expected_duration)
-        return MergeResult(output_path=output_path, success=True)
+        return MergeResult(output_path=output_path, success=True, note="; ".join(notes) or None)
 
     except Cancelled:
         tmp_output.unlink(missing_ok=True)

@@ -50,7 +50,8 @@ def check_ffmpeg() -> FfmpegStatus:
 def list_video_files(folder: Path) -> list[Path]:
     return sorted(
         p for p in folder.iterdir()
-        if p.is_file() and p.suffix.lower() in VIDEO_EXTENSIONS
+        # dot-files include our own leftover temp files (".name.part.mkv"), never episodes
+        if p.is_file() and p.suffix.lower() in VIDEO_EXTENSIONS and not p.name.startswith(".")
     )
 
 

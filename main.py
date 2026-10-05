@@ -26,7 +26,7 @@ import merger
 from merger import MergeSettings, MergeResult
 
 APP_TITLE = "ClipMerger"
-APP_VERSION = "0.2.10"
+APP_VERSION = "0.3.0"
 GITHUB_LATEST_RELEASE_API = "https://api.github.com/repos/Vipp0/ClipMerger/releases/latest"
 GITHUB_RELEASES_PAGE = "https://github.com/Vipp0/ClipMerger/releases/latest"
 
@@ -397,6 +397,7 @@ class MainWindow(QMainWindow):
         self.preflight_worker: PreflightWorker | None = None
         self.retired_workers: list[PreflightWorker] = []  # cancelled but possibly still finishing
         self.preflight_paths: list[Path] = []
+        self.row_notes: dict[int, list[str]] = {}  # per-row remarks shown next to "Completato"
 
         self.theme_choice = self.qsettings.value("theme", "auto")
         if self.theme_choice not in ("light", "dark", "auto"):
@@ -595,12 +596,25 @@ class MainWindow(QMainWindow):
         )
         enc_grid.addWidget(self.audio_combo, 6, 1, 1, 3)
 
+        self.deinterlace_check = QCheckBox(
+            "Deinterlaccia i video interlacciati (vecchi DVD / registrazioni TV: senza, si vedrebbe l'effetto \"pettine\")"
+        )
+        self.deinterlace_check.setChecked(True)
+        enc_grid.addWidget(self.deinterlace_check, 7, 0, 1, 4)
+
+        self.ten_bit_check = QCheckBox(
+            "Mantieni i 10 bit se l'episodio è a 10 bit (solo H.265 / AV1 software; evita le bande nei gradienti)"
+        )
+        self.ten_bit_check.setChecked(True)
+        enc_grid.addWidget(self.ten_bit_check, 8, 0, 1, 4)
+
         enc_box = QGroupBox("Codifica")
         enc_box.setLayout(enc_grid)
         root.addWidget(enc_box)
 
         self._update_tune_checkbox()
         self._update_two_pass_checkbox()
+        self._update_ten_bit_checkbox()
 
         # Queue table
         self.table = DropTableWidget()
@@ -638,8 +652,10 @@ class MainWindow(QMainWindow):
         self.codec_combo.currentIndexChanged.connect(self._update_gpu_checkbox)
         self.codec_combo.currentIndexChanged.connect(self._update_tune_checkbox)
         self.codec_combo.currentIndexChanged.connect(self._update_two_pass_checkbox)
+        self.codec_combo.currentIndexChanged.connect(self._update_ten_bit_checkbox)
         self.gpu_check.toggled.connect(self._update_tune_checkbox)
         self.gpu_check.toggled.connect(self._update_two_pass_checkbox)
+        self.gpu_check.toggled.connect(self._update_ten_bit_checkbox)
         self.bitrate_group.idClicked.connect(self.bitrate_stack.setCurrentIndex)
         self.bitrate_group.idClicked.connect(self._update_two_pass_checkbox)
         self.table.cellDoubleClicked.connect(self._show_row_detail)
@@ -682,6 +698,21 @@ class MainWindow(QMainWindow):
             self._apply_theme(self._resolve_theme("auto"))
 
     def closeEvent(self, event):
+        if self.running:
+            reply = QMessageBox.question(
+                self, "Codifica in corso",
+                "C'è una codifica in corso: chiudendo il programma verrà interrotta e i file "
+                "parziali eliminati. Chiudere comunque?",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
+            )
+            if reply != QMessageBox.Yes:
+                event.ignore()
+                return
+            # Let the running tasks stop their ffmpeg and delete their partial files
+            # before the process goes away (otherwise those files are left behind).
+            self.cancel_event.set()
+            self.pool.clear()
+            self.pool.waitForDone(20000)
         self.qsettings.setValue("window_geometry", self.saveGeometry())
         for worker in [self.preflight_worker, *self.retired_workers]:
             if worker is not None and worker.isRunning():
@@ -729,6 +760,14 @@ class MainWindow(QMainWindow):
             self.gpu_check.setToolTip(self.hw_reasons.get(codec, ""))
         self._update_tune_checkbox()
         self._update_two_pass_checkbox()
+        self._update_ten_bit_checkbox()
+
+    def _update_ten_bit_checkbox(self):
+        # Only disabled, never unchecked: the choice survives switching codec back and forth.
+        if not hasattr(self, "ten_bit_check"):
+            return
+        using_hw = self.gpu_check.isChecked() and self.gpu_check.isEnabled()
+        self.ten_bit_check.setEnabled(self._current_codec() in ("h265", "av1") and not using_hw)
 
     def _update_tune_checkbox(self):
         if not hasattr(self, "tune_check"):
@@ -749,11 +788,23 @@ class MainWindow(QMainWindow):
             self.two_pass_check.setChecked(False)
 
     def _browse_folder(self):
+        if self._queue_locked():
+            return
         folder = QFileDialog.getExistingDirectory(self, "Seleziona cartella puntate")
         if folder:
             self._load_folder(folder)
 
+    def _queue_locked(self) -> bool:
+        """Replacing the queue under a running batch (or while it's being analyzed) makes
+        row indices point at the wrong rows, and used to leave Stop/Reset dead for good."""
+        if self.running or self.analyzing:
+            self.summary_label.setText("Non puoi cambiare la coda mentre è in corso un'elaborazione.")
+            return True
+        return False
+
     def _load_folder(self, folder: str):
+        if self._queue_locked():
+            return
         self.folder_edit.setText(folder)
         files = utils.list_video_files(Path(folder))
         if not files:
@@ -764,6 +815,8 @@ class MainWindow(QMainWindow):
             self.output_edit.setText(str(Path(folder) / "output"))
 
     def _load_files(self, files: list[Path]):
+        if self._queue_locked():
+            return
         files = self._auto_assign_sigle(files)
         self.rows = []
         self.table.setRowCount(0)
@@ -776,15 +829,22 @@ class MainWindow(QMainWindow):
         them. Matched as separate words rather than one exact phrase, so filenames
         with brackets or other text between them (e.g. "Sigla [1080p] Iniziale.mkv")
         are still recognized."""
-        remaining = []
+        intros, outros, remaining = [], [], []
         for f in files:
             name = f.name.lower()
             if "sigla" in name and "iniziale" in name:
-                self.intro_edit.setText(str(f))
+                intros.append(f)
             elif "sigla" in name and "finale" in name:
-                self.outro_edit.setText(str(f))
+                outros.append(f)
             else:
                 remaining.append(f)
+        if intros:
+            self.intro_edit.setText(str(intros[0]))
+        if outros:
+            self.outro_edit.setText(str(outros[0]))
+        ignored = [f.name for f in intros[1:] + outros[1:]]
+        if ignored:
+            self.summary_label.setText("Più sigle trovate: usata la prima, ignorate: " + ", ".join(ignored))
         return remaining
 
     def _add_row(self, path: Path):
@@ -809,13 +869,16 @@ class MainWindow(QMainWindow):
             self.output_edit.setText(folder)
 
     def _set_row_status(self, row: int, status: str):
-        self.table.item(row, COL_STATUS).setText(status)
+        item = self.table.item(row, COL_STATUS)
+        if item is not None:  # a row can vanish under a late signal; never let that kill the slot
+            item.setText(status)
         if row < len(self.rows):
             self.rows[row]["last_status"] = status
 
     def _set_row_progress(self, row: int, pct: float):
-        bar: QProgressBar = self.table.cellWidget(row, COL_PROGRESS)
-        bar.setValue(int(pct * 100))
+        bar: QProgressBar | None = self.table.cellWidget(row, COL_PROGRESS)
+        if bar is not None:
+            bar.setValue(int(pct * 100))
 
     def _show_row_detail(self, row: int, _column: int):
         if row >= len(self.rows):
@@ -914,6 +977,12 @@ class MainWindow(QMainWindow):
             self.summary_label.setText("L'elenco dei file è cambiato durante l'analisi: premi di nuovo Avvia.")
             return
 
+        output_dir = Path(self.output_edit.text()).resolve()
+        if any(p.resolve().parent == output_dir for p in self.preflight_paths):
+            warnings = (warnings + "\n" if warnings else "") + (
+                "La cartella di output coincide con quella dei file sorgente: una nuova esecuzione "
+                "ricodificherebbe anche i file già prodotti."
+            )
         message = summary + (f"\n\nAvvisi:\n{warnings}" if warnings else "")
         reply = QMessageBox.question(
             self, "Riepilogo prima di avviare", message,
@@ -944,6 +1013,8 @@ class MainWindow(QMainWindow):
             tune_animation=self.tune_check.isChecked() and self.tune_check.isEnabled(),
             two_pass=self.two_pass_check.isChecked() and self.two_pass_check.isEnabled(),
             audio_mode=self.audio_combo.currentData(),
+            deinterlace=self.deinterlace_check.isChecked(),
+            keep_10bit=self.ten_bit_check.isChecked() and self.ten_bit_check.isEnabled(),
         )
 
         output_dir = Path(self.output_edit.text())
@@ -971,10 +1042,25 @@ class MainWindow(QMainWindow):
         self.eta_label.setText("")
 
         container_suffix = self.container_combo.currentData()
+        used_names: set[str] = set()
+        self.row_notes = {}
         for row, item in enumerate(self.rows):
             episode_path = item["path"]
-            suffix = container_suffix or episode_path.suffix
-            output_path = output_dir / (episode_path.stem + suffix)
+            suffix, changed = merger.pick_container(episode_path.suffix, codec, container_suffix)
+            notes = []
+            if changed:
+                notes.append(f"salvato come {suffix}: il formato {episode_path.suffix} non supporta questo codec")
+            # Two episodes sharing a name (e.g. "Puntata 1.mp4" and "Puntata 1.avi") would
+            # otherwise write the very same output and temp files.
+            stem, n = episode_path.stem, 1
+            while f"{stem}{suffix}".lower() in used_names:
+                n += 1
+                stem = f"{episode_path.stem} ({n})"
+            used_names.add(f"{stem}{suffix}".lower())
+            if n > 1:
+                notes.append(f"nome già usato da un altro episodio: salvato come {stem}{suffix}")
+            self.row_notes[row] = notes
+            output_path = output_dir / (stem + suffix)
             item["output"] = output_path
             self._set_row_status(row, "In coda")
             self._set_row_progress(row, 0.0)
@@ -1076,7 +1162,8 @@ class MainWindow(QMainWindow):
             self._set_row_progress(row, 1.0)
             self.skip_count += 1
         elif result.success:
-            self._set_row_status(row, "Completato")
+            notes = [*self.row_notes.get(row, []), *([result.note] if result.note else [])]
+            self._set_row_status(row, "Completato" + (f" — {'; '.join(notes)}" if notes else ""))
             self._set_row_progress(row, 1.0)
             self.ok_count += 1
         else:
