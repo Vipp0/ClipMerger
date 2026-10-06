@@ -9,6 +9,18 @@ ClipMerger (PySide6, `main.py` + `merger.py` + `utils.py`) oggi unisce sigla ini
 
 Il piano originale incollato faceva riferimento a un altro progetto (CustomTkinter, "percorso FFmpeg" condiviso, changelog "✅ Fixato —", Spot Cutter). Qui è adattato a ClipMerger com'è davvero.
 
+## Stato delle fasi
+
+- **Fase 0 (documentazione)**: fatta.
+- **Fase 1 (motore `trova_sigla.py`)**: scritto e collaudato su episodi sintetici con verità nota (voce vera + sigla inserita a tempi precisi). Risultati: casi normali (volume diverso, equalizzazione, sigla accorciata all'inizio o alla fine, sigla all'istante 0, due comparse, sigla assente, brano diverso) con errore massimo 0,03 s su `cerca` e 0,05 s su `impara`; con voce sopra la sigla l'inizio è preciso (0,07-0,10 s) e la fine prudente (il silenzio finale non viene riconosciuto); circa 0,4 s per episodio con `cerca`, 8 s per imparare da 8 episodi. **In attesa del collaudo su episodi veri di Fabrizio** (richiesto: entro mezzo secondo dal controllo a mano).
+- Fasi 2-5: da fare.
+
+Note tecniche emerse nel collaudo (da non dimenticare):
+- Le caratteristiche usate sono la **differenza nel tempo** dei livelli per banda (annulla volume e equalizzazione fissa). Il tentativo di "agganciare" i bordi al salto più netto è stato scartato: sulle sigle che iniziano piano (dissolvenza in entrata) sceglie un salto interno.
+- Un bordo deciso dalla curva di somiglianza cade a metà della finestra di analisi (84 ms): va corretto di mezza finestra; un bordo coincidente con quello del campione è esatto.
+- Se sia il campione sia l'episodio sono silenziosi accanto alla parte trovata (es. coda muta della sigla), il silenzio fa parte della sigla; se sopra c'è parlato o rumore, non si estende (prudente).
+- Nella sigla di Giorgione, la sigla finale riusa la stessa musica della iniziale: un campione "diverso" non è sempre diverso. I dati di prova stanno nello scratchpad della sessione, non nel repo.
+
 ## Decisioni già prese con Fabrizio
 
 1. **Come si ottiene il campione della sigla da togliere**: o un file separato fornito dall'utente, **oppure il programma "impara" la sigla scansionando la cartella degli episodi** (la sigla è uguale in ogni episodio). Niente strumento di ritaglio manuale.
