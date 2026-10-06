@@ -54,6 +54,7 @@ Produce l'eseguibile in `dist\ClipMerger\ClipMerger.exe` (modalità PyInstaller 
 
 ## Roadmap (idee per versioni future)
 
+- **Scheda "Sostituisci sigla"** (in lavorazione, a fasi): trova automaticamente una sigla dentro gli episodi (da un campione, oppure "imparandola" dalla cartella) e la sostituisce con un'altra, solo audio o audio + video. Piano completo e stato delle fasi in [docs/PIANO_SOSTITUISCI_SIGLA.md](docs/PIANO_SOSTITUISCI_SIGLA.md).
 - Preset di codifica salvabili/richiamabili, in stile HandBrake (al posto del semplice "ricorda le ultime impostazioni").
 - Preset più veloce dedicato al primo passaggio della codifica a 2 passaggi, per ridurre il tempo totale (oggi entrambi i passaggi usano lo stesso preset, quindi il 2-pass costa quasi il doppio del tempo di un singolo passaggio).
 
