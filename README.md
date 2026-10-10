@@ -18,6 +18,7 @@ Applicazione desktop per Windows che unisce automaticamente una **sigla iniziale
 - **Video ruotati** (metadato di rotazione, tipico dei video da telefono) gestiti correttamente.
 - **Deinterlaccia automatica** dei video segnalati come interlacciati (vecchi DVD/TV), disattivabile; **10 bit mantenuti** per H.265/AV1 software se l'episodio è a 10 bit.
 - **Contenitore di ripiego**: con "come originale", se l'estensione dell'episodio non può contenere il codec scelto (es. `.webm`, `.mpg`) il file viene salvato come `.mkv`; nomi di output duplicati vengono numerati. I sottotitoli non supportati dal formato di uscita vengono saltati (con nota nello stato) invece di far fallire il file.
+- **MP4/MOV pronti per lo streaming** (Plex, NAS, web): l'indice del file viene scritto all'inizio (`faststart`), così la riproduzione parte subito.
 - **Chiusura sicura**: chiudere la finestra durante la codifica chiede conferma, ferma ffmpeg ed elimina i file parziali.
 - **Proporzione dei pixel (SAR)** dell'episodio preservata, così i video "anamorfici" (vecchi DVD/AVI, TV registrata) non risultano più stretti.
 - **Verifica di integrità** automatica dell'output (controllo durata) al termine di ogni file.

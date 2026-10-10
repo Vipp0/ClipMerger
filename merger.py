@@ -665,6 +665,8 @@ def build_command(
                     cmd += [f"-metadata:s:a:{j}", f"handler_name={audio_stream.title}"]
             if set_default_flag:
                 cmd += [f"-disposition:a:{j}", "default" if audio_stream.default else "0"]
+        if suffix in MP4_LIKE_SUFFIXES:
+            cmd += ["-movflags", "+faststart"]  # index up front: streams (Plex) start at once
         cmd += ["-progress", "pipe:1", "-nostats", str(output_path)]
 
     return cmd
@@ -753,6 +755,7 @@ def remux_subtitles(
         for k, s in enumerate(subtitles):
             if s.title:
                 cmd += [f"-metadata:s:s:{k}", f"handler_name={s.title}"]
+        cmd += ["-movflags", "+faststart"]
     cmd += [str(final_output)]
 
     proc = subprocess.run(cmd, capture_output=True, text=True, creationflags=CREATE_NO_WINDOW)
