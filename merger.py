@@ -32,7 +32,7 @@ _SVTAV1_PRESETS = {"fast": "8", "medium": "6", "slow": "4"}
 # user asks for "same as the original" and the source's own extension can't hold the output.
 _CONTAINERS_FOR_CODEC = {
     "h264": {".mp4", ".mkv", ".mov", ".avi", ".ts", ".m2ts", ".flv", ".wmv"},
-    "h265": {".mp4", ".mkv", ".mov", ".avi", ".ts", ".m2ts", ".flv"},
+    "h265": {".mp4", ".mkv", ".mov", ".ts", ".m2ts", ".flv"},  # not .avi: ffmpeg writes H.265 there without a codec tag, so nothing can play it
     "av1": {".mp4", ".mkv", ".avi", ".ts", ".m2ts", ".flv", ".wmv"},
 }
 _TEXT_SUBTITLE_CODECS = {"subrip", "srt", "ass", "ssa", "mov_text", "webvtt", "text"}
@@ -106,6 +106,7 @@ class ProbeResult:
     attachment_count: int = 0  # mkv attachments proper (e.g. subtitle fonts)
     interlaced: bool = False  # field_order says the video is interlaced
     bit_depth: int = 8
+    video_codec: str = ""  # ffprobe codec_name of the video ("h264", "hevc", "av1", ...)
 
 
 @dataclass
@@ -295,7 +296,43 @@ def probe(ffprobe_path: str, path: Path) -> ProbeResult:
         video_index=video_index, covers=covers, attachment_count=attachment_count,
         interlaced=video_stream.get("field_order") in ("tt", "bb", "tb", "bt"),
         bit_depth=_bit_depth(video_stream),
+        video_codec=video_stream.get("codec_name", ""),
     )
+
+
+# ffprobe codec_name -> the codec names of the app's codec menu (None = not writable here)
+_APP_CODEC_FOR_SOURCE = {"h264": "h264", "hevc": "h265", "av1": "av1"}
+_CODEC_DISPLAY_NAMES = {
+    "h264": "H.264", "hevc": "H.265", "h265": "H.265", "av1": "AV1", "vp9": "VP9",
+    "mpeg4": "MPEG-4", "mpeg2video": "MPEG-2",
+}
+# Rule of thumb: bitrate each codec needs for about the same picture quality, relative to
+# H.264. Checked on a 1080p AV1 source at 1 Mbit/s: H.264 at that bitrate looked clearly
+# blockier, H.265 recovered most of it, H.264 needed 2-3x to match.
+_RELATIVE_BITRATE = {"h264": 1.0, "vp9": 0.65, "hevc": 0.6, "h265": 0.6, "av1": 0.5}
+
+
+def app_codec_for(source_codec: str) -> str | None:
+    """The app's codec ("h264"/"h265"/"av1") matching a source's ffprobe codec name."""
+    return _APP_CODEC_FOR_SOURCE.get(source_codec)
+
+
+def codec_display_name(source_codec: str) -> str:
+    return _CODEC_DISPLAY_NAMES.get(source_codec, source_codec.upper() or "?")
+
+
+def compensated_bitrate_kbps(source_codec: str, source_kbps: int, out_codec: str) -> int | None:
+    """Bitrate the output codec needs to look about as good as the source did at
+    source_kbps. None when the source's bitrate is already enough (same or less
+    efficient source codec) or a codec is unknown."""
+    src = _RELATIVE_BITRATE.get(source_codec)
+    out = _RELATIVE_BITRATE.get(out_codec)
+    if not src or not out or source_kbps <= 0:
+        return None
+    ratio = out / src
+    if ratio < 1.15:
+        return None
+    return int(round(source_kbps * ratio / 50.0)) * 50
 
 
 def _rate_control_args(settings: MergeSettings, bitrate_kbps: int | None) -> list[str]:

@@ -4,12 +4,14 @@ Avvio: python main.py
 """
 from __future__ import annotations
 
+import dataclasses
 import json
 import re
 import sys
 import threading
 import time
 import urllib.request
+from collections import Counter
 from pathlib import Path
 
 from PySide6.QtCore import Qt, QObject, Signal, QRunnable, QThreadPool, QThread, QSettings
@@ -27,7 +29,7 @@ import merger
 from merger import MergeSettings, MergeResult
 
 APP_TITLE = "ClipMerger"
-APP_VERSION = "0.3.2"
+APP_VERSION = "0.3.3"
 GITHUB_LATEST_RELEASE_API = "https://api.github.com/repos/Vipp0/ClipMerger/releases/latest"
 GITHUB_RELEASES_PAGE = "https://github.com/Vipp0/ClipMerger/releases/latest"
 
@@ -310,6 +312,50 @@ class UpdateCheckWorker(QThread):
         self.checked.emit(tag)
 
 
+def format_kbps(kbps: int) -> str:
+    return f"{kbps:,}".replace(",", ".")
+
+
+def describe_source_codecs(infos: list[tuple[str, int | None]]) -> str:
+    """"AV1, ~1.000 kbit/s" for a uniform set; "20 × AV1, 5 × H.264 (da ... a ...)" for a mixed one."""
+    counts = Counter(merger.codec_display_name(c) for c, _ in infos)
+    rates = [b // 1000 for _, b in infos if b]
+    if len(counts) == 1:
+        text = next(iter(counts))
+        if len(infos) > 1:
+            text = f"tutti {text}"
+    else:
+        text = ", ".join(f"{n} × {name}" for name, n in counts.most_common())
+    if rates:
+        lo, hi = min(rates), max(rates)
+        text += f", ~{format_kbps(lo)} kbit/s" if hi < lo * 1.1 else f", da {format_kbps(lo)} a {format_kbps(hi)} kbit/s"
+    return text
+
+
+class SourceScanWorker(QThread):
+    """Reads the codec/bitrate of every queued episode in the background, so the codec
+    choice can show what the originals are as soon as the files are loaded."""
+
+    done = Signal(list)  # [(video codec, video bitrate or None), ...]
+
+    def __init__(self, ffprobe_path: str, episodes: list[Path]):
+        super().__init__()
+        self.ffprobe_path = ffprobe_path
+        self.episodes = episodes
+
+    def run(self):
+        infos = []
+        for episode in self.episodes:
+            if self.isInterruptionRequested():
+                return
+            try:
+                info = merger.probe(self.ffprobe_path, episode)
+            except merger.MergeError:
+                continue
+            infos.append((info.video_codec, info.video_bitrate))
+        self.done.emit(infos)
+
+
 class PreflightWorker(QThread):
     """Probes the sigle and every episode off the GUI thread (so the window stays
     responsive and can show progress), then emits the text of the pre-start summary."""
@@ -322,6 +368,7 @@ class PreflightWorker(QThread):
         self.ffprobe_path = ffprobe_path
         self.intro, self.outro = intro, outro
         self.episodes = episodes
+        self.sources: dict[Path, merger.ProbeResult] = {}  # what each episode turned out to be
 
     def run(self):
         total = bool(self.intro) + bool(self.outro) + len(self.episodes)
@@ -356,6 +403,7 @@ class PreflightWorker(QThread):
                 return
             try:
                 info = merger.probe(self.ffprobe_path, episode)
+                self.sources[episode] = info
                 resolutions.add((info.width, info.height))
                 durations.append(info.duration)
             except merger.MergeError as exc:
@@ -367,6 +415,9 @@ class PreflightWorker(QThread):
                 f"Durata episodi: da {utils.format_duration(min(durations))} "
                 f"a {utils.format_duration(max(durations))}"
             )
+        if self.sources:
+            lines.append("Codec degli originali: " + describe_source_codecs(
+                [(i.video_codec, i.video_bitrate) for i in self.sources.values()]))
         if resolutions:
             res_str = ", ".join(f"{w}x{h}" for w, h in sorted(resolutions))
             lines.append(f"Risoluzioni rilevate: {res_str}")
@@ -402,6 +453,9 @@ class MainWindow(QMainWindow):
         self.analyzing = False  # pre-start file analysis in progress
         self.preflight_worker: PreflightWorker | None = None
         self.retired_workers: list[PreflightWorker] = []  # cancelled but possibly still finishing
+        self.scan_worker: SourceScanWorker | None = None
+        self.source_infos: list[tuple[str, int | None]] = []  # (codec, bitrate) of the queued originals
+        self.episode_sources: dict[Path, merger.ProbeResult] = {}  # from the last pre-start analysis
         self.preflight_paths: list[Path] = []
         self.row_notes: dict[int, list[str]] = {}  # per-row remarks shown next to "Completato"
 
@@ -501,8 +555,13 @@ class MainWindow(QMainWindow):
 
         enc_grid.addWidget(QLabel("Codec:"), 0, 0)
         self.codec_combo = QComboBox()
-        for label, _ in CODEC_LABELS:
-            self.codec_combo.addItem(label)
+        self.codec_combo.addItem("Come originale", "source")
+        for label, codec in CODEC_LABELS:
+            self.codec_combo.addItem(label, codec)
+        self.codec_combo.setToolTip(
+            "Come originale: ogni episodio esce nello stesso codec che ha adesso "
+            "(H.264, H.265 o AV1; se l'originale è un altro formato si usa H.265)."
+        )
         enc_grid.addWidget(self.codec_combo, 0, 1)
 
         self.gpu_check = QCheckBox("Usa GPU se disponibile (rilevamento in corso...)")
@@ -614,8 +673,14 @@ class MainWindow(QMainWindow):
         self.ten_bit_check.setChecked(True)
         enc_grid.addWidget(self.ten_bit_check, 8, 0, 1, 4)
 
+        self.source_info_label = QLabel("")
+        self.source_info_label.setWordWrap(True)
+        self.source_info_label.hide()
+        enc_layout = QVBoxLayout()
+        enc_layout.addWidget(self.source_info_label)
+        enc_layout.addLayout(enc_grid)
         enc_box = QGroupBox("Codifica")
-        enc_box.setLayout(enc_grid)
+        enc_box.setLayout(enc_layout)
         root.addWidget(enc_box)
 
         self._update_tune_checkbox()
@@ -659,6 +724,9 @@ class MainWindow(QMainWindow):
         self.codec_combo.currentIndexChanged.connect(self._update_tune_checkbox)
         self.codec_combo.currentIndexChanged.connect(self._update_two_pass_checkbox)
         self.codec_combo.currentIndexChanged.connect(self._update_ten_bit_checkbox)
+        self.codec_combo.currentIndexChanged.connect(self._refresh_source_info)
+        self.bitrate_group.idClicked.connect(self._refresh_source_info)
+        self.cbr_spin.valueChanged.connect(self._refresh_source_info)
         self.gpu_check.toggled.connect(self._update_tune_checkbox)
         self.gpu_check.toggled.connect(self._update_two_pass_checkbox)
         self.gpu_check.toggled.connect(self._update_ten_bit_checkbox)
@@ -728,7 +796,7 @@ class MainWindow(QMainWindow):
 
     # ---------------------------------------------------------------- helpers
     def _current_codec(self) -> str:
-        return CODEC_LABELS[self.codec_combo.currentIndex()][1]
+        return self.codec_combo.currentData()
 
     def _current_preset(self) -> str:
         return PRESET_LABELS[self.preset_combo.currentIndex()][1]
@@ -756,7 +824,12 @@ class MainWindow(QMainWindow):
         if self.hw_thread.isRunning():
             return
         codec = self._current_codec()
-        encoder = self.hw_encoders.get(codec)
+        if codec == "source":  # every episode picks its own codec: any detected encoder can be used
+            encoder = ", ".join(e for e in self.hw_encoders.values() if e)
+            reasons = " | ".join(r for r in self.hw_reasons.values() if r)
+        else:
+            encoder = self.hw_encoders.get(codec)
+            reasons = self.hw_reasons.get(codec, "")
         if encoder:
             self.gpu_check.setEnabled(True)
             self.gpu_check.setText(f"Usa GPU se disponibile (rilevato: {encoder})")
@@ -765,7 +838,7 @@ class MainWindow(QMainWindow):
             self.gpu_check.setEnabled(False)
             self.gpu_check.setChecked(False)
             self.gpu_check.setText("Usa GPU se disponibile (nessun encoder hardware rilevato)")
-            self.gpu_check.setToolTip(self.hw_reasons.get(codec, ""))
+            self.gpu_check.setToolTip(reasons)
         self._update_tune_checkbox()
         self._update_two_pass_checkbox()
         self._update_ten_bit_checkbox()
@@ -775,13 +848,13 @@ class MainWindow(QMainWindow):
         if not hasattr(self, "ten_bit_check"):
             return
         using_hw = self.gpu_check.isChecked() and self.gpu_check.isEnabled()
-        self.ten_bit_check.setEnabled(self._current_codec() in ("h265", "av1") and not using_hw)
+        self.ten_bit_check.setEnabled(self._current_codec() in ("source", "h265", "av1") and not using_hw)
 
     def _update_tune_checkbox(self):
         if not hasattr(self, "tune_check"):
             return
         using_hw = self.gpu_check.isChecked() and self.gpu_check.isEnabled()
-        eligible = self._current_codec() in ("h264", "h265") and not using_hw
+        eligible = self._current_codec() in ("source", "h264", "h265") and not using_hw
         self.tune_check.setEnabled(eligible)
         if not eligible:
             self.tune_check.setChecked(False)
@@ -794,6 +867,70 @@ class MainWindow(QMainWindow):
         self.two_pass_check.setEnabled(eligible)
         if not eligible:
             self.two_pass_check.setChecked(False)
+
+    def _scan_sources(self):
+        """Re-read codec/bitrate of the queued originals in the background."""
+        if self.scan_worker is not None:
+            self.scan_worker.done.disconnect(self._on_sources_scanned)
+            self.scan_worker.requestInterruption()
+            self.retired_workers.append(self.scan_worker)
+            self.scan_worker = None
+        self.source_infos = []
+        self._refresh_source_info()
+        if not self.rows or not self.ffmpeg_status.ffprobe_path:
+            return
+        self.scan_worker = SourceScanWorker(self.ffmpeg_status.ffprobe_path, [i["path"] for i in self.rows])
+        self.scan_worker.done.connect(self._on_sources_scanned)
+        self.scan_worker.start()
+
+    def _on_sources_scanned(self, infos: list):
+        self.source_infos = infos
+        self._refresh_source_info()
+
+    def _codec_advice(self, infos: list[tuple[str, int | None]]) -> list[str]:
+        """When the chosen codec is less efficient than the originals' and the bitrate is
+        tied to theirs, the picture gets blockier: say so, with a bitrate that compensates."""
+        codec = self._current_codec()
+        if codec == "source" or self.crf_radio.isChecked():
+            return []
+        rates: dict[str, list[int]] = {}
+        for src_codec, bitrate in infos:
+            if bitrate:
+                rates.setdefault(src_codec, []).append(bitrate // 1000)
+        out_name = merger.codec_display_name(codec)
+        advice = []
+        for src_codec, values in rates.items():
+            avg = sum(values) // len(values)
+            needed = merger.compensated_bitrate_kbps(src_codec, avg, codec)
+            if needed is None:
+                continue
+            if self.cbr_radio.isChecked():
+                if self.cbr_spin.value() >= needed * 0.9:
+                    continue
+                now = f"a {format_kbps(self.cbr_spin.value())} kbit/s"
+            else:
+                now = "con lo stesso bitrate"
+            advice.append(
+                f"Attenzione: gli originali sono {merger.codec_display_name(src_codec)} a ~{format_kbps(avg)} kbit/s; "
+                f"in {out_name} {now} la qualità scende (più \"quadrettoni\"). Per una qualità simile servono circa "
+                f"{format_kbps(needed)} kbit/s (Bitrate costante), oppure scegli Qualità (CRF), oppure il codec "
+                f"\"Come originale\"."
+            )
+        return advice
+
+    def _refresh_source_info(self):
+        """The note above the codec choice: what the queued originals are, plus any advice."""
+        if not self.source_infos:
+            self.source_info_label.hide()
+            return
+        text = "Originali: " + describe_source_codecs(self.source_infos)
+        if self._current_codec() == "source":
+            text += ". Ogni episodio esce nel suo codec."
+        advice = self._codec_advice(self.source_infos)
+        if advice:
+            text += "\n" + "\n".join(advice)
+        self.source_info_label.setText(text)
+        self.source_info_label.show()
 
     def _browse_folder(self):
         if self._queue_locked():
@@ -830,6 +967,7 @@ class MainWindow(QMainWindow):
         self.table.setRowCount(0)
         for f in files:
             self._add_row(f)
+        self._scan_sources()
 
     def _auto_assign_sigle(self, files: list[Path]) -> list[Path]:
         """Pull out files whose name contains both "sigla" and "iniziale"/"finale"
@@ -905,6 +1043,8 @@ class MainWindow(QMainWindow):
         for row in reversed(rows):  # bottom-up, so earlier indices stay valid
             self.table.removeRow(row)
             del self.rows[row]
+        if rows:
+            self._scan_sources()
 
     def _show_queue_context_menu(self, pos):
         if self.running or self.analyzing:
@@ -991,6 +1131,10 @@ class MainWindow(QMainWindow):
                 "La cartella di output coincide con quella dei file sorgente: una nuova esecuzione "
                 "ricodificherebbe anche i file già prodotti."
             )
+        self.episode_sources = self.preflight_worker.sources if self.preflight_worker is not None else {}
+        advice = self._codec_advice([(i.video_codec, i.video_bitrate) for i in self.episode_sources.values()])
+        if advice:
+            warnings = (warnings + "\n" if warnings else "") + "\n".join(advice)
         message = summary + (f"\n\nAvvisi:\n{warnings}" if warnings else "")
         reply = QMessageBox.question(
             self, "Riepilogo prima di avviare", message,
@@ -1001,6 +1145,9 @@ class MainWindow(QMainWindow):
 
     def _launch_batch(self):
         codec = self._current_codec()
+        source_mode = codec == "source"
+        if source_mode:
+            codec = "h265"  # only a placeholder: each episode gets the codec of its own original below
         use_gpu = self.gpu_check.isChecked() and self.gpu_check.isEnabled()
         encoder = self.hw_encoders.get(codec) if use_gpu else None
         is_hardware = bool(encoder)
@@ -1054,8 +1201,23 @@ class MainWindow(QMainWindow):
         self.row_notes = {}
         for row, item in enumerate(self.rows):
             episode_path = item["path"]
-            suffix, changed = merger.pick_container(episode_path.suffix, codec, container_suffix)
+            row_settings, row_codec = settings, codec
             notes = []
+            if source_mode:
+                info = self.episode_sources.get(episode_path)
+                row_codec = merger.app_codec_for(info.video_codec) if info else codec
+                if row_codec is None:
+                    row_codec = "h265"
+                    notes.append(
+                        f"codec originale ({merger.codec_display_name(info.video_codec)}) "
+                        "non riscrivibile: usato H.265"
+                    )
+                row_encoder = self.hw_encoders.get(row_codec) if use_gpu else None
+                row_settings = dataclasses.replace(
+                    settings, codec=row_codec, encoder=row_encoder or utils.CODEC_ENCODERS[row_codec][0],
+                    is_hardware=bool(row_encoder),
+                )
+            suffix, changed = merger.pick_container(episode_path.suffix, row_codec, container_suffix)
             if changed:
                 notes.append(f"salvato come {suffix}: il formato {episode_path.suffix} non supporta questo codec")
             # Two episodes sharing a name (e.g. "Puntata 1.mp4" and "Puntata 1.avi") would
@@ -1074,7 +1236,7 @@ class MainWindow(QMainWindow):
             self._set_row_progress(row, 0.0)
             task = MergeTask(
                 row, intro_path, episode_path, outro_path, output_path,
-                settings, self.ffmpeg_status.ffmpeg_path, self.ffmpeg_status.ffprobe_path,
+                row_settings, self.ffmpeg_status.ffmpeg_path, self.ffmpeg_status.ffprobe_path,
                 self.signals, self.cancel_event,
             )
             self.pool.start(task)
@@ -1134,6 +1296,7 @@ class MainWindow(QMainWindow):
         self.outro_edit.clear()
         self.rows = []
         self.table.setRowCount(0)
+        self._scan_sources()
         self.global_progress.setValue(0)
         self.summary_label.setText("")
         self.eta_label.setText("")

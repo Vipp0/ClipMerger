@@ -8,6 +8,7 @@ Applicazione desktop per Windows che unisce automaticamente una **sigla iniziale
 - **Riconoscimento automatico delle sigle**: se nella cartella trascinata un file contiene "sigla" insieme a "iniziale" o "finale" nel nome (anche separate da parentesi o altro testo), viene assegnato da solo ai campi corrispondenti invece di finire in coda come episodio.
 - **Ricodifica robusta**: episodio, sigla iniziale e sigla finale possono avere risoluzione, framerate o codec diversi tra loro — l'episodio fa sempre da riferimento e le sigle vengono adattate.
 - **Codec**: H.264, H.265 (HEVC), AV1, con rilevamento automatico e uso opzionale dell'accelerazione hardware (NVIDIA NVENC, Intel QuickSync, AMD AMF) se disponibile.
+- **Codec "Come originale"** (predefinito): ogni episodio esce nello stesso codec che ha già (H.264, H.265 o AV1; per altri formati si usa H.265). Appena carichi i file, sopra la scelta del codec compare cosa sono gli originali (codec e bitrate) e, se scegli un codec meno efficiente con il bitrate legato all'originale, un avviso con il bitrate consigliato per compensare (esempio: da AV1 a H.264 servono circa il doppio dei kbit/s).
 - **Controllo qualità/peso**: qualità costante (CRF), bitrate costante (CBR), oppure bitrate allineato all'originale per minimizzare la perdita percepita.
 - **Ottimizzazione per cartoni animati** (`tune animation`, solo codifica software H.264/H.265).
 - Gestione di **tracce audio multiple** e **sottotitoli** dell'episodio, mantenuti sincronizzati nel file finale, con **nomi delle tracce**, lingua, traccia predefinita e flag "forzati" identici all'originale (in MP4 i nomi sono salvati nel campo `handler_name`).
@@ -17,7 +18,7 @@ Applicazione desktop per Windows che unisce automaticamente una **sigla iniziale
 - **Sincronia audio/video** garantita attorno alle sigle anche con file "sporchi" (audio più lungo o in ritardo rispetto al video): video e audio si concatenano insieme.
 - **Video ruotati** (metadato di rotazione, tipico dei video da telefono) gestiti correttamente.
 - **Deinterlaccia automatica** dei video segnalati come interlacciati (vecchi DVD/TV), disattivabile; **10 bit mantenuti** per H.265/AV1 software se l'episodio è a 10 bit.
-- **Contenitore di ripiego**: con "come originale", se l'estensione dell'episodio non può contenere il codec scelto (es. `.webm`, `.mpg`) il file viene salvato come `.mkv`; nomi di output duplicati vengono numerati. I sottotitoli non supportati dal formato di uscita vengono saltati (con nota nello stato) invece di far fallire il file.
+- **Contenitore di ripiego**: con "come originale", se l'estensione dell'episodio non può contenere il codec scelto (es. `.webm`, `.mpg`, o `.avi` con H.265) il file viene salvato come `.mkv`; nomi di output duplicati vengono numerati. I sottotitoli non supportati dal formato di uscita vengono saltati (con nota nello stato) invece di far fallire il file.
 - **MP4/MOV pronti per lo streaming** (Plex, NAS, web): l'indice del file viene scritto all'inizio (`faststart`), così la riproduzione parte subito.
 - **Chiusura sicura**: chiudere la finestra durante la codifica chiede conferma, ferma ffmpeg ed elimina i file parziali.
 - **Proporzione dei pixel (SAR)** dell'episodio preservata, così i video "anamorfici" (vecchi DVD/AVI, TV registrata) non risultano più stretti.
