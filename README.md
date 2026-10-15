@@ -31,6 +31,8 @@ Applicazione desktop per Windows che unisce automaticamente una **sigla iniziale
 - Elaborazioni **parallele** configurabili, con possibilità di annullare il batch in corso.
 - Tema **chiaro / scuro / automatico** (segue le impostazioni di Windows).
 
+- **Scheda "Sostituisci sigla"**: toglie la sigla che c'è già dentro gli episodi (iniziale e/o finale, riconosciute dall'audio: la "impara" dagli episodi o la cerca da un file di esempio) e ci mette una nuova, audio e video. Si vede una tabella con i risultati prima di scrivere qualsiasi cosa, c'è l'anteprima delle giunzioni, e ogni episodio viene ricodificato una volta sola nel suo codec. Una schermata col titolo dopo la sigla viene conservata (senza la musica).
+
 ## Requisiti
 
 - Windows
@@ -71,7 +73,10 @@ Produce l'eseguibile in `dist\ClipMerger\ClipMerger.exe` (modalità PyInstaller 
 ## Struttura del progetto
 
 ```
-main.py             GUI (PySide6)
+main.py             GUI (PySide6), con le due schede
+tab_sostituisci.py  Scheda "Sostituisci sigla"
+sostituisci.py      Sostituzione delle sigle dentro un episodio: punti di taglio, comando ffmpeg
+trova_sigla.py      Riconoscimento delle sigle dall'audio (numpy)
 merger.py           Logica di unione video: probing, comando ffmpeg, verifica integrità
 utils.py            Rilevamento ffmpeg/ffprobe, encoder hardware, utility varie
 assets/             Icone usate dall'interfaccia

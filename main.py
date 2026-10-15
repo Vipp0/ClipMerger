@@ -21,15 +21,16 @@ from PySide6.QtWidgets import (
     QGroupBox, QLabel, QLineEdit, QPushButton, QFileDialog, QTableWidget,
     QTableWidgetItem, QProgressBar, QComboBox, QRadioButton, QButtonGroup,
     QStackedWidget, QSpinBox, QMessageBox, QCheckBox, QHeaderView, QAbstractItemView,
-    QToolButton, QMenu,
+    QToolButton, QMenu, QTabWidget,
 )
 
 import utils
 import merger
 from merger import MergeSettings, MergeResult
+from tab_sostituisci import SostituisciTab
 
 APP_TITLE = "ClipMerger"
-APP_VERSION = "0.3.3"
+APP_VERSION = "0.4.0"
 GITHUB_LATEST_RELEASE_API = "https://api.github.com/repos/Vipp0/ClipMerger/releases/latest"
 GITHUB_RELEASES_PAGE = "https://github.com/Vipp0/ClipMerger/releases/latest"
 
@@ -487,8 +488,7 @@ class MainWindow(QMainWindow):
 
     # ---------------------------------------------------------------- UI build
     def _build_ui(self):
-        central = QWidget()
-        self.setCentralWidget(central)
+        central = QWidget()  # first tab ("Unisci sigle"); the window's central widget is set at the end
         root = QVBoxLayout(central)
         root.setSpacing(10)
 
@@ -712,6 +712,12 @@ class MainWindow(QMainWindow):
 
         root.addLayout(bottom)
 
+        tabs = QTabWidget()
+        tabs.addTab(central, "Unisci sigle")
+        self.sostituisci_tab = SostituisciTab(self)
+        tabs.addTab(self.sostituisci_tab, "Sostituisci sigla")
+        self.setCentralWidget(tabs)
+
     def _wire_signals(self):
         self.theme_toggle_btn.clicked.connect(self._cycle_theme)
         QGuiApplication.styleHints().colorSchemeChanged.connect(self._on_system_theme_changed)
@@ -772,6 +778,17 @@ class MainWindow(QMainWindow):
             self._apply_theme(self._resolve_theme("auto"))
 
     def closeEvent(self, event):
+        if self.sostituisci_tab.is_busy():
+            reply = QMessageBox.question(
+                self, "Elaborazione in corso",
+                "Nella scheda «Sostituisci sigla» c'è un'elaborazione in corso: chiudendo il programma verrà "
+                "interrotta e i file parziali eliminati. Chiudere comunque?",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
+            )
+            if reply != QMessageBox.Yes:
+                event.ignore()
+                return
+            self.sostituisci_tab.shutdown()
         if self.running:
             reply = QMessageBox.question(
                 self, "Codifica in corso",
