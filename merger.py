@@ -513,13 +513,16 @@ def _plan_audios(ffmpeg_path: str, settings: MergeSettings, episode: ProbeResult
 
 def _build_filter_complex(
     segments: list[ProbeResult], episode_idx: int, plans: list[AudioPlan], deinterlace: bool = True,
+    trims: dict[int, tuple[float, float]] | None = None, mutes: dict[int, float] | None = None,
 ) -> tuple[str, list[str]]:
     """Returns (filter_complex_string, output_audio_labels). `segments` holds every
     clip being concatenated, in input order - sigla iniziale and sigla finale are
     each optional, so this is 2 or 3 items; `episode_idx` says which one is the real
     episode, whose resolution/fps/audio-track-count drives the output. Every output of
     the graph (video and each audio track) has to be mapped by the caller, otherwise
-    ffmpeg fails with an "unconnected" output."""
+    ffmpeg fails with an "unconnected" output. `trims` (segment index -> (start, end) in
+    that clip's own time) keeps only that part of a clip; `mutes` (segment index -> seconds,
+    counted from the start of the kept part) silences the beginning of its audio."""
     episode = segments[episode_idx]
     W, H, FPS = episode.width, episode.height, episode.fps
     n = len(segments)
@@ -533,6 +536,9 @@ def _build_filter_complex(
         # The interlaced flag can't survive re-encoding, so unless it's switched off the
         # fields are merged here (one output frame per input frame, parity auto-detected).
         deint = "yadif=mode=0:parity=-1:deint=0," if deinterlace and seg.interlaced else ""
+        trim = (trims or {}).get(i)
+        if trim:
+            deint = f"trim=start={trim[0]:.3f}:end={trim[1]:.3f},setpts=PTS-STARTPTS," + deint
         if i == episode_idx or seg.sar == sar:
             parts.append(
                 f"[{i}:v:{seg.video_index}]{deint}scale=w={W}:h={H}:force_original_aspect_ratio=decrease,"
@@ -565,6 +571,12 @@ def _build_filter_complex(
             else:
                 src = f"[{seg_i}:a:{min(j, len(seg_probe.audio) - 1)}]" if seg_probe.audio else None
             label = f"a{seg_i}_{j}"
+            cut = ""
+            if (trims or {}).get(seg_i):
+                t0, t1 = trims[seg_i]
+                cut = f"atrim=start={t0:.3f}:end={t1:.3f},asetpts=PTS-STARTPTS,"
+                if (mutes or {}).get(seg_i):
+                    cut += f"volume=0:enable='lt(t,{mutes[seg_i]:.3f})',"
             if src is None:
                 parts.append(
                     f"anullsrc=r={plan.sample_rate}:cl={plan.layout}:"
@@ -574,7 +586,7 @@ def _build_filter_complex(
                 )
             else:
                 parts.append(
-                    f"{src}aresample={plan.sample_rate},"
+                    f"{src}{cut}aresample={plan.sample_rate},"
                     f"aformat=channel_layouts={plan.layout}{fmt}[{label}]"
                 )
 
@@ -616,13 +628,14 @@ def build_command(
     output_path: Path, settings: MergeSettings,
     pass_num: int | None = None, passlog_prefix: str | None = None,
     chapters_file: Path | None = None, cover_files: list[CoverFile] = (),
+    trims: dict[int, tuple[float, float]] | None = None, mutes: dict[int, float] | None = None,
 ) -> list[str]:
     is_first_pass = pass_num == 1
     probes = [p for _, p in segments]
     episode = probes[episode_idx]
     plans = _plan_audios(ffmpeg_path, settings, episode, output_path.suffix.lower())
     filter_complex, audio_labels = _build_filter_complex(
-        probes, episode_idx, plans, deinterlace=settings.deinterlace,
+        probes, episode_idx, plans, deinterlace=settings.deinterlace, trims=trims, mutes=mutes,
     )
 
     cmd = [ffmpeg_path, "-y", "-hide_banner", "-loglevel", "error"]
