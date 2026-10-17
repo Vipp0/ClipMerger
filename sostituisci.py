@@ -47,19 +47,37 @@ def black_intervals(ffmpeg: str, path: Path, start: float, duration: float) -> l
     return [(float(a) + start, float(b) + start) for a, b in _BLACK_RE.findall(proc.stderr)]
 
 
+def _inset(start: float, end: float, cap: float) -> float:
+    """A cut a little way into a black stretch (never past its middle): the first frames of a
+    "black" are often still the faint tail of a fade-out, and must not end up in the output."""
+    return start + min(cap, (end - start) / 2)
+
+
 def plan_cuts(
     ffmpeg: str, episode: Path, duration: float,
     intro: trova_sigla.Detection | None, outro: trova_sigla.Detection | None,
+    keep_card: bool = True,
 ) -> CutPlan:
-    """Turns the audio detections into picture cut points, snapping to the black frames the
-    sigle are bracketed with. The opening is cut where its animation ends (its last black
-    frame before the music ends), so an episode-title card that follows is kept, without the
-    music; the closing is cut inside the black that precedes the credits."""
+    """Turns the audio detections into picture cut points, snapping to the black frames the sigle
+    are bracketed with. After the opening there is often a title card (episode name) that is
+    shown while the music still plays: it sits between two black stretches, the second one close
+    to where the music ends. With `keep_card` the cut is made at the black BEFORE the card, so the
+    card stays (its sound silenced until the old music ends); without it the cut is made at the
+    black after the card, so the card goes away with the sigla. The closing is cut inside the
+    black that precedes the credits."""
     keep_start, mute_head = 0.0, 0.0
     if intro is not None:
-        blacks = black_intervals(ffmpeg, episode, intro.start - 1.0, intro.end - intro.start + 8.0)
-        inside = [b for b in blacks if intro.start + 1.0 < b[0] <= intro.end]
-        keep_start = inside[-1][0] if inside else intro.end
+        blacks = black_intervals(ffmpeg, episode, max(intro.end - 15.0, 0.0), 23.0)
+        card = None
+        for first, second in zip(blacks, blacks[1:]):
+            if 1.2 <= second[0] - first[1] <= 6.0 and abs(second[0] - intro.end) <= 3.0:
+                card = (first, second)  # keeps the last such pair
+        if card is not None:
+            first, second = card
+            keep_start = _inset(*first, 0.1) if keep_card else _inset(*second, 0.3)
+        else:
+            inside = [b for b in blacks if intro.start + 1.0 < b[0] <= intro.end]
+            keep_start = _inset(*inside[-1], 0.1) if inside else intro.end
         mute_head = max(intro.end - keep_start, 0.0)
     keep_end = duration
     if outro is not None:
@@ -67,8 +85,7 @@ def plan_cuts(
         blacks = black_intervals(ffmpeg, episode, outro.start - 8.0, 10.0)
         near = [b for b in blacks if b[0] <= outro.start + 0.5 and b[1] >= outro.start - 3.0]
         if near:
-            b0, b1 = near[-1]
-            keep_end = b0 + min(0.25, (b1 - b0) / 2)
+            keep_end = _inset(*near[-1], 0.25)
     if keep_end <= keep_start + 60:
         raise SostituisciError("I punti di taglio trovati non sono coerenti: controlla le sigle rilevate.")
     return CutPlan(keep_start, keep_end, mute_head, intro, outro)
@@ -157,6 +174,7 @@ class EpisodeAnalysis:
 
 def analizza(
     episodes: list[Path], intro_cfg, outro_cfg, ffmpeg: str, ffprobe: str, progress=None, cancelled=None,
+    keep_card: bool = True,
 ) -> list[EpisodeAnalysis]:
     """Finds the old sigle in every episode and decides the cut points. `intro_cfg`/`outro_cfg`:
     None (leave that sigla alone), "impara" (learn it from the episodes) or the Path of a sample
@@ -205,7 +223,8 @@ def analizza(
             res.duration = merger.probe(ffprobe, ep).duration
             if res.status in ("Trovata", "Da verificare"):
                 res.plan = plan_cuts(ffmpeg, ep, res.duration,
-                                     res.intro if res.want_intro else None, res.outro if res.want_outro else None)
+                                     res.intro if res.want_intro else None, res.outro if res.want_outro else None,
+                                     keep_card=keep_card)
         except (merger.MergeError, SostituisciError) as exc:
             res.error = str(exc)
     if progress:

@@ -31,7 +31,7 @@ Applicazione desktop per Windows che unisce automaticamente una **sigla iniziale
 - Elaborazioni **parallele** configurabili, con possibilità di annullare il batch in corso.
 - Tema **chiaro / scuro / automatico** (segue le impostazioni di Windows).
 
-- **Scheda "Sostituisci sigla"**: toglie la sigla che c'è già dentro gli episodi (iniziale e/o finale, riconosciute dall'audio: la "impara" dagli episodi o la cerca da un file di esempio) e ci mette una nuova, audio e video. Si vede una tabella con i risultati prima di scrivere qualsiasi cosa, c'è l'anteprima delle giunzioni, e ogni episodio viene ricodificato una volta sola nel suo codec. Una schermata col titolo dopo la sigla viene conservata (senza la musica).
+- **Scheda "Sostituisci sigla"**: toglie la sigla che c'è già dentro gli episodi (iniziale e/o finale, riconosciute dall'audio: la "impara" dagli episodi o la cerca da un file di esempio) e ci mette una nuova, audio e video. Si vede una tabella con i risultati prima di scrivere qualsiasi cosa, c'è l'anteprima delle giunzioni, e ogni episodio viene ricodificato una volta sola nel suo codec. Una schermata col titolo dopo la sigla viene conservata (senza la musica; si può spegnere con la casella apposita) e i punti di taglio si possono correggere a mano nella tabella.
 
 ## Requisiti
 

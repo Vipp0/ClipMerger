@@ -10,7 +10,7 @@ from pathlib import Path
 from PySide6.QtCore import Qt, QObject, QRunnable, QThread, QThreadPool, QUrl, Signal
 from PySide6.QtGui import QDesktopServices, QDragEnterEvent, QDropEvent
 from PySide6.QtWidgets import (
-    QAbstractItemView, QComboBox, QFileDialog, QGridLayout, QGroupBox, QHBoxLayout, QHeaderView, QLabel,
+    QAbstractItemView, QCheckBox, QComboBox, QFileDialog, QGridLayout, QGroupBox, QHBoxLayout, QHeaderView, QLabel,
     QLineEdit, QMessageBox, QProgressBar, QPushButton, QSpinBox, QTableWidget, QTableWidgetItem,
     QVBoxLayout, QWidget,
 )
@@ -27,12 +27,26 @@ AUDIO_MODES = [
     ("AAC stereo 192k (compatto)", "aac_stereo"),
     ("FLAC senza perdita (file più grandi)", "flac"),
 ]
-COL_CHECK, COL_NAME, COL_INTRO, COL_OUTRO, COL_CONF, COL_STATUS, COL_PROGRESS = range(7)
+COL_CHECK, COL_NAME, COL_INTRO, COL_OUTRO, COL_CUT_IN, COL_CUT_OUT, COL_CONF, COL_STATUS, COL_PROGRESS = range(9)
 
 
 def fmt_time(t: float) -> str:
     minutes, seconds = divmod(t, 60)
     return f"{int(minutes)}:{seconds:04.1f}"
+
+
+def parse_time(text: str) -> float | None:
+    """"1:00.7", "60,7" or "0:01:00.7" -> seconds; None when it can't be read."""
+    try:
+        parts = [float(p) for p in text.strip().replace(",", ".").split(":")]
+    except ValueError:
+        return None
+    if not parts or len(parts) > 3 or any(p < 0 for p in parts):
+        return None
+    seconds = 0.0
+    for p in parts:
+        seconds = seconds * 60 + p
+    return seconds
 
 
 def is_sigla_file(path: Path) -> bool:
@@ -63,17 +77,18 @@ class AnalyzeWorker(QThread):
     done = Signal(list)
     failed = Signal(str)
 
-    def __init__(self, ffmpeg: str, ffprobe: str, episodes: list[Path], intro_cfg, outro_cfg):
+    def __init__(self, ffmpeg: str, ffprobe: str, episodes: list[Path], intro_cfg, outro_cfg, keep_card: bool = True):
         super().__init__()
         self.ffmpeg, self.ffprobe = ffmpeg, ffprobe
         self.episodes, self.intro_cfg, self.outro_cfg = episodes, intro_cfg, outro_cfg
+        self.keep_card = keep_card
 
     def run(self):
         try:
             result = sostituisci.analizza(
                 self.episodes, self.intro_cfg, self.outro_cfg, self.ffmpeg, self.ffprobe,
                 progress=lambda f, text: self.progress.emit(f, text),
-                cancelled=self.isInterruptionRequested,
+                cancelled=self.isInterruptionRequested, keep_card=self.keep_card,
             )
         except sostituisci.Annullato:
             return
@@ -206,6 +221,7 @@ class SostituisciTab(QWidget):
         self.finished_count = self.total_count = 0
         self.ok_count = self.skip_count = self.err_count = 0
         self.job_rows: list[int] = []
+        self._filling = False  # True while the table is being filled by code (ignores itemChanged)
         self._build_ui()
         self.signals.progress.connect(self._on_progress)
         self.signals.status.connect(self._on_status)
@@ -242,6 +258,14 @@ class SostituisciTab(QWidget):
         self.outro_group = SigleGroup("Sostituisci la sigla finale", "finale")
         root.addWidget(self.intro_group)
         root.addWidget(self.outro_group)
+
+        self.card_check = QCheckBox(
+            "Conserva la schermata dopo la sigla iniziale (es. il titolo dell'episodio), senza la musica della vecchia sigla")
+        self.card_check.setChecked(True)
+        self.card_check.setToolTip(
+            "Se la vecchia sigla è seguita da una schermata con il titolo dell'episodio, resta quella schermata "
+            "(muta). Spegni per togliere tutto fino alla fine della musica.")
+        root.addWidget(self.card_check)
 
         enc = QGridLayout()
         enc.setSpacing(8)
@@ -292,21 +316,25 @@ class SostituisciTab(QWidget):
         buttons.addWidget(self.start_btn)
         root.addLayout(buttons)
 
-        self.table = QTableWidget(0, 7)
+        self.table = QTableWidget(0, 9)
         self.table.setHorizontalHeaderLabels(
-            ["", "Episodio", "Sigla iniziale", "Sigla finale", "Affidabilità", "Stato", "Avanzamento"])
+            ["", "Episodio", "Sigla iniziale", "Sigla finale", "Tiene da", "Tiene fino a", "Affidab.", "Stato",
+             "Avanzamento"])
         header = self.table.horizontalHeader()
         header.setSectionResizeMode(COL_CHECK, QHeaderView.ResizeToContents)
         header.setSectionResizeMode(COL_NAME, QHeaderView.Stretch)
-        for col in (COL_INTRO, COL_OUTRO, COL_CONF, COL_STATUS):
+        for col in (COL_INTRO, COL_OUTRO, COL_CUT_IN, COL_CUT_OUT, COL_CONF, COL_STATUS):
             header.setSectionResizeMode(col, QHeaderView.ResizeToContents)
         header.setSectionResizeMode(COL_PROGRESS, QHeaderView.Fixed)
         self.table.setColumnWidth(COL_PROGRESS, 150)
-        self.table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.table.setEditTriggers(QAbstractItemView.DoubleClicked | QAbstractItemView.EditKeyPressed)
         self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.table.setSelectionMode(QAbstractItemView.SingleSelection)
         self.table.cellDoubleClicked.connect(self._show_row_detail)
-        self.table.setToolTip("Doppio clic su una riga per i dettagli dei punti di taglio.")
+        self.table.itemChanged.connect(self._on_item_changed)
+        self.table.setToolTip(
+            "Doppio clic su «Tiene da» o «Tiene fino a» per correggere a mano i punti di taglio (es. 1:00.7); "
+            "doppio clic sul resto della riga per i dettagli.")
         self.table.setMinimumHeight(150)
         root.addWidget(self.table, stretch=1)
 
@@ -348,8 +376,11 @@ class SostituisciTab(QWidget):
         self.start_btn.setEnabled(self.state == "processing" or (idle and any(a.ready for a in self.analyses)))
         self.preview_btn.setEnabled(idle and any(a.ready for a in self.analyses))
         for w in (self.folder_edit, self.output_edit, self.quality_combo, self.preset_combo, self.parallel_spin,
-                  self.audio_combo):
+                  self.audio_combo, self.card_check):
             w.setEnabled(idle)
+        self.table.setEditTriggers(
+            (QAbstractItemView.DoubleClicked | QAbstractItemView.EditKeyPressed) if idle
+            else QAbstractItemView.NoEditTriggers)
         self.intro_group.setEnabled(idle)
         self.outro_group.setEnabled(idle)
         for name in ("analyze_btn", "start_btn"):
@@ -401,6 +432,12 @@ class SostituisciTab(QWidget):
         self.info_label.setText(f"{len(episodes)} episodi. Premi Analizza per cercare le vecchie sigle.")
         self._refresh_buttons()
 
+    @staticmethod
+    def _ro_item(text: str) -> QTableWidgetItem:
+        item = QTableWidgetItem(text)
+        item.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable)
+        return item
+
     def _add_row(self, ep: Path):
         row = self.table.rowCount()
         self.table.insertRow(row)
@@ -408,10 +445,10 @@ class SostituisciTab(QWidget):
         check.setFlags(Qt.ItemIsUserCheckable | Qt.ItemIsEnabled)
         check.setCheckState(Qt.Unchecked)
         self.table.setItem(row, COL_CHECK, check)
-        self.table.setItem(row, COL_NAME, QTableWidgetItem(ep.name))
-        for col in (COL_INTRO, COL_OUTRO, COL_CONF):
-            self.table.setItem(row, col, QTableWidgetItem(""))
-        self.table.setItem(row, COL_STATUS, QTableWidgetItem("Da analizzare"))
+        self.table.setItem(row, COL_NAME, self._ro_item(ep.name))
+        for col in (COL_INTRO, COL_OUTRO, COL_CUT_IN, COL_CUT_OUT, COL_CONF):
+            self.table.setItem(row, col, self._ro_item(""))
+        self.table.setItem(row, COL_STATUS, self._ro_item("Da analizzare"))
         bar = QProgressBar()
         bar.setRange(0, 100)
         bar.setValue(0)
@@ -440,10 +477,12 @@ class SostituisciTab(QWidget):
         for row in range(self.table.rowCount()):
             self.table.item(row, COL_STATUS).setText("In analisi...")
             self.table.item(row, COL_CHECK).setCheckState(Qt.Unchecked)
-            for col in (COL_INTRO, COL_OUTRO, COL_CONF):
+            for col in (COL_INTRO, COL_OUTRO, COL_CUT_IN, COL_CUT_OUT, COL_CONF):
                 self.table.item(row, col).setText("")
+                self.table.item(row, col).setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable)
         self.progress.setValue(0)
-        self.analyze_worker = AnalyzeWorker(tools[0], tools[1], list(self.episodes), intro_cfg, outro_cfg)
+        self.analyze_worker = AnalyzeWorker(tools[0], tools[1], list(self.episodes), intro_cfg, outro_cfg,
+                                            self.card_check.isChecked())
         self.analyze_worker.progress.connect(self._on_analysis_progress)
         self.analyze_worker.done.connect(self._on_analysis_done)
         self.analyze_worker.failed.connect(self._on_analysis_failed)
@@ -500,9 +539,17 @@ class SostituisciTab(QWidget):
                 return "non trovata"
             return f"{fmt_time(det.start)} → {fmt_time(det.end)}"
 
+        self._filling = True
         self.table.item(row, COL_INTRO).setText(side(ana.want_intro, ana.intro))
         self.table.item(row, COL_OUTRO).setText(side(ana.want_outro, ana.outro))
         self.table.item(row, COL_CONF).setText(str(ana.confidence))
+        for col, value in ((COL_CUT_IN, ana.plan.keep_start if ana.plan else None),
+                           (COL_CUT_OUT, ana.plan.keep_end if ana.plan else None)):
+            cell = self.table.item(row, col)
+            cell.setText(fmt_time(value) if value is not None else "")
+            cell.setFlags((Qt.ItemIsEnabled | Qt.ItemIsSelectable | Qt.ItemIsEditable) if value is not None
+                          else (Qt.ItemIsEnabled | Qt.ItemIsSelectable))
+        self._filling = False
         self.table.item(row, COL_STATUS).setText(ana.status if not ana.error else f"Errore: {ana.error}")
         check = self.table.item(row, COL_CHECK)
         if ana.ready:
@@ -512,8 +559,31 @@ class SostituisciTab(QWidget):
             check.setFlags(Qt.NoItemFlags)
             check.setCheckState(Qt.Unchecked)
 
-    def _show_row_detail(self, row: int, _col: int):
-        if row >= len(self.analyses):
+    def _on_item_changed(self, item: QTableWidgetItem):
+        """Manual correction of a cut point (the cell holds a time like 1:00.7)."""
+        if self._filling or item.column() not in (COL_CUT_IN, COL_CUT_OUT):
+            return
+        row = item.row()
+        ana = self.analyses[row] if row < len(self.analyses) else None
+        if ana is None or ana.plan is None:
+            return
+        plan = ana.plan
+        value = parse_time(item.text())
+        start = value if item.column() == COL_CUT_IN else plan.keep_start
+        end = value if item.column() == COL_CUT_OUT else plan.keep_end
+        if value is None or not (0 <= start < end <= ana.duration + 0.5) or end - start < 10:
+            self.info_label.setText("Tempo non valido: scrivilo come minuti:secondi, ad esempio 1:00.7.")
+        else:
+            plan.keep_start, plan.keep_end = start, end
+            if ana.want_intro and ana.intro is not None:
+                plan.mute_head = max(ana.intro.end - plan.keep_start, 0.0)
+            self.info_label.setText(f"Taglio di {ana.episode.name} corretto a mano.")
+        self._filling = True
+        item.setText(fmt_time(plan.keep_start if item.column() == COL_CUT_IN else plan.keep_end))
+        self._filling = False
+
+    def _show_row_detail(self, row: int, col: int):
+        if row >= len(self.analyses) or col in (COL_CUT_IN, COL_CUT_OUT):
             return
         ana = self.analyses[row]
         lines = [ana.episode.name, f"Stato: {ana.status}"]
