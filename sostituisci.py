@@ -20,6 +20,7 @@ import utils
 from utils import CREATE_NO_WINDOW
 
 _BLACK_RE = re.compile(r"black_start:([\d.]+) black_end:([\d.]+)")
+_SCENE_RE = re.compile(r"pts_time:([\d.]+)\s*\n.*?lavfi\.scene_score=([\d.]+)")
 
 
 class SostituisciError(Exception):
@@ -47,6 +48,20 @@ def black_intervals(ffmpeg: str, path: Path, start: float, duration: float) -> l
     return [(float(a) + start, float(b) + start) for a, b in _BLACK_RE.findall(proc.stderr)]
 
 
+def scene_cut_near(ffmpeg: str, path: Path, t: float, radius: float = 1.0, threshold: float = 0.25) -> float | None:
+    """Time of the strongest hard cut of the picture within `radius` seconds of `t`, or None. A sigla
+    that is glued straight onto the episode ends exactly on such a cut: the audio detection only
+    knows the boundary to a few hundredths of a second, the cut gives the exact frame."""
+    start = max(t - radius, 0.0)
+    proc = subprocess.run(
+        [ffmpeg, "-hide_banner", "-ss", f"{start:.3f}", "-t", f"{2 * radius:.3f}", "-i", str(path), "-an",
+         "-vf", f"select='gt(scene,{threshold})',metadata=print", "-f", "null", "-"],
+        capture_output=True, text=True, encoding="utf-8", errors="replace", creationflags=CREATE_NO_WINDOW,
+    )
+    cuts = [(float(a) + start, float(b)) for a, b in _SCENE_RE.findall(proc.stderr)]
+    return max(cuts, key=lambda c: c[1])[0] if cuts else None
+
+
 def _inset(start: float, end: float, cap: float) -> float:
     """A cut a little way into a black stretch (never past its middle): the first frames of a
     "black" are often still the faint tail of a fade-out, and must not end up in the output."""
@@ -72,13 +87,21 @@ def plan_cuts(
         for first, second in zip(blacks, blacks[1:]):
             if 1.2 <= second[0] - first[1] <= 6.0 and abs(second[0] - intro.end) <= 3.0:
                 card = (first, second)  # keeps the last such pair
+        # a black that starts shortly before the music ends is the one bracketing the sigla
+        # (a black deep inside the sigla is just part of its animation)
+        edge = [b for b in blacks if intro.end - 3.0 <= b[0] <= intro.end + 0.3]
         if card is not None:
             first, second = card
             keep_start = _inset(*first, 0.1) if keep_card else _inset(*second, 0.3)
+            mute_head = max(intro.end - keep_start, 0.0)
+        elif edge:
+            keep_start = _inset(*edge[-1], 0.1)
+            mute_head = max(intro.end - keep_start, 0.0)
         else:
-            inside = [b for b in blacks if intro.start + 1.0 < b[0] <= intro.end]
-            keep_start = _inset(*inside[-1], 0.1) if inside else intro.end
-        mute_head = max(intro.end - keep_start, 0.0)
+            # no black: the sigla is glued straight onto the episode. Snap to the picture's hard cut
+            # next to where the music ends, else trust the audio boundary.
+            cut = scene_cut_near(ffmpeg, episode, intro.end)
+            keep_start = cut if cut is not None else intro.end
     keep_end = duration
     if outro is not None:
         keep_end = outro.start
@@ -86,6 +109,10 @@ def plan_cuts(
         near = [b for b in blacks if b[0] <= outro.start + 0.5 and b[1] >= outro.start - 3.0]
         if near:
             keep_end = _inset(*near[-1], 0.25)
+        else:
+            cut = scene_cut_near(ffmpeg, episode, outro.start)
+            if cut is not None:
+                keep_end = cut
     if keep_end <= keep_start + 60:
         raise SostituisciError("I punti di taglio trovati non sono coerenti: controlla le sigle rilevate.")
     return CutPlan(keep_start, keep_end, mute_head, intro, outro)
