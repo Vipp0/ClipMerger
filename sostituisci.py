@@ -35,6 +35,10 @@ class CutPlan:
     mute_head: float  # seconds, from keep_start, whose sound is the old opening's music tail: silenced
     old_intro: trova_sigla.Detection | None
     old_outro: trova_sigla.Detection | None
+    # how each cut was decided: "titolo" / "nero" (a black frame), "stacco" (a hard picture cut),
+    # "audio" (only the sound's boundary: least precise), "manuale", or "" when that sigla is left alone
+    start_kind: str = ""
+    end_kind: str = ""
 
 
 def black_intervals(ffmpeg: str, path: Path, start: float, duration: float) -> list[tuple[float, float]]:
@@ -81,6 +85,7 @@ def plan_cuts(
     black after the card, so the card goes away with the sigla. The closing is cut inside the
     black that precedes the credits."""
     keep_start, mute_head = 0.0, 0.0
+    start_kind = end_kind = ""
     if intro is not None:
         blacks = black_intervals(ffmpeg, episode, max(intro.end - 15.0, 0.0), 23.0)
         card = None
@@ -94,28 +99,34 @@ def plan_cuts(
             first, second = card
             keep_start = _inset(*first, 0.1) if keep_card else _inset(*second, 0.3)
             mute_head = max(intro.end - keep_start, 0.0)
+            start_kind = "titolo" if keep_card else "nero"
         elif edge:
             keep_start = _inset(*edge[-1], 0.1)
             mute_head = max(intro.end - keep_start, 0.0)
+            start_kind = "nero"
         else:
             # no black: the sigla is glued straight onto the episode. Snap to the picture's hard cut
             # next to where the music ends, else trust the audio boundary.
             cut = scene_cut_near(ffmpeg, episode, intro.end)
             keep_start = cut if cut is not None else intro.end
+            start_kind = "stacco" if cut is not None else "audio"
     keep_end = duration
     if outro is not None:
         keep_end = outro.start
+        end_kind = "audio"
         blacks = black_intervals(ffmpeg, episode, outro.start - 8.0, 10.0)
         near = [b for b in blacks if b[0] <= outro.start + 0.5 and b[1] >= outro.start - 3.0]
         if near:
             keep_end = _inset(*near[-1], 0.25)
+            end_kind = "nero"
         else:
             cut = scene_cut_near(ffmpeg, episode, outro.start)
             if cut is not None:
                 keep_end = cut
+                end_kind = "stacco"
     if keep_end <= keep_start + 60:
         raise SostituisciError("I punti di taglio trovati non sono coerenti: controlla le sigle rilevate.")
-    return CutPlan(keep_start, keep_end, mute_head, intro, outro)
+    return CutPlan(keep_start, keep_end, mute_head, intro, outro, start_kind, end_kind)
 
 
 def replace_sigle(
@@ -192,7 +203,18 @@ class EpisodeAnalysis:
             return "Non trovata"
         if any(d.status == "piu_volte" or d.confidence < CONFIDENCE_OK for d in dets):
             return "Da verificare"
+        if self.note:
+            return "Da verificare"
         return "Trovata"
+
+    @property
+    def note(self) -> str:
+        """Why a found sigla still deserves a look (empty when nothing)."""
+        if self.plan is None:
+            return ""
+        if (self.want_intro and self.plan.start_kind == "audio") or (self.want_outro and self.plan.end_kind == "audio"):
+            return "taglio deciso solo dall'audio: controlla l'anteprima"
+        return ""
 
     @property
     def ready(self) -> bool:

@@ -550,7 +550,8 @@ class SostituisciTab(QWidget):
             cell.setFlags((Qt.ItemIsEnabled | Qt.ItemIsSelectable | Qt.ItemIsEditable) if value is not None
                           else (Qt.ItemIsEnabled | Qt.ItemIsSelectable))
         self._filling = False
-        self.table.item(row, COL_STATUS).setText(ana.status if not ana.error else f"Errore: {ana.error}")
+        self.table.item(row, COL_STATUS).setText(
+            f"Errore: {ana.error}" if ana.error else ana.status + (f" — {ana.note}" if ana.note else ""))
         check = self.table.item(row, COL_CHECK)
         if ana.ready:
             check.setFlags(Qt.ItemIsUserCheckable | Qt.ItemIsEnabled)
@@ -575,9 +576,14 @@ class SostituisciTab(QWidget):
             self.info_label.setText("Tempo non valido: scrivilo come minuti:secondi, ad esempio 1:00.7.")
         else:
             plan.keep_start, plan.keep_end = start, end
+            if item.column() == COL_CUT_IN and ana.want_intro:
+                plan.start_kind = "manuale"
+            if item.column() == COL_CUT_OUT and ana.want_outro:
+                plan.end_kind = "manuale"
             if ana.want_intro and ana.intro is not None:
                 plan.mute_head = max(ana.intro.end - plan.keep_start, 0.0)
             self.info_label.setText(f"Taglio di {ana.episode.name} corretto a mano.")
+        self.table.item(row, COL_STATUS).setText(ana.status + (f" — {ana.note}" if ana.note else ""))
         self._filling = True
         item.setText(fmt_time(plan.keep_start if item.column() == COL_CUT_IN else plan.keep_end))
         self._filling = False
@@ -595,7 +601,8 @@ class SostituisciTab(QWidget):
             lines.append(f"Sigla finale: {ana.outro}")
         if ana.plan is not None:
             lines.append(
-                f"Si tiene l'episodio da {fmt_time(ana.plan.keep_start)} a {fmt_time(ana.plan.keep_end)}"
+                f"Si tiene l'episodio da {fmt_time(ana.plan.keep_start)} a {fmt_time(ana.plan.keep_end)} "
+                f"(inizio deciso da: {ana.plan.start_kind or '-'}; fine deciso da: {ana.plan.end_kind or '-'})"
                 + (f" (silenzio nei primi {ana.plan.mute_head:.1f} s dopo il taglio iniziale)" if ana.plan.mute_head > 0 else "")
             )
         elif ana.status in ("Trovata", "Da verificare"):
