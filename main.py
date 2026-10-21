@@ -30,7 +30,7 @@ from merger import MergeSettings, MergeResult
 from tab_sostituisci import SostituisciTab
 
 APP_TITLE = "ClipMerger"
-APP_VERSION = "0.4.2"
+APP_VERSION = "0.4.3"
 GITHUB_LATEST_RELEASE_API = "https://api.github.com/repos/Vipp0/ClipMerger/releases/latest"
 GITHUB_RELEASES_PAGE = "https://github.com/Vipp0/ClipMerger/releases/latest"
 
