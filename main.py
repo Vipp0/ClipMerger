@@ -21,16 +21,18 @@ from PySide6.QtWidgets import (
     QGroupBox, QLabel, QLineEdit, QPushButton, QFileDialog, QTableWidget,
     QTableWidgetItem, QProgressBar, QComboBox, QRadioButton, QButtonGroup,
     QStackedWidget, QSpinBox, QMessageBox, QCheckBox, QHeaderView, QAbstractItemView,
-    QToolButton, QMenu, QTabWidget,
+    QToolButton, QMenu, QTabWidget, QDialog,
 )
 
 import utils
 import merger
 from merger import MergeSettings, MergeResult
 from tab_sostituisci import SostituisciTab
+from fine_coda import CountdownDialog
 
 APP_TITLE = "ClipMerger"
-APP_VERSION = "0.4.3"
+AT_END_SECONDS = 10  # countdown before closing the program when the queue is done
+APP_VERSION = "0.4.4"
 GITHUB_LATEST_RELEASE_API = "https://api.github.com/repos/Vipp0/ClipMerger/releases/latest"
 GITHUB_RELEASES_PAGE = "https://github.com/Vipp0/ClipMerger/releases/latest"
 
@@ -716,6 +718,20 @@ class MainWindow(QMainWindow):
         tabs.addTab(central, "Unisci sigle")
         self.sostituisci_tab = SostituisciTab(self)
         tabs.addTab(self.sostituisci_tab, "Sostituisci sigla")
+        corner = QWidget()
+        corner_layout = QHBoxLayout(corner)
+        corner_layout.setContentsMargins(0, 0, 6, 0)
+        corner_layout.addWidget(QLabel("Quando la coda è finita:"))
+        self.at_end_combo = QComboBox()
+        self.at_end_combo.addItem("Non fare niente", "none")
+        self.at_end_combo.addItem("Chiudi il programma", "close")
+        self.at_end_combo.setToolTip(
+            "Vale per entrambe le schede, solo per questa sessione (all'avvio torna su «Non fare niente»). "
+            "Con «Chiudi il programma», a coda finita parte un conto alla rovescia di 10 secondi in cui si può annullare. "
+            "Non scatta se fermi tu l'elaborazione.")
+        corner_layout.addWidget(self.at_end_combo)
+        tabs.setCornerWidget(corner, Qt.TopRightCorner)
+        self.sostituisci_tab.queue_finished.connect(self._queue_finished)
         self.setCentralWidget(tabs)
 
     def _wire_signals(self):
@@ -1369,6 +1385,17 @@ class MainWindow(QMainWindow):
             self.summary_label.setText(
                 f"Completati: {self.ok_count}  Saltati: {self.skip_count}  Falliti: {self.err_count}"
             )
+            if not self.cancel_event.is_set():
+                self._queue_finished()
+
+    def _queue_finished(self):
+        """A queue ended on its own (either tab): do what the corner selector says."""
+        if self.at_end_combo.currentData() != "close":
+            return
+        if self.running or self.analyzing or self.sostituisci_tab.is_busy():
+            return  # another queue is still going
+        if CountdownDialog(self, AT_END_SECONDS).exec() == QDialog.Accepted:
+            self.close()
 
 
 def main():

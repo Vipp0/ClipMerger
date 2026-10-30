@@ -205,6 +205,8 @@ class SigleGroup(QGroupBox):
 
 
 class SostituisciTab(QWidget):
+    queue_finished = Signal()  # an Elabora run ended by itself (not stopped by the user)
+
     def __init__(self, main_window):
         super().__init__()
         self.win = main_window
@@ -760,3 +762,5 @@ class SostituisciTab(QWidget):
             self._set_state("idle")
             self.info_label.setText(
                 f"Completati: {self.ok_count}  Saltati: {self.skip_count}  Falliti: {self.err_count}")
+            if not self.cancel_event.is_set():
+                self.queue_finished.emit()
