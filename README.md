@@ -33,6 +33,7 @@ Applicazione desktop per Windows che unisce automaticamente una **sigla iniziale
 - Tema **chiaro / scuro / automatico** (segue le impostazioni di Windows).
 
 - **Scheda "Sostituisci sigla"**: toglie la sigla che c'è già dentro gli episodi (iniziale e/o finale, riconosciute dall'audio: la "impara" dagli episodi o la cerca da un file di esempio) e ci mette una nuova, audio e video. Si vede una tabella con i risultati prima di scrivere qualsiasi cosa, c'è l'anteprima delle giunzioni, e ogni episodio viene ricodificato una volta sola nel suo codec. Una schermata col titolo dopo la sigla viene conservata (senza la musica; si può spegnere con la casella apposita) e i punti di taglio si possono correggere a mano nella tabella.
+- **Scheda "Modifica tracce"**: cambia ordine, traccia predefinita, nome, lingua e presenza delle tracce audio e dei sottotitoli dei video di una cartella (o della coda di «Unisci sigle»), **senza ricodificare** (si riscrive solo il contenitore: pochi secondi per episodio, audio e video identici). Regole valide per tutti i file (es. "metti per prima e rendi predefinita la traccia ita", "elimina i sottotitoli eng", "nessuna predefinita") con la tabella prima/dopo, e modifica a mano di un singolo video. Il risultato è un file nuovo in una cartella a parte; MP4 tiene solo sottotitoli di testo, i formati vecchi (avi, ts...) escono come MKV.
 
 ## Requisiti
 
@@ -79,6 +80,9 @@ main.py             GUI (PySide6), con le due schede
 tab_sostituisci.py  Scheda "Sostituisci sigla"
 sostituisci.py      Sostituzione delle sigle dentro un episodio: punti di taglio, comando ffmpeg
 trova_sigla.py      Riconoscimento delle sigle dall'audio (numpy)
+tab_tracce.py       Scheda "Modifica tracce"
+tracce.py           Lettura, regole e riscrittura (remux) delle tracce audio/sottotitoli
+fine_coda.py        Conto alla rovescia di "a coda finita"
 merger.py           Logica di unione video: probing, comando ffmpeg, verifica integrità
 utils.py            Rilevamento ffmpeg/ffprobe, encoder hardware, utility varie
 assets/             Icone usate dall'interfaccia
