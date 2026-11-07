@@ -15,6 +15,7 @@ from PySide6.QtWidgets import (
     QTableWidgetItem, QVBoxLayout, QWidget,
 )
 
+import applog
 import merger
 import tracce
 import utils
@@ -82,7 +83,8 @@ class TaskRunner(QRunnable):
             result = tracce.remux(*self.args, progress_cb=lambda p: self.signals.progress.emit(self.row, p),
                                   cancel_event=self.cancel_event)
         except Exception as exc:
-            result = merger.MergeResult(output_path=Path(), success=False, error=str(exc))
+            applog.log_exception("Modifica tracce", exc)
+            result = merger.MergeResult(output_path=Path(), success=False, error=applog.describe_exception(exc))
         self.signals.finished.emit(self.row, result)
 
 
@@ -624,6 +626,7 @@ class TracceTab(QWidget):
             QMessageBox.Yes | QMessageBox.Cancel, QMessageBox.Yes)
         if reply != QMessageBox.Yes:
             return
+        applog.log_batch_start("Modifica tracce", f"cartella di output {output_dir}", len(rows), self.parallel_spin.value())
         self.cancel_event = threading.Event()
         self.pool.setMaxThreadCount(self.parallel_spin.value())
         self.started, self.job_rows = set(), rows
@@ -667,6 +670,7 @@ class TracceTab(QWidget):
             self.progress.setValue(int(sum(self.row_pct.values()) * 100 / self.total_count))
 
     def _on_finished(self, row: int, result):
+        applog.log_result("Modifica tracce", self.sources[row].path.name if row < len(self.sources) else f"riga {row}", result)
         self.finished_count += 1
         self.row_pct[row] = 1.0
         bar = self.table.cellWidget(row, COL_PROGRESS)

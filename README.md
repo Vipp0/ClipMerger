@@ -34,6 +34,7 @@ Applicazione desktop per Windows che unisce automaticamente una **sigla iniziale
 
 - **Scheda "Sostituisci sigla"**: toglie la sigla che c'è già dentro gli episodi (iniziale e/o finale, riconosciute dall'audio: la "impara" dagli episodi o la cerca da un file di esempio) e ci mette una nuova, audio e video. Si vede una tabella con i risultati prima di scrivere qualsiasi cosa, c'è l'anteprima delle giunzioni, e ogni episodio viene ricodificato una volta sola nel suo codec. Una schermata col titolo dopo la sigla viene conservata (senza la musica; si può spegnere con la casella apposita) e i punti di taglio si possono correggere a mano nella tabella.
 - **Scheda "Modifica tracce"**: cambia ordine, traccia predefinita, nome, lingua e presenza delle tracce audio e dei sottotitoli dei video di una cartella (o della coda di «Unisci sigle»), **senza ricodificare** (si riscrive solo il contenitore: pochi secondi per episodio, audio e video identici). Regole valide per tutti i file ("metti per prima e rendi predefinita la traccia ita", "elimina i sottotitoli eng", "tieni solo ita, eng", "rinomina le tracce ita in Italiano", "assegna la lingua a quelle senza lingua", "segna / togli / elimina le forzate", "nessuna predefinita") con la tabella prima/dopo, e modifica a mano di un singolo video. Il risultato è un file nuovo in una cartella a parte; MP4 tiene solo sottotitoli di testo, i formati vecchi (avi, ts...) escono come MKV.
+- **File di log**: il programma scrive `%LOCALAPPDATA%\ClipMerger\logs\clipmerger.log` (impostazioni di ogni lavoro, comando di ogni ffmpeg, errori completi, memoria del computer, del programma e degli ffmpeg in corso ogni 30 secondi, picco di memoria di ogni codifica) e `crash.log` (blocchi fatali di Python/Qt). Se la sessione precedente non si era chiusa normalmente (blocco, chiusura forzata, PC spento) lo segnala all'avvio. Il pulsante «Apri i log» in alto a destra apre la cartella. Il log ruota da solo (restano circa 3 MB) e contiene solo nomi di file, impostazioni ed errori.
 
 ## Requisiti
 
@@ -80,6 +81,7 @@ main.py             GUI (PySide6), con le due schede
 tab_sostituisci.py  Scheda "Sostituisci sigla"
 sostituisci.py      Sostituzione delle sigle dentro un episodio: punti di taglio, comando ffmpeg
 trova_sigla.py      Riconoscimento delle sigle dall'audio (numpy)
+applog.py           File di log, memoria usata, rapporto dei blocchi
 tab_tracce.py       Scheda "Modifica tracce"
 tracce.py           Lettura, regole e riscrittura (remux) delle tracce audio/sottotitoli
 fine_coda.py        Conto alla rovescia di "a coda finita"

@@ -12,12 +12,14 @@ import os
 import re
 import subprocess
 import threading
+import time
 from dataclasses import dataclass, field
 from fractions import Fraction
 from functools import lru_cache
 from pathlib import Path
 from typing import Callable
 
+import applog
 from utils import CREATE_NO_WINDOW, CODEC_ENCODERS
 
 TARGET_SAMPLE_RATE = 48000
@@ -730,14 +732,19 @@ def run_merge_pass(
     progress_cb: Callable[[float], None] | None,
     cancel_event: threading.Event | None,
 ) -> None:
+    started = time.monotonic()
+    applog.log.info("ffmpeg avviato: %s", applog.format_command(cmd))
     proc = subprocess.Popen(
         cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
         creationflags=CREATE_NO_WINDOW,
     )
+    applog.track(proc.pid, "ffmpeg")
+    cancelled = False
     try:
         assert proc.stdout is not None
         for line in proc.stdout:
             if cancel_event is not None and cancel_event.is_set():
+                cancelled = True
                 proc.terminate()
                 try:
                     proc.wait(timeout=5)
@@ -758,9 +765,15 @@ def run_merge_pass(
             except subprocess.TimeoutExpired:
                 proc.kill()
                 proc.wait()
+        peak = applog.untrack(proc.pid)
+        applog.log.info(
+            "ffmpeg#%s finito: %s, %.0f s%s", proc.pid,
+            "annullato" if cancelled else f"codice {applog.signed_code(proc.returncode)}", time.monotonic() - started,
+            f", {peak}" if peak else "")
 
     if proc.returncode != 0:
         stderr = proc.stderr.read() if proc.stderr else ""
+        applog.log.error("ffmpeg#%s ha fallito (codice %s). Messaggio completo:\n%s", proc.pid, applog.signed_code(proc.returncode), stderr.strip())
         raise MergeError(f"ffmpeg ha fallito (codice {proc.returncode}): {stderr.strip()[-800:]}")
 
 

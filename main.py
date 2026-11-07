@@ -14,8 +14,8 @@ import urllib.request
 from collections import Counter
 from pathlib import Path
 
-from PySide6.QtCore import Qt, QObject, Signal, QRunnable, QThreadPool, QThread, QSettings
-from PySide6.QtGui import QDragEnterEvent, QDropEvent, QGuiApplication
+from PySide6.QtCore import Qt, QObject, Signal, QRunnable, QThreadPool, QThread, QSettings, QUrl
+from PySide6.QtGui import QDesktopServices, QDragEnterEvent, QDropEvent, QGuiApplication
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QGridLayout,
     QGroupBox, QLabel, QLineEdit, QPushButton, QFileDialog, QTableWidget,
@@ -24,6 +24,7 @@ from PySide6.QtWidgets import (
     QToolButton, QMenu, QTabWidget, QDialog,
 )
 
+import applog
 import utils
 import merger
 from merger import MergeSettings, MergeResult
@@ -33,7 +34,7 @@ from fine_coda import CountdownDialog
 
 APP_TITLE = "ClipMerger"
 AT_END_SECONDS = 10  # countdown before closing the program when the queue is done
-APP_VERSION = "0.5.1"
+APP_VERSION = "0.5.2"
 GITHUB_LATEST_RELEASE_API = "https://api.github.com/repos/Vipp0/ClipMerger/releases/latest"
 GITHUB_RELEASES_PAGE = "https://github.com/Vipp0/ClipMerger/releases/latest"
 
@@ -275,7 +276,8 @@ class MergeTask(QRunnable):
                 cancel_event=self.cancel_event,
             )
         except Exception as exc:  # defensive: never let a worker thread crash silently
-            result = MergeResult(output_path=self.output, success=False, error=str(exc))
+            applog.log_exception(f"elaborazione di {self.episode.name}", exc)
+            result = MergeResult(output_path=self.output, success=False, error=applog.describe_exception(exc))
         self.signals.finished.emit(self.row, result)
 
 
@@ -447,6 +449,7 @@ class MainWindow(QMainWindow):
             self.resize(980, 640)
 
         self.ffmpeg_status = utils.check_ffmpeg()
+        applog.log.info("ffmpeg: %s | ffprobe: %s", self.ffmpeg_status.ffmpeg_path, self.ffmpeg_status.ffprobe_path)
         self.hw_encoders: dict[str, str | None] = {c: None for _, c in CODEC_LABELS}
         self.hw_reasons: dict[str, str] = {c: "" for _, c in CODEC_LABELS}
         self.rows: list[dict] = []  # {path, output}
@@ -733,6 +736,13 @@ class MainWindow(QMainWindow):
             "Con «Chiudi il programma», a coda finita parte un conto alla rovescia di 10 secondi in cui si può annullare. "
             "Non scatta se fermi tu l'elaborazione.")
         corner_layout.addWidget(self.at_end_combo)
+        log_btn = QPushButton("Apri i log")
+        log_btn.setObjectName("secondary")
+        log_btn.setToolTip(
+            "Apre la cartella con il file di log del programma: se qualcosa va storto, "
+            "mandami il file «clipmerger.log» (e «crash.log», se c'è) che si trova lì.")
+        log_btn.clicked.connect(lambda: QDesktopServices.openUrl(QUrl.fromLocalFile(str(applog.log_dir()))))
+        corner_layout.addWidget(log_btn)
         tabs.setCornerWidget(corner, Qt.TopRightCorner)
         self.sostituisci_tab.queue_finished.connect(self._queue_finished)
         self.tracce_tab.queue_finished.connect(self._queue_finished)
@@ -1235,6 +1245,14 @@ class MainWindow(QMainWindow):
         self.row_start_time = {}
         self.eta_label.setText("")
 
+        applog.log_batch_start(
+            "Unisci sigle",
+            f"codec {'come originale' if source_mode else codec} ({encoder}{', scheda video' if is_hardware else ''}), "
+            f"preset {settings.preset}, modalità {bitrate_mode} (CRF {settings.crf}, CBR {settings.cbr_kbps} kbps), "
+            f"2 passaggi {'sì' if settings.two_pass else 'no'}, audio {settings.audio_mode}, "
+            f"sigla iniziale {'sì' if intro_path else 'no'}, finale {'sì' if outro_path else 'no'}",
+            self.total_count, self.parallel_spin.value())
+
         container_suffix = self.container_combo.currentData()
         used_names: set[str] = set()
         self.row_notes = {}
@@ -1366,6 +1384,7 @@ class MainWindow(QMainWindow):
             self.eta_label.setText(f"Tempo rimanente stimato: {utils.format_duration(remaining)}")
 
     def _on_finished(self, row: int, result: MergeResult):
+        applog.log_result("Unisci sigle", self.rows[row]["path"].name if row < len(self.rows) else f"riga {row}", result)
         self.row_pct[row] = 1.0
         if result.skipped:
             self._set_row_status(row, "Già presente, saltato")
@@ -1405,6 +1424,7 @@ class MainWindow(QMainWindow):
 
 
 def main():
+    applog.setup(APP_VERSION)
     app = QApplication(sys.argv)
     # The native Windows 11 style ignores QSS background-color on some container
     # widgets (QGroupBox in particular); Fusion always honors the stylesheet.

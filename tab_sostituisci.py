@@ -15,6 +15,7 @@ from PySide6.QtWidgets import (
     QVBoxLayout, QWidget,
 )
 
+import applog
 import merger
 import sostituisci
 import utils
@@ -93,7 +94,8 @@ class AnalyzeWorker(QThread):
         except sostituisci.Annullato:
             return
         except Exception as exc:  # never let the thread die silently
-            self.failed.emit(str(exc))
+            applog.log_exception("Sostituisci sigla (analisi)", exc)
+            self.failed.emit(applog.describe_exception(exc))
             return
         self.done.emit(result)
 
@@ -110,7 +112,8 @@ class PreviewWorker(QThread):
         try:
             self.ready.emit([str(p) for p in sostituisci.anteprima_giunzioni(*self.args)])
         except Exception as exc:
-            self.failed.emit(str(exc))
+            applog.log_exception("Sostituisci sigla (anteprima)", exc)
+            self.failed.emit(applog.describe_exception(exc))
 
 
 class ProcessSignals(QObject):
@@ -138,7 +141,8 @@ class ProcessTask(QRunnable):
                 cancel_event=self.cancel_event,
             )
         except Exception as exc:
-            result = merger.MergeResult(output_path=Path(), success=False, error=str(exc))
+            applog.log_exception("Sostituisci sigla", exc)
+            result = merger.MergeResult(output_path=Path(), success=False, error=applog.describe_exception(exc))
         self.signals.finished.emit(self.row, result)
 
 
@@ -684,6 +688,11 @@ class SostituisciTab(QWidget):
         )
         if reply != QMessageBox.Yes:
             return
+        applog.log_batch_start(
+            "Sostituisci sigla",
+            f"qualità {self.quality_combo.currentText()}, preset {self.preset_combo.currentData()}, "
+            f"audio {self.audio_combo.currentData()}, cartella di output {output_dir}",
+            len(rows), self.parallel_spin.value())
         self.cancel_event = threading.Event()
         self.pool.setMaxThreadCount(self.parallel_spin.value())
         self.started = set()
@@ -735,6 +744,8 @@ class SostituisciTab(QWidget):
             self.progress.setValue(int(sum(self.row_pct.values()) * 100 / self.total_count))
 
     def _on_finished(self, row: int, result):
+        name_item = self.table.item(row, COL_NAME)
+        applog.log_result("Sostituisci sigla", name_item.text() if name_item else f"riga {row}", result)
         self.finished_count += 1
         self.row_pct[row] = 1.0
         bar = self.table.cellWidget(row, COL_PROGRESS)
