@@ -222,15 +222,22 @@ class RuleRow(QWidget):
         self.language.setMinimumWidth(110)
         self.set_languages(languages)
         self.language.setCurrentText("ita")
+        self.name_edit = QLineEdit()
+        self.name_edit.setPlaceholderText("nuovo nome (vuoto = nessun nome)")
+        self.name_edit.setMinimumWidth(200)
+        self.language_label = QLabel("in lingua:")
         remove = QPushButton("✕")
         remove.setObjectName("secondary")
         remove.setToolTip("Togli questa regola")
         remove.setFixedWidth(34)
         remove.clicked.connect(lambda: self.removed.emit(self))
-        for widget in (QLabel("Su:"), self.kind, self.action, QLabel("in lingua:"), self.language, remove):
+        self.name_label = QLabel("nome:")
+        for widget in (QLabel("Su:"), self.kind, self.action, self.language_label, self.language,
+                       self.name_label, self.name_edit, remove):
             row.addWidget(widget)
         row.addStretch(1)
         self.action.currentIndexChanged.connect(self._action_changed)
+        self._action_changed()
 
     def set_languages(self, languages: list[str]):
         current = self.language.currentText()
@@ -240,12 +247,28 @@ class RuleRow(QWidget):
             self.language.setCurrentText(current)
 
     def _action_changed(self):
-        self.language.setEnabled(self.action.currentData() != tracce.NO_DEFAULT)
+        action = self.action.currentData()
+        self.language.setEnabled(action != tracce.NO_DEFAULT)
+        if action in tracce.LANGUAGE_IS_LIST:
+            self.language_label.setText("lingue da tenere (separate da virgola):")
+            self.language.setToolTip("Esempio: ita, eng. Tutte le altre tracce di questo tipo vengono eliminate.")
+        elif action in tracce.LANGUAGE_IS_TARGET:
+            self.language_label.setText("lingua da assegnare:")
+            self.language.setToolTip("Le tracce senza lingua (o «und») prendono questa lingua.")
+        else:
+            self.language_label.setText("in lingua:")
+            self.language.setToolTip("")
+        self.name_label.setVisible(action in tracce.ACTIONS_NEEDING_NAME)
+        self.name_edit.setVisible(action in tracce.ACTIONS_NEEDING_NAME)
 
     def rule(self) -> Rule:
         text = self.language.currentText().strip()
-        lang = tracce.ANY_LANGUAGE if text in ("", ALL_LABEL) else tracce.norm_lang(text)
-        return Rule(self.kind.currentData(), self.action.currentData(), lang)
+        action = self.action.currentData()
+        if action in tracce.LANGUAGE_IS_LIST:
+            lang = tracce.ANY_LANGUAGE if text in ("", ALL_LABEL) else text  # "ita, eng": split by apply_rules
+        else:
+            lang = tracce.ANY_LANGUAGE if text in ("", ALL_LABEL) else tracce.norm_lang(text)
+        return Rule(self.kind.currentData(), action, lang, self.name_edit.text())
 
 
 # ---------------------------------------------------------------------------- the tab

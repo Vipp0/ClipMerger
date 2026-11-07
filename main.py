@@ -33,7 +33,7 @@ from fine_coda import CountdownDialog
 
 APP_TITLE = "ClipMerger"
 AT_END_SECONDS = 10  # countdown before closing the program when the queue is done
-APP_VERSION = "0.5.0"
+APP_VERSION = "0.5.1"
 GITHUB_LATEST_RELEASE_API = "https://api.github.com/repos/Vipp0/ClipMerger/releases/latest"
 GITHUB_RELEASES_PAGE = "https://github.com/Vipp0/ClipMerger/releases/latest"
 

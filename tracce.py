@@ -13,14 +13,28 @@ AUDIO, SUB = "audio", "sub"
 
 # Rule actions
 FIRST_DEFAULT, FIRST, DEFAULT, DELETE, NO_DEFAULT = "first_default", "first", "default", "delete", "no_default"
+KEEP_ONLY, RENAME, FIX_LANGUAGE = "keep_only", "rename", "fix_language"
+DELETE_FORCED, CLEAR_FORCED, SET_FORCED = "delete_forced", "clear_forced", "set_forced"
 ACTION_LABELS = [
     (FIRST_DEFAULT, "Metti per prima e rendi predefinita"),
     (FIRST, "Metti per prima"),
     (DEFAULT, "Rendi predefinita"),
     (DELETE, "Elimina"),
+    (KEEP_ONLY, "Tieni solo le lingue (elimina le altre)"),
     (NO_DEFAULT, "Nessuna predefinita"),
+    (RENAME, "Rinomina in..."),
+    (FIX_LANGUAGE, "Assegna la lingua a quelle senza lingua"),
+    (SET_FORCED, "Segna come «forzata»"),
+    (CLEAR_FORCED, "Togli il segno «forzata»"),
+    (DELETE_FORCED, "Elimina quelle «forzate»"),
 ]
+# what the "language" box means for each action
+ACTIONS_WITHOUT_LANGUAGE = (NO_DEFAULT, CLEAR_FORCED, DELETE_FORCED)  # these act on all the tracks (or the language given)
+ACTIONS_NEEDING_NAME = (RENAME,)
+LANGUAGE_IS_LIST = (KEEP_ONLY,)  # "ita, eng"
+LANGUAGE_IS_TARGET = (FIX_LANGUAGE,)  # the language to give
 ANY_LANGUAGE = "*"
+_NO_LANGUAGE = ("", "und", "unk", "mis", "zxx")
 
 _LANG_ALIASES = {
     "it": "ita", "en": "eng", "ja": "jpn", "jp": "jpn", "fr": "fra", "fre": "fra", "de": "deu", "ger": "deu",
@@ -77,7 +91,8 @@ class FileTracks:
 class Rule:
     kind: str  # AUDIO | SUB
     action: str
-    language: str = ANY_LANGUAGE
+    language: str = ANY_LANGUAGE  # KEEP_ONLY: "ita, eng"; FIX_LANGUAGE: the language to assign
+    name: str = ""  # RENAME: the new track name (empty = remove the name)
 
 
 def read_tracks(ffprobe: str, path: Path) -> FileTracks:
@@ -137,7 +152,46 @@ def apply_rules(ft: FileTracks, rules: list[Rule]) -> tuple[FileTracks, list[str
     for rule in rules:
         lst = out.of(rule.kind)
         wanted = norm_lang(rule.language)
+        if rule.action == KEEP_ONLY:
+            keep = {norm_lang(x) for x in rule.language.replace(";", ",").split(",") if x.strip()}
+            if not keep or ANY_LANGUAGE in keep:
+                notes.append("«tieni solo le lingue»: nessuna lingua indicata")
+                continue
+            rest = [t for t in lst if t.language in keep]
+            if not rest and rule.kind == AUDIO:
+                notes.append("nessuna traccia audio nelle lingue da tenere: non elimino niente")
+                continue
+            lst[:] = rest
+            continue
+        if rule.action == FIX_LANGUAGE:
+            if wanted in _NO_LANGUAGE or wanted == ANY_LANGUAGE:
+                notes.append("«assegna la lingua»: nessuna lingua indicata")
+                continue
+            for t in lst:
+                if t.language in _NO_LANGUAGE:
+                    t.language = wanted
+            continue
+        if rule.action == RENAME:
+            for t in lst:
+                if wanted in ("", ANY_LANGUAGE) or t.language == wanted:
+                    t.title = rule.name.strip()
+            continue
         match = [t for t in lst if wanted in ("", ANY_LANGUAGE) or t.language == wanted]
+        if rule.action == SET_FORCED:
+            for t in match:
+                t.forced = True
+            continue
+        if rule.action == CLEAR_FORCED:
+            for t in match:
+                t.forced = False
+            continue
+        if rule.action == DELETE_FORCED:
+            gone = [t for t in match if t.forced]
+            if len(gone) == len(lst) and rule.kind == AUDIO:
+                notes.append("non elimino tutte le tracce audio")
+                continue
+            lst[:] = [t for t in lst if t not in gone]
+            continue
         rest = [t for t in lst if t not in match]
         if rule.action in (FIRST, FIRST_DEFAULT) and match:
             lst[:] = match + rest
