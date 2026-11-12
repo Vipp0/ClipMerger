@@ -80,6 +80,7 @@ class Piece:
     title: str = ""
     score: float = 0.0
     ambiguous: bool = False
+    tail: tuple[float, float] | None = None  # the file's own ending (TV switching off + closing credits): (start, end)
 
     @property
     def duration(self) -> float:
@@ -96,6 +97,7 @@ class FileAnalysis:
     duration: float = 0.0
     opening_end: float = 0.0
     credits_start: float | None = None
+    tail_start: float | None = None  # where the ending begins (the "TV switching off" effect, else the credits)
     pieces: list[Piece] = field(default_factory=list)
     error: str | None = None
 
@@ -201,6 +203,21 @@ def _snap(ffmpeg: str, path: Path, t: float, radius: float) -> float:
     return round(cut, 3) if cut is not None else t
 
 
+def tv_off_start(ffmpeg: str, path: Path, credits: float) -> float | None:
+    """Where the "television switching off" effect that closes the last sketch begins (a hard cut to nearly black
+    frames, 0.3-0.4 s before the credits), or None when the sketch goes straight to the credits."""
+    cut = scene_cut_near(ffmpeg, path, credits - 0.4, 0.3)
+    if cut is None or not (0.1 <= credits - cut <= 0.7):
+        return None
+    proc = subprocess.run(
+        [ffmpeg, "-v", "error", "-nostdin", "-ss", f"{cut + 0.04:.3f}", "-i", str(path), "-an", "-sn", "-frames:v", "1",
+         "-vf", "scale=32:18,format=gray", "-f", "rawvideo", "-"],
+        capture_output=True, creationflags=CREATE_NO_WINDOW)
+    if len(proc.stdout) < 32 * 18 or np.frombuffer(proc.stdout, dtype=np.uint8).mean() > 25:
+        return None  # what follows the cut is not dark: an ordinary cut inside the sketch
+    return round(cut, 3)
+
+
 def credits_start(ffmpeg: str, path: Path, duration: float) -> float | None:
     """Where the orange closing credits begin (the last stretch where most of the picture is orange)."""
     t0 = max(0.0, duration - 40.0)
@@ -289,7 +306,10 @@ def analizza_file(ffmpeg: str, ffprobe: str, path: Path, profile: Profile, sampl
         res.credits_start = credits_start(ffmpeg, path, res.duration)
         if res.credits_start:
             res.credits_start = _snap(ffmpeg, path, res.credits_start, 0.5)
-    end_of_file = res.credits_start or res.duration
+    res.tail_start = res.credits_start
+    if res.credits_start:
+        res.tail_start = tv_off_start(ffmpeg, path, res.credits_start) or res.credits_start
+    end_of_file = res.tail_start or res.duration
 
     if progress:
         progress(0.8, f"{path.name}: punti di taglio")
@@ -303,7 +323,8 @@ def analizza_file(ffmpeg: str, ffprobe: str, path: Path, profile: Profile, sampl
     starts = [res.opening_end] + [c[0] for c in cuts[1:]]
     for i, (cut, ok, seen) in enumerate(cuts):
         end = starts[i + 1] if i + 1 < len(starts) else end_of_file
-        res.pieces.append(Piece(start=starts[i], end=end, cup_cut=cut, cup_found=seen, snapped=ok))
+        res.pieces.append(Piece(start=starts[i], end=end, cup_cut=cut, cup_found=seen, snapped=ok,
+                                tail=(res.tail_start, res.duration) if res.tail_start else None))
 
     if progress:
         progress(0.9, f"{path.name}: leggo i titoli")
@@ -348,9 +369,11 @@ QUALITY_LEVELS = [("Alta", 18), ("Bilanciata (consigliata)", 20), ("Compatta", 2
 
 
 def cut_piece(ffmpeg: str, ffprobe: str, src: Path, start: float, end: float, output: Path, crf: int, preset: str,
-              codec: str, title: str = "", progress_cb=None, cancel_event=None) -> merger.MergeResult:
+              codec: str, title: str = "", progress_cb=None, cancel_event=None,
+              tail: tuple[float, float] | None = None) -> merger.MergeResult:
     """One piece: [start, end) of `src`, re-encoded once, in the same container, never above the source's video
-    bitrate. The audio keeps its codec and track layout."""
+    bitrate. The audio keeps its codec and track layout. With `tail` = (start, end) of the same file, that stretch
+    (the file's own ending) is joined after the piece, in the same single encode."""
     try:
         info = merger.probe(ffprobe, src)
         use = codec if codec != "original" else (merger.app_codec_for(info.video_codec) or "h264")
@@ -365,15 +388,20 @@ def cut_piece(ffmpeg: str, ffprobe: str, src: Path, start: float, end: float, ou
             bitrate_mode="crf", crf=crf + (-1 if use == "h265" else 0), audio_mode="original",
             max_kbps=cap if use in ("h264", "h265") else 0,
         )
-        cmd = merger.build_command(ffmpeg, [(src, info)], 0, output, settings, windows={0: (start, end - 0.01)})
+        segments = [(src, info)] + ([(src, info)] if tail else [])
+        windows = {0: (start, end - 0.01)}
+        if tail:
+            windows[1] = tail
+        cmd = merger.build_command(ffmpeg, segments, 0, output, settings, windows=windows)
         if title:
             at = len(cmd) - 1 - cmd[::-1].index("-progress")
             cmd[at:at] = ["-metadata", f"title={title}"]
         tmp = output.with_name(f".{output.stem}.part{output.suffix}")
         cmd[-1] = str(tmp)
         try:
-            merger.run_merge_pass(cmd, end - start, progress_cb, cancel_event)
-            merger.verify_output(ffprobe, tmp, end - start)
+            expected = end - start + ((tail[1] - tail[0]) if tail else 0.0)
+            merger.run_merge_pass(cmd, expected, progress_cb, cancel_event)
+            merger.verify_output(ffprobe, tmp, expected)
             tmp.replace(output)
         finally:
             tmp.unlink(missing_ok=True)

@@ -24,6 +24,8 @@ from utils import list_video_files
 
 PRESETS = [("Veloce", "fast"), ("Bilanciato", "medium"), ("Qualità", "slow")]
 CODECS = [("Come l'originale", "original"), ("H.265 (file più piccoli)", "h265")]
+ENDINGS = [("Pulita: finisce con la scena, senza la transizione", "clean"),
+           ("Con la transizione e i titoli di coda (circa 8 secondi)", "credits")]
 COL_CHECK, COL_FILE, COL_START, COL_END, COL_DUR, COL_NUM, COL_TITLE, COL_STATUS, COL_SHOT, COL_PROGRESS = range(10)
 COL_EDITABLE = (COL_START, COL_END, COL_NUM, COL_TITLE)
 WORK_DIR = Path(tempfile.gettempdir()) / "ClipMerger_dividi"
@@ -92,10 +94,12 @@ class ProcessSignals(QObject):
 
 class ProcessTask(QRunnable):
     def __init__(self, row: int, ffmpeg: str, ffprobe: str, src: Path, start: float, end: float, output: Path,
-                 crf: int, preset: str, codec: str, title: str, signals: ProcessSignals, cancel_event: threading.Event):
+                 crf: int, preset: str, codec: str, title: str, tail: tuple[float, float] | None,
+                 signals: ProcessSignals, cancel_event: threading.Event):
         super().__init__()
         self.row = row
         self.args = (ffmpeg, ffprobe, src, start, end, output, crf, preset, codec, title)
+        self.tail = tail
         self.signals, self.cancel_event = signals, cancel_event
         self.setAutoDelete(True)
 
@@ -104,7 +108,7 @@ class ProcessTask(QRunnable):
         try:
             result = dividi.cut_piece(
                 *self.args, progress_cb=lambda pct: self.signals.progress.emit(self.row, pct),
-                cancel_event=self.cancel_event)
+                cancel_event=self.cancel_event, tail=self.tail)
         except Exception as exc:
             applog.log_exception("Dividi puntate", exc)
             result = merger.MergeResult(output_path=Path(), success=False, error=applog.describe_exception(exc))
@@ -240,12 +244,20 @@ class DividiTab(QWidget):
         self.parallel_spin.setRange(1, 4)
         self.parallel_spin.setValue(2)
         enc.addWidget(self.parallel_spin, 0, 7)
+        enc.addWidget(QLabel("Fine di ogni puntata:"), 1, 0)
+        self.ending_combo = QComboBox()
+        for label, value in ENDINGS:
+            self.ending_combo.addItem(label, value)
+        self.ending_combo.setToolTip(
+            "Il file originale finisce con l'effetto del televisore che si spegne e i titoli di coda arancioni. "
+            "«Con la transizione e i titoli di coda» li mette alla fine di ogni puntata, come accade all'ultima.")
+        enc.addWidget(self.ending_combo, 1, 1, 1, 7)
         note = QLabel(
             "Ogni pezzo viene ricodificato una sola volta (il taglio è preciso al fotogramma), con codifica software, "
             "nello stesso formato del file. Il bitrate non supera mai quello dell'originale; l'audio resta com'è "
             "(stesso codec e tracce). Con «Bilanciata» i pezzi escono più piccoli dell'originale.")
         note.setWordWrap(True)
-        enc.addWidget(note, 1, 0, 1, 8)
+        enc.addWidget(note, 2, 0, 1, 8)
         enc.setColumnStretch(1, 1)
         enc_box = QGroupBox("Codifica")
         enc_box.setLayout(enc)
@@ -347,7 +359,8 @@ class DividiTab(QWidget):
         self.start_btn.setText("Stop" if self.state == "processing" else "Avvia")
         self.start_btn.setEnabled(self.state == "processing" or (idle and any(p is not None for _, p, _ in self.entries)))
         for w in (self.folder_edit, self.output_edit, self.profile_combo, self.series_spin, self.season_spin, self.key_edit,
-                  self.list_btn, self.quality_combo, self.preset_combo, self.codec_combo, self.parallel_spin):
+                  self.list_btn, self.quality_combo, self.preset_combo, self.codec_combo, self.ending_combo,
+                  self.parallel_spin):
             w.setEnabled(idle)
         self.table.setEditTriggers(
             (QAbstractItemView.DoubleClicked | QAbstractItemView.EditKeyPressed) if idle else QAbstractItemView.NoEditTriggers)
@@ -686,7 +699,7 @@ class DividiTab(QWidget):
         applog.log_batch_start(
             "Dividi puntate",
             f"qualità {self.quality_combo.currentText()}, preset {self.preset_combo.currentData()}, "
-            f"codec {self.codec_combo.currentData()}, cartella di output {output_dir}",
+            f"codec {self.codec_combo.currentData()}, fine {self.ending_combo.currentData()}, cartella di output {output_dir}",
             len(rows), self.parallel_spin.value())
         self.cancel_event = threading.Event()
         self.pool.setMaxThreadCount(self.parallel_spin.value())
@@ -705,7 +718,8 @@ class DividiTab(QWidget):
             self.pool.start(ProcessTask(
                 row, tools[0], tools[1], path, piece.start, piece.end, output_dir / (names[row] + path.suffix),
                 self.quality_combo.currentData(), self.preset_combo.currentData(), self.codec_combo.currentData(),
-                names[row], self.signals, self.cancel_event))
+                names[row], piece.tail if self.ending_combo.currentData() == "credits" else None,
+                self.signals, self.cancel_event))
 
     def _cancel_processing(self):
         self.cancel_event.set()
