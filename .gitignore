@@ -4,3 +4,4 @@ dist/
 test_output/
 __pycache__/
 *.pyc
+tmdb_key.txt

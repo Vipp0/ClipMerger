@@ -125,6 +125,7 @@ class MergeSettings:
     audio_mode: str = "original"  # "original" | "aac_keep" | "aac_stereo" | "flac"
     deinterlace: bool = True  # deinterlace sources flagged as interlaced (the flag can't survive re-encoding)
     keep_10bit: bool = True  # keep 10-bit sources 10-bit (software H.265/AV1 only)
+    max_kbps: int = 0  # >0: in CRF mode, never go above this video bitrate (x264/x265 only: -maxrate)
 
 
 @dataclass
@@ -361,6 +362,8 @@ def _rate_control_args(settings: MergeSettings, bitrate_kbps: int | None) -> lis
     if "_amf" in enc:
         return ["-rc", "cqp", "-qp_i", str(crf), "-qp_p", str(crf), "-qp_b", str(crf)]
     # libx264 / libx265 / libsvtav1
+    if settings.max_kbps > 0 and enc in ("libx264", "libx265"):
+        return ["-crf", str(crf), "-maxrate", f"{settings.max_kbps}k", "-bufsize", f"{settings.max_kbps * 2}k"]
     return ["-crf", str(crf)]
 
 
@@ -631,7 +634,11 @@ def build_command(
     pass_num: int | None = None, passlog_prefix: str | None = None,
     chapters_file: Path | None = None, cover_files: list[CoverFile] = (),
     trims: dict[int, tuple[float, float]] | None = None, mutes: dict[int, float] | None = None,
+    windows: dict[int, tuple[float, float]] | None = None,
 ) -> list[str]:
+    """`windows` (segment index -> (start, end)) reads only that stretch of a clip, by seeking in the input
+    (frame-exact, because the picture is re-encoded anyway); unlike `trims` it doesn't decode everything
+    before the start, so it is the way to cut a piece out of the middle of a long file."""
     is_first_pass = pass_num == 1
     probes = [p for _, p in segments]
     episode = probes[episode_idx]
@@ -641,7 +648,10 @@ def build_command(
     )
 
     cmd = [ffmpeg_path, "-y", "-hide_banner", "-loglevel", "error"]
-    for path, _ in segments:
+    for i, (path, _) in enumerate(segments):
+        window = (windows or {}).get(i)
+        if window:
+            cmd += ["-ss", f"{window[0]:.3f}", "-t", f"{window[1] - window[0]:.3f}"]
         cmd += ["-i", str(path)]
     chapters_input_idx = None
     if chapters_file is not None and not is_first_pass:

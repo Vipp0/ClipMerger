@@ -28,13 +28,14 @@ import applog
 import utils
 import merger
 from merger import MergeSettings, MergeResult
+from tab_dividi import DividiTab
 from tab_sostituisci import SostituisciTab
 from tab_tracce import TracceTab
 from fine_coda import CountdownDialog
 
 APP_TITLE = "ClipMerger"
 AT_END_SECONDS = 10  # countdown before closing the program when the queue is done
-APP_VERSION = "0.5.2"
+APP_VERSION = "0.6.0"
 GITHUB_LATEST_RELEASE_API = "https://api.github.com/repos/Vipp0/ClipMerger/releases/latest"
 GITHUB_RELEASES_PAGE = "https://github.com/Vipp0/ClipMerger/releases/latest"
 
@@ -724,6 +725,8 @@ class MainWindow(QMainWindow):
         tabs.addTab(self.sostituisci_tab, "Sostituisci sigla")
         self.tracce_tab = TracceTab(self)
         tabs.addTab(self.tracce_tab, "Modifica tracce")
+        self.dividi_tab = DividiTab(self)
+        tabs.addTab(self.dividi_tab, "Dividi puntate")
         corner = QWidget()
         corner_layout = QHBoxLayout(corner)
         corner_layout.setContentsMargins(0, 0, 6, 0)
@@ -746,6 +749,7 @@ class MainWindow(QMainWindow):
         tabs.setCornerWidget(corner, Qt.TopRightCorner)
         self.sostituisci_tab.queue_finished.connect(self._queue_finished)
         self.tracce_tab.queue_finished.connect(self._queue_finished)
+        self.dividi_tab.queue_finished.connect(self._queue_finished)
         self.setCentralWidget(tabs)
 
     def _wire_signals(self):
@@ -808,11 +812,11 @@ class MainWindow(QMainWindow):
             self._apply_theme(self._resolve_theme("auto"))
 
     def closeEvent(self, event):
-        busy_tabs = [tab for tab in (self.sostituisci_tab, self.tracce_tab) if tab.is_busy()]
+        busy_tabs = [tab for tab in (self.sostituisci_tab, self.tracce_tab, self.dividi_tab) if tab.is_busy()]
         if busy_tabs:
             reply = QMessageBox.question(
                 self, "Elaborazione in corso",
-                "Nelle schede «Sostituisci sigla» / «Modifica tracce» c'è un'elaborazione in corso: chiudendo il "
+                "Nelle schede «Sostituisci sigla» / «Modifica tracce» / «Dividi puntate» c'è un'elaborazione in corso: chiudendo il "
                 "programma verrà interrotta e i file parziali eliminati. Chiudere comunque?",
                 QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
             )
@@ -1417,7 +1421,7 @@ class MainWindow(QMainWindow):
         """A queue ended on its own (either tab): do what the corner selector says."""
         if self.at_end_combo.currentData() != "close":
             return
-        if self.running or self.analyzing or self.sostituisci_tab.is_busy() or self.tracce_tab.is_busy():
+        if self.running or self.analyzing or self.sostituisci_tab.is_busy() or self.tracce_tab.is_busy() or self.dividi_tab.is_busy():
             return  # another queue is still going
         if CountdownDialog(self, AT_END_SECONDS).exec() == QDialog.Accepted:
             self.close()
