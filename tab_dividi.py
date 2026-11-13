@@ -19,7 +19,9 @@ import applog
 import dividi
 import merger
 import titoli
-from tab_sostituisci import FolderDropEdit, fmt_time, parse_time
+import dropwidgets
+from dropwidgets import PathDropEdit, PathDropTable
+from tab_sostituisci import fmt_time, parse_time
 from utils import list_video_files
 
 PRESETS = [("Veloce", "fast"), ("Bilanciato", "medium"), ("Qualità", "slow")]
@@ -156,8 +158,8 @@ class DividiTab(QWidget):
         top = QGridLayout()
         top.setSpacing(8)
         top.addWidget(QLabel("File o cartella:"), 0, 0)
-        self.folder_edit = FolderDropEdit("Trascina qui la cartella con i file da dividere, oppure sfoglia...")
-        self.folder_edit.folder_dropped.connect(self._load_folder)
+        self.folder_edit = PathDropEdit("Trascina qui la cartella o i file da dividere, oppure sfoglia...")
+        self.folder_edit.paths_dropped.connect(self._on_paths_dropped)
         top.addWidget(self.folder_edit, 0, 1)
         browse_folder = QPushButton("Cartella...")
         browse_folder.setObjectName("secondary")
@@ -168,8 +170,8 @@ class DividiTab(QWidget):
         browse_files.clicked.connect(self._browse_files)
         top.addWidget(browse_files, 0, 3)
         top.addWidget(QLabel("Cartella output:"), 1, 0)
-        self.output_edit = QLineEdit()
-        self.output_edit.setPlaceholderText("<cartella dei file>/puntate divise")
+        self.output_edit = PathDropEdit("<cartella dei file>/puntate divise")
+        self.output_edit.paths_dropped.connect(self._on_output_dropped)
         top.addWidget(self.output_edit, 1, 1)
         browse_out = QPushButton("Sfoglia...")
         browse_out.setObjectName("secondary")
@@ -315,7 +317,8 @@ class DividiTab(QWidget):
         buttons.addWidget(self.start_btn)
         root.addLayout(buttons)
 
-        self.table = QTableWidget(0, 10)
+        self.table = PathDropTable(0, 10)
+        self.table.paths_dropped.connect(self._on_paths_dropped)
         self.table.setHorizontalHeaderLabels(
             ["", "File", "Inizio", "Fine", "Durata", "N°", "Titolo", "Stato", "Titolo sullo schermo", "Avanzamento"])
         header = self.table.horizontalHeader()
@@ -446,13 +449,23 @@ class DividiTab(QWidget):
             self.output_edit.setText(folder)
 
     def _load_folder(self, folder: str):
+        self._on_paths_dropped([Path(folder)])
+
+    def _on_paths_dropped(self, paths: list):
+        """A folder, or one or more files (dropped or chosen)."""
         if self.is_busy():
             return
-        files = list_video_files(Path(folder))
+        files = dropwidgets.video_files(paths)
         if not files:
-            QMessageBox.warning(self, "Nessun video", "Nessun video trovato in questa cartella.")
+            QMessageBox.warning(self, "Nessun video", "Nessun video trovato.")
             return
-        self._set_files(files, folder)
+        folder = paths[0] if len(paths) == 1 and paths[0].is_dir() else files[0].parent
+        self._set_files(files, str(folder))
+
+    def _on_output_dropped(self, paths: list):
+        folder = dropwidgets.as_folder(paths)
+        if folder is not None and not self.is_busy():
+            self.output_edit.setText(str(folder))
 
     def _set_files(self, files: list[Path], folder: str):
         self.files = files

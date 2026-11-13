@@ -16,32 +16,16 @@ from PySide6.QtWidgets import (
 )
 
 import applog
+import dropwidgets
 import merger
 import tracce
 import utils
+from dropwidgets import PathDropEdit, PathDropTable
 from tracce import AUDIO, SUB, FileTracks, Rule, Track
 
 COL_CHECK, COL_NAME, COL_A_BEFORE, COL_A_AFTER, COL_S_BEFORE, COL_S_AFTER, COL_STATUS, COL_PROGRESS = range(8)
 ALL_LABEL = "(tutte)"
 COMMON_LANGUAGES = ["ita", "eng", "jpn", "fra", "deu", "spa", "und"]
-
-
-class FolderDropEdit(QLineEdit):
-    folder_dropped = Signal(str)
-
-    def __init__(self, placeholder: str):
-        super().__init__()
-        self.setPlaceholderText(placeholder)
-        self.setAcceptDrops(True)
-
-    def dragEnterEvent(self, event: QDragEnterEvent):
-        if event.mimeData().hasUrls():
-            event.acceptProposedAction()
-
-    def dropEvent(self, event: QDropEvent):
-        paths = [Path(u.toLocalFile()) for u in event.mimeData().urls()]
-        if len(paths) == 1 and paths[0].is_dir():
-            self.folder_dropped.emit(str(paths[0]))
 
 
 class ReadWorker(QThread):
@@ -314,8 +298,8 @@ class TracceTab(QWidget):
         top = QGridLayout()
         top.setSpacing(8)
         top.addWidget(QLabel("Cartella video:"), 0, 0)
-        self.folder_edit = FolderDropEdit("Trascina qui la cartella, oppure sfoglia...")
-        self.folder_edit.folder_dropped.connect(self._load_folder)
+        self.folder_edit = PathDropEdit("Trascina qui la cartella o i file, oppure sfoglia...")
+        self.folder_edit.paths_dropped.connect(self._on_paths_dropped)
         top.addWidget(self.folder_edit, 0, 1)
         browse = QPushButton("Sfoglia...")
         browse.setObjectName("secondary")
@@ -326,8 +310,8 @@ class TracceTab(QWidget):
         self.queue_btn.clicked.connect(self._use_queue)
         top.addWidget(self.queue_btn, 0, 3)
         top.addWidget(QLabel("Cartella output:"), 1, 0)
-        self.output_edit = QLineEdit()
-        self.output_edit.setPlaceholderText("<cartella video>/tracce modificate")
+        self.output_edit = PathDropEdit("<cartella video>/tracce modificate")
+        self.output_edit.paths_dropped.connect(self._on_output_dropped)
         top.addWidget(self.output_edit, 1, 1)
         browse_out = QPushButton("Sfoglia...")
         browse_out.setObjectName("secondary")
@@ -371,7 +355,8 @@ class TracceTab(QWidget):
         buttons.addWidget(self.start_btn)
         root.addLayout(buttons)
 
-        self.table = QTableWidget(0, 8)
+        self.table = PathDropTable(0, 8)
+        self.table.paths_dropped.connect(self._on_paths_dropped)
         self.table.setHorizontalHeaderLabels(
             ["", "Video", "Audio prima", "Audio dopo", "Sottotitoli prima", "Sottotitoli dopo", "Stato", "Avanzamento"])
         header = self.table.horizontalHeader()
@@ -458,14 +443,27 @@ class TracceTab(QWidget):
             self.output_edit.setText(folder)
 
     def _load_folder(self, folder: str):
+        self._load_paths([Path(folder)])
+
+    def _on_paths_dropped(self, paths: list):
+        self._load_paths(paths)
+
+    def _on_output_dropped(self, paths: list):
+        folder = dropwidgets.as_folder(paths)
+        if folder is not None and not self.is_busy():
+            self.output_edit.setText(str(folder))
+
+    def _load_paths(self, paths: list[Path]):
+        """A folder, or one or more files (dropped or chosen)."""
         if self.is_busy():
             return
-        files = utils.list_video_files(Path(folder))
+        files = dropwidgets.video_files(paths)
         if not files:
-            QMessageBox.warning(self, "Nessun video", "Nessun file video trovato in questa cartella.")
+            QMessageBox.warning(self, "Nessun video", "Nessun file video trovato.")
             return
-        self.folder_edit.setText(folder)
-        self.output_edit.setText(str(Path(folder) / "tracce modificate"))
+        folder = paths[0] if len(paths) == 1 and paths[0].is_dir() else files[0].parent
+        self.folder_edit.setText(str(paths[0]) if len(paths) == 1 else str(folder))
+        self.output_edit.setText(str(folder / "tracce modificate"))
         self._read_files(files)
 
     def _use_queue(self):

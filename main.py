@@ -25,6 +25,7 @@ from PySide6.QtWidgets import (
 )
 
 import applog
+import dropwidgets
 import utils
 import merger
 from merger import MergeSettings, MergeResult
@@ -32,10 +33,11 @@ from tab_dividi import DividiTab
 from tab_sostituisci import SostituisciTab
 from tab_tracce import TracceTab
 from fine_coda import CountdownDialog
+from dropwidgets import PathDropEdit
 
 APP_TITLE = "ClipMerger"
 AT_END_SECONDS = 10  # countdown before closing the program when the queue is done
-APP_VERSION = "0.6.3"
+APP_VERSION = "0.6.4"
 GITHUB_LATEST_RELEASE_API = "https://api.github.com/repos/Vipp0/ClipMerger/releases/latest"
 GITHUB_RELEASES_PAGE = "https://github.com/Vipp0/ClipMerger/releases/latest"
 
@@ -142,60 +144,6 @@ QToolButton#themeToggle {{
 QToolButton#themeToggle:hover {{ background-color: {c['disabled_bg']}; }}
 QToolButton#themeToggle:pressed {{ background-color: {c['input_border']}; }}
 """
-
-
-class DropLineEdit(QLineEdit):
-    """Single-file drop target (sigla iniziale/finale)."""
-
-    file_dropped = Signal(str)
-
-    def __init__(self, placeholder: str):
-        super().__init__()
-        self.setReadOnly(True)
-        self.setPlaceholderText(placeholder)
-        self.setAcceptDrops(True)
-
-    def dragEnterEvent(self, event: QDragEnterEvent):
-        if event.mimeData().hasUrls():
-            event.acceptProposedAction()
-
-    def dragMoveEvent(self, event):
-        if event.mimeData().hasUrls():
-            event.acceptProposedAction()
-
-    def dropEvent(self, event: QDropEvent):
-        urls = event.mimeData().urls()
-        if urls:
-            path = Path(urls[0].toLocalFile())
-            if path.is_file():
-                self.file_dropped.emit(str(path))
-
-
-class DropFolderLineEdit(QLineEdit):
-    """Folder drop target (cartella puntate)."""
-
-    folder_dropped = Signal(str)
-
-    def __init__(self, placeholder: str):
-        super().__init__()
-        self.setReadOnly(True)
-        self.setPlaceholderText(placeholder)
-        self.setAcceptDrops(True)
-
-    def dragEnterEvent(self, event: QDragEnterEvent):
-        if event.mimeData().hasUrls():
-            event.acceptProposedAction()
-
-    def dragMoveEvent(self, event):
-        if event.mimeData().hasUrls():
-            event.acceptProposedAction()
-
-    def dropEvent(self, event: QDropEvent):
-        urls = event.mimeData().urls()
-        if urls:
-            path = Path(urls[0].toLocalFile())
-            if path.is_dir():
-                self.folder_dropped.emit(str(path))
 
 
 class DropTableWidget(QTableWidget):
@@ -520,7 +468,7 @@ class MainWindow(QMainWindow):
         top_grid.setSpacing(8)
 
         top_grid.addWidget(QLabel("Cartella puntate:"), 0, 0)
-        self.folder_edit = DropFolderLineEdit("Trascina qui la cartella, oppure sfoglia...")
+        self.folder_edit = PathDropEdit("Trascina qui la cartella o i file, oppure sfoglia...", read_only=True)
         top_grid.addWidget(self.folder_edit, 0, 1)
         browse_folder_btn = QPushButton("Sfoglia...")
         browse_folder_btn.setObjectName("secondary")
@@ -528,7 +476,7 @@ class MainWindow(QMainWindow):
         top_grid.addWidget(browse_folder_btn, 0, 2)
 
         top_grid.addWidget(QLabel("Sigla iniziale:"), 1, 0)
-        self.intro_edit = DropLineEdit("Trascina qui il file, oppure sfoglia...")
+        self.intro_edit = PathDropEdit("Trascina qui il file, oppure sfoglia...", read_only=True)
         top_grid.addWidget(self.intro_edit, 1, 1)
         browse_intro_btn = QPushButton("Sfoglia...")
         browse_intro_btn.setObjectName("secondary")
@@ -536,7 +484,7 @@ class MainWindow(QMainWindow):
         top_grid.addWidget(browse_intro_btn, 1, 2)
 
         top_grid.addWidget(QLabel("Sigla finale:"), 2, 0)
-        self.outro_edit = DropLineEdit("Trascina qui il file, oppure sfoglia...")
+        self.outro_edit = PathDropEdit("Trascina qui il file, oppure sfoglia...", read_only=True)
         top_grid.addWidget(self.outro_edit, 2, 1)
         browse_outro_btn = QPushButton("Sfoglia...")
         browse_outro_btn.setObjectName("secondary")
@@ -544,8 +492,7 @@ class MainWindow(QMainWindow):
         top_grid.addWidget(browse_outro_btn, 2, 2)
 
         top_grid.addWidget(QLabel("Cartella output:"), 3, 0)
-        self.output_edit = QLineEdit()
-        self.output_edit.setPlaceholderText("<cartella puntate>/output")
+        self.output_edit = PathDropEdit("<cartella puntate>/output")
         top_grid.addWidget(self.output_edit, 3, 1)
         browse_output_btn = QPushButton("Sfoglia...")
         browse_output_btn.setObjectName("secondary")
@@ -756,10 +703,11 @@ class MainWindow(QMainWindow):
         self.theme_toggle_btn.clicked.connect(self._cycle_theme)
         QGuiApplication.styleHints().colorSchemeChanged.connect(self._on_system_theme_changed)
         self.table.folder_dropped.connect(self._load_folder)
-        self.folder_edit.folder_dropped.connect(self._load_folder)
+        self.folder_edit.paths_dropped.connect(self._on_paths_dropped)
         self.table.files_dropped.connect(self._load_files)
-        self.intro_edit.file_dropped.connect(self.intro_edit.setText)
-        self.outro_edit.file_dropped.connect(self.outro_edit.setText)
+        self.intro_edit.paths_dropped.connect(lambda paths: self._on_sigla_dropped(self.intro_edit, paths))
+        self.outro_edit.paths_dropped.connect(lambda paths: self._on_sigla_dropped(self.outro_edit, paths))
+        self.output_edit.paths_dropped.connect(self._on_output_dropped)
         self.codec_combo.currentIndexChanged.connect(self._update_gpu_checkbox)
         self.codec_combo.currentIndexChanged.connect(self._update_tune_checkbox)
         self.codec_combo.currentIndexChanged.connect(self._update_two_pass_checkbox)
@@ -1000,6 +948,35 @@ class MainWindow(QMainWindow):
             return True
         return False
 
+    def _on_paths_dropped(self, paths: list):
+        """The episodes field: a folder, or one or more video files."""
+        if self._queue_locked():
+            return
+        if len(paths) == 1 and paths[0].is_dir():
+            self._load_folder(str(paths[0]))
+            return
+        files = dropwidgets.video_files(paths)
+        if not files:
+            QMessageBox.warning(self, "Nessun video", "Nessun file video trovato.")
+            return
+        self.folder_edit.setText(str(files[0].parent))
+        self._load_files(files)
+        if not self.output_edit.text():
+            self.output_edit.setText(str(files[0].parent / "output"))
+
+    def _on_sigla_dropped(self, edit: QLineEdit, paths: list):
+        """A sigla field: a file as it is, or the only video inside a dropped folder."""
+        found = dropwidgets.single_file(paths)
+        if found is None:
+            QMessageBox.information(self, "Quale file?", "Trascina direttamente il file giusto: nella cartella ce ne sono più di uno (o nessuno).")
+            return
+        edit.setText(str(found))
+
+    def _on_output_dropped(self, paths: list):
+        folder = dropwidgets.as_folder(paths)
+        if folder is not None:
+            self.output_edit.setText(str(folder))
+
     def _load_folder(self, folder: str):
         if self._queue_locked():
             return
@@ -1057,7 +1034,7 @@ class MainWindow(QMainWindow):
         self.table.setCellWidget(row, COL_PROGRESS, bar)
         self.rows.append({"path": path, "output": None, "last_status": "In coda"})
 
-    def _browse_file(self, target: DropLineEdit):
+    def _browse_file(self, target: QLineEdit):
         path, _ = QFileDialog.getOpenFileName(self, "Seleziona video", "", "Video (*.*)")
         if path:
             target.setText(path)

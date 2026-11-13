@@ -16,9 +16,11 @@ from PySide6.QtWidgets import (
 )
 
 import applog
+import dropwidgets
 import merger
 import sostituisci
 import utils
+from dropwidgets import PathDropEdit, PathDropTable
 from sostituisci import EpisodeAnalysis
 
 PRESETS = [("Veloce", "fast"), ("Bilanciato", "medium"), ("Qualità", "slow")]
@@ -53,24 +55,6 @@ def parse_time(text: str) -> float | None:
 def is_sigla_file(path: Path) -> bool:
     name = path.name.lower()
     return "sigla" in name and ("iniziale" in name or "finale" in name)
-
-
-class FolderDropEdit(QLineEdit):
-    folder_dropped = Signal(str)
-
-    def __init__(self, placeholder: str):
-        super().__init__()
-        self.setPlaceholderText(placeholder)
-        self.setAcceptDrops(True)
-
-    def dragEnterEvent(self, event: QDragEnterEvent):
-        if event.mimeData().hasUrls():
-            event.acceptProposedAction()
-
-    def dropEvent(self, event: QDropEvent):
-        paths = [Path(u.toLocalFile()) for u in event.mimeData().urls()]
-        if len(paths) == 1 and paths[0].is_dir():
-            self.folder_dropped.emit(str(paths[0]))
 
 
 class AnalyzeWorker(QThread):
@@ -158,8 +142,8 @@ class SigleGroup(QGroupBox):
         grid.setSpacing(8)
 
         grid.addWidget(QLabel("Nuova sigla:"), 0, 0)
-        self.new_edit = QLineEdit()
-        self.new_edit.setPlaceholderText("Il file con la sigla da mettere...")
+        self.new_edit = PathDropEdit("Il file con la sigla da mettere (anche trascinato)...")
+        self.new_edit.paths_dropped.connect(lambda paths: self._dropped(self.new_edit, paths, False))
         grid.addWidget(self.new_edit, 0, 1, 1, 2)
         browse_new = QPushButton("Sfoglia...")
         browse_new.setObjectName("secondary")
@@ -171,8 +155,8 @@ class SigleGroup(QGroupBox):
         self.how_combo.addItem("Impara dagli episodi", "impara")
         self.how_combo.addItem("Da un file di esempio", "file")
         grid.addWidget(self.how_combo, 1, 1)
-        self.old_edit = QLineEdit()
-        self.old_edit.setPlaceholderText("Un file con la vecchia sigla (video o audio)...")
+        self.old_edit = PathDropEdit("Un file con la vecchia sigla (video o audio, anche trascinato)...")
+        self.old_edit.paths_dropped.connect(lambda paths: self._dropped(self.old_edit, paths, True))
         self.old_edit.setEnabled(False)
         grid.addWidget(self.old_edit, 1, 2)
         self.browse_old = QPushButton("Sfoglia...")
@@ -187,6 +171,14 @@ class SigleGroup(QGroupBox):
         from_file = self.how_combo.currentData() == "file"
         self.old_edit.setEnabled(from_file)
         self.browse_old.setEnabled(from_file)
+
+    def _dropped(self, target: QLineEdit, paths: list, audio_too: bool):
+        """A file dropped as it is; from a dropped folder, the only video (audio) file inside."""
+        found = dropwidgets.single_file(paths, audio_too=audio_too)
+        if found is None:
+            QMessageBox.information(self, "Quale file?", "Trascina direttamente il file giusto: nella cartella ce ne sono più di uno (o nessuno).")
+            return
+        target.setText(str(found))
 
     def _browse(self, target: QLineEdit):
         path, _ = QFileDialog.getOpenFileName(self, "Seleziona il file", "", "Video e audio (*.*)")
@@ -241,16 +233,16 @@ class SostituisciTab(QWidget):
         top = QGridLayout()
         top.setSpacing(8)
         top.addWidget(QLabel("Cartella episodi:"), 0, 0)
-        self.folder_edit = FolderDropEdit("Trascina qui la cartella, oppure sfoglia...")
-        self.folder_edit.folder_dropped.connect(self._load_folder)
+        self.folder_edit = PathDropEdit("Trascina qui la cartella o i file, oppure sfoglia...")
+        self.folder_edit.paths_dropped.connect(self._on_paths_dropped)
         top.addWidget(self.folder_edit, 0, 1)
         browse = QPushButton("Sfoglia...")
         browse.setObjectName("secondary")
         browse.clicked.connect(self._browse_folder)
         top.addWidget(browse, 0, 2)
         top.addWidget(QLabel("Cartella output:"), 1, 0)
-        self.output_edit = QLineEdit()
-        self.output_edit.setPlaceholderText("<cartella episodi>/sigle sostituite")
+        self.output_edit = PathDropEdit("<cartella episodi>/sigle sostituite")
+        self.output_edit.paths_dropped.connect(self._on_output_dropped)
         top.addWidget(self.output_edit, 1, 1)
         browse_out = QPushButton("Sfoglia...")
         browse_out.setObjectName("secondary")
@@ -322,7 +314,8 @@ class SostituisciTab(QWidget):
         buttons.addWidget(self.start_btn)
         root.addLayout(buttons)
 
-        self.table = QTableWidget(0, 9)
+        self.table = PathDropTable(0, 9)
+        self.table.paths_dropped.connect(self._on_paths_dropped)
         self.table.setHorizontalHeaderLabels(
             ["", "Episodio", "Sigla iniziale", "Sigla finale", "Tiene da", "Tiene fino a", "Affidab.", "Stato",
              "Avanzamento"])
@@ -412,10 +405,24 @@ class SostituisciTab(QWidget):
         if folder:
             self.output_edit.setText(folder)
 
+    def _on_paths_dropped(self, paths: list):
+        if self.is_busy():
+            return
+        files = dropwidgets.video_files(paths)
+        folder = paths[0] if len(paths) == 1 and paths[0].is_dir() else (files[0].parent if files else paths[0])
+        self._load_video_files(files, str(folder))
+
+    def _on_output_dropped(self, paths: list):
+        folder = dropwidgets.as_folder(paths)
+        if folder is not None and not self.is_busy():
+            self.output_edit.setText(str(folder))
+
     def _load_folder(self, folder: str):
         if self.is_busy():
             return
-        files = utils.list_video_files(Path(folder))
+        self._load_video_files(utils.list_video_files(Path(folder)), folder)
+
+    def _load_video_files(self, files: list[Path], folder: str):
         sigle = [f for f in files if is_sigla_file(f)]
         episodes = [f for f in files if not is_sigla_file(f)]
         if not episodes:
