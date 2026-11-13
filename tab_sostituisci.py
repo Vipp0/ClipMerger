@@ -62,18 +62,19 @@ class AnalyzeWorker(QThread):
     done = Signal(list)
     failed = Signal(str)
 
-    def __init__(self, ffmpeg: str, ffprobe: str, episodes: list[Path], intro_cfg, outro_cfg, keep_card: bool = True):
+    def __init__(self, ffmpeg: str, ffprobe: str, episodes: list[Path], intro_cfg, outro_cfg, keep_card: bool = True,
+                 profile: sostituisci.Profile = sostituisci.PROFILES["standard"]):
         super().__init__()
         self.ffmpeg, self.ffprobe = ffmpeg, ffprobe
         self.episodes, self.intro_cfg, self.outro_cfg = episodes, intro_cfg, outro_cfg
-        self.keep_card = keep_card
+        self.keep_card, self.profile = keep_card, profile
 
     def run(self):
         try:
             result = sostituisci.analizza(
                 self.episodes, self.intro_cfg, self.outro_cfg, self.ffmpeg, self.ffprobe,
                 progress=lambda f, text: self.progress.emit(f, text),
-                cancelled=self.isInterruptionRequested, keep_card=self.keep_card,
+                cancelled=self.isInterruptionRequested, keep_card=self.keep_card, profile=self.profile,
             )
         except sostituisci.Annullato:
             return
@@ -248,6 +249,15 @@ class SostituisciTab(QWidget):
         browse_out.setObjectName("secondary")
         browse_out.clicked.connect(self._browse_output)
         top.addWidget(browse_out, 1, 2)
+        top.addWidget(QLabel("Profilo:"), 2, 0)
+        self.profile_combo = QComboBox()
+        for key, profile in sostituisci.PROFILES.items():
+            self.profile_combo.addItem(profile.name, key)
+        self.profile_combo.currentIndexChanged.connect(self._profile_changed)
+        top.addWidget(self.profile_combo, 2, 1)
+        self.profile_label = QLabel(sostituisci.PROFILES["standard"].description)
+        self.profile_label.setWordWrap(True)
+        top.addWidget(self.profile_label, 3, 1, 1, 2)
         top_box = QGroupBox("Episodi")
         top_box.setLayout(top)
         root.addWidget(top_box)
@@ -347,6 +357,19 @@ class SostituisciTab(QWidget):
         self._refresh_buttons()
 
     # ------------------------------------------------------------------ helpers
+    def _profile(self) -> sostituisci.Profile:
+        return sostituisci.PROFILES[self.profile_combo.currentData()]
+
+    def _profile_changed(self):
+        self.profile_label.setText(self._profile().description)
+        self.analyses = []
+        for row in range(self.table.rowCount()):
+            self.table.item(row, COL_STATUS).setText("Da analizzare")
+            for col in (COL_INTRO, COL_OUTRO, COL_CUT_IN, COL_CUT_OUT, COL_CONF):
+                self.table.item(row, col).setText("")
+            self.table.item(row, COL_CHECK).setCheckState(Qt.Unchecked)
+        self._refresh_buttons()
+
     def _tools(self) -> tuple[str, str] | None:
         status = self.win.ffmpeg_status
         if not status.ffmpeg_path or not status.ffprobe_path:
@@ -375,7 +398,7 @@ class SostituisciTab(QWidget):
         self.start_btn.setEnabled(self.state == "processing" or (idle and any(a.ready for a in self.analyses)))
         self.preview_btn.setEnabled(idle and any(a.ready for a in self.analyses))
         for w in (self.folder_edit, self.output_edit, self.quality_combo, self.preset_combo, self.parallel_spin,
-                  self.audio_combo, self.card_check):
+                  self.audio_combo, self.card_check, self.profile_combo):
             w.setEnabled(idle)
         self.table.setEditTriggers(
             (QAbstractItemView.DoubleClicked | QAbstractItemView.EditKeyPressed) if idle
@@ -495,7 +518,7 @@ class SostituisciTab(QWidget):
                 self.table.item(row, col).setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable)
         self.progress.setValue(0)
         self.analyze_worker = AnalyzeWorker(tools[0], tools[1], list(self.episodes), intro_cfg, outro_cfg,
-                                            self.card_check.isChecked())
+                                            self.card_check.isChecked(), self._profile())
         self.analyze_worker.progress.connect(self._on_analysis_progress)
         self.analyze_worker.done.connect(self._on_analysis_done)
         self.analyze_worker.failed.connect(self._on_analysis_failed)
@@ -612,6 +635,10 @@ class SostituisciTab(QWidget):
             lines.append(f"Sigla iniziale: {ana.intro}")
         if ana.outro is not None and ana.want_outro:
             lines.append(f"Sigla finale: {ana.outro}")
+        if ana.plan is not None and ana.plan.card is not None:
+            lines.append(
+                f"Scheda del titolo dentro la vecchia sigla: da {fmt_time(ana.plan.card[0])} a {fmt_time(ana.plan.card[1])}, "
+                "si mette dopo la nuova sigla iniziale, senza audio.")
         if ana.plan is not None:
             lines.append(
                 f"Si tiene l'episodio da {fmt_time(ana.plan.keep_start)} a {fmt_time(ana.plan.keep_end)} "

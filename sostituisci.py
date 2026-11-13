@@ -14,6 +14,8 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 
+import numpy as np
+
 import merger
 import trova_sigla
 import utils
@@ -25,6 +27,28 @@ _SCENE_RE = re.compile(r"pts_time:([\d.]+)\s*\n.*?lavfi\.scene_score=([\d.]+)")
 
 class SostituisciError(Exception):
     pass
+
+
+@dataclass(frozen=True)
+class Profile:
+    """How the old sigle of a series are built, when that is not the usual "opening, then the episode"."""
+    key: str
+    name: str
+    description: str
+    title_card_in_intro: bool = False  # the episode's title card is shown INSIDE the old opening: it is kept, silent, after the new one
+    end_lookback: float = 0.0  # the old closing's music starts later than its picture: look this many seconds back for the picture's cut
+    edge_after: float = 0.3  # the black that ends the old opening may begin this long after the music has ended
+
+
+PROFILES = {
+    "standard": Profile("standard", "Standard", "Una sigla iniziale e/o finale da sostituire; il resto dell'episodio resta com'è."),
+    "alice": Profile(
+        "alice", "Alice nel paese delle meraviglie",
+        "Il titolo inglese dell'episodio compare dentro la vecchia sigla iniziale (scheda rossa di 5 secondi): viene "
+        "tenuto, senza musica, subito dopo la nuova sigla. L'inizio dei vecchi titoli di coda si cerca nell'immagine, "
+        "perché la loro musica parte alcuni secondi dopo.",
+        title_card_in_intro=True, end_lookback=12.0, edge_after=0.8),
+}
 
 
 @dataclass
@@ -39,6 +63,7 @@ class CutPlan:
     # "audio" (only the sound's boundary: least precise), "manuale", or "" when that sigla is left alone
     start_kind: str = ""
     end_kind: str = ""
+    card: tuple[float, float] | None = None  # the title card shown inside the old opening (episode time), when it is kept
 
 
 def black_intervals(ffmpeg: str, path: Path, start: float, duration: float) -> list[tuple[float, float]]:
@@ -66,6 +91,65 @@ def scene_cut_near(ffmpeg: str, path: Path, t: float, radius: float = 1.0, thres
     return max(cuts, key=lambda c: c[1])[0] if cuts else None
 
 
+def scene_cuts(ffmpeg: str, path: Path, start: float, length: float, threshold: float) -> list[tuple[float, float]]:
+    """Every hard cut of the picture in [start, start + length]: (time, strength 0..1)."""
+    start = max(start, 0.0)
+    proc = subprocess.run(
+        [ffmpeg, "-hide_banner", "-ss", f"{start:.3f}", "-t", f"{length:.3f}", "-i", str(path), "-an", "-sn",
+         "-vf", f"select='gt(scene,{threshold})',metadata=print", "-f", "null", "-"],
+        capture_output=True, text=True, encoding="utf-8", errors="replace", creationflags=CREATE_NO_WINDOW,
+    )
+    return [(float(a) + start, float(b)) for a, b in _SCENE_RE.findall(proc.stderr)]
+
+
+def find_title_card(ffmpeg: str, episode: Path, intro: trova_sigla.Detection) -> tuple[float, float] | None:
+    """The episode's title card inside the old opening: a card on a salmon-red background (the same frame in every
+    episode, only the lettering changes) that stays on screen a few seconds. Returns its first and last picture time,
+    put on the hard cuts that bracket it."""
+    start = max(intro.start, 0.0)
+    length = min(max(intro.end - start, 10.0), 120.0)
+    raw = subprocess.run(
+        [ffmpeg, "-v", "error", "-nostdin", "-ss", f"{start:.3f}", "-t", f"{length:.3f}", "-i", str(episode), "-an", "-sn",
+         "-vf", "fps=25,scale=64:48,format=rgb24", "-f", "rawvideo", "-"],
+        capture_output=True, creationflags=CREATE_NO_WINDOW).stdout
+    n = len(raw) // (64 * 48 * 3)
+    if n < 50:
+        return None
+    fr = np.frombuffer(raw[: n * 64 * 48 * 3], dtype=np.uint8).reshape(n, 64 * 48, 3).astype(int)
+    r, g, b = fr[:, :, 0], fr[:, :, 1], fr[:, :, 2]
+    red = ((r > 150) & (g < 110) & (b < 110) & (r - g > 70)).mean(axis=1) > 0.45
+    best, i = None, 0
+    while i < n:
+        if red[i]:
+            j = i
+            while j + 1 < n and red[j + 1]:
+                j += 1
+            if (j + 1 - i) >= 50 and (best is None or (j - i) > (best[1] - best[0])):  # at least 2 s: a real card
+                best = (i, j)
+            i = j + 1
+        else:
+            i += 1
+    if best is None:
+        return None
+    first, last = start + best[0] / 25, start + (best[1] + 1) / 25
+    a = scene_cut_near(ffmpeg, episode, first, 0.3) or first
+    z = scene_cut_near(ffmpeg, episode, last, 0.3) or last
+    return (round(a, 3), round(z, 3)) if z - a >= 2.0 else None
+
+
+def closing_cut_before(ffmpeg: str, episode: Path, t: float, max_back: float) -> float | None:
+    """Some old closings show their credits several seconds before their music begins. The picture then changes with
+    one strong hard cut into the credits, followed by a stretch without other cuts that lasts until the music starts.
+    Returns that cut (time), looking back at most `max_back` seconds from `t`, else None."""
+    cuts = scene_cuts(ffmpeg, episode, t - max_back, max_back + 0.5, 0.25)
+    for time_c, strength in sorted(cuts):
+        if strength < 0.7 or time_c > t - 0.5:
+            continue
+        if not [c for c in cuts if time_c + 0.5 < c[0] < t - 0.3]:
+            return time_c
+    return None
+
+
 def _inset(start: float, end: float, cap: float) -> float:
     """A cut a little way into a black stretch (never past its middle): the first frames of a
     "black" are often still the faint tail of a fade-out, and must not end up in the output."""
@@ -75,7 +159,7 @@ def _inset(start: float, end: float, cap: float) -> float:
 def plan_cuts(
     ffmpeg: str, episode: Path, duration: float,
     intro: trova_sigla.Detection | None, outro: trova_sigla.Detection | None,
-    keep_card: bool = True,
+    keep_card: bool = True, profile: Profile = PROFILES["standard"],
 ) -> CutPlan:
     """Turns the audio detections into picture cut points, snapping to the black frames the sigle
     are bracketed with. After the opening there is often a title card (episode name) that is
@@ -94,7 +178,7 @@ def plan_cuts(
                 card = (first, second)  # keeps the last such pair
         # a black that starts shortly before the music ends is the one bracketing the sigla
         # (a black deep inside the sigla is just part of its animation)
-        edge = [b for b in blacks if intro.end - 3.0 <= b[0] <= intro.end + 0.3]
+        edge = [b for b in blacks if intro.end - 3.0 <= b[0] <= intro.end + profile.edge_after]
         if card is not None:
             first, second = card
             keep_start = _inset(*first, 0.1) if keep_card else _inset(*second, 0.3)
@@ -124,9 +208,15 @@ def plan_cuts(
             if cut is not None:
                 keep_end = cut
                 end_kind = "stacco"
+            elif profile.end_lookback > 0:
+                cut = closing_cut_before(ffmpeg, episode, outro.start, profile.end_lookback)
+                if cut is not None:
+                    keep_end = cut
+                    end_kind = "immagine"
     if keep_end <= keep_start + 60:
         raise SostituisciError("I punti di taglio trovati non sono coerenti: controlla le sigle rilevate.")
-    return CutPlan(keep_start, keep_end, mute_head, intro, outro, start_kind, end_kind)
+    card = find_title_card(ffmpeg, episode, intro) if (intro is not None and profile.title_card_in_intro) else None
+    return CutPlan(keep_start, keep_end, mute_head, intro, outro, start_kind, end_kind, card)
 
 
 def replace_sigle(
@@ -139,15 +229,26 @@ def replace_sigle(
     segments: list[tuple[Path, merger.ProbeResult]] = []
     if new_intro is not None:
         segments.append((new_intro, merger.probe(ffprobe, new_intro)))
+    # the title card that was inside the old opening goes right after the new one (picture only, no sound)
+    card_idx = None
+    if new_intro is not None and plan.card is not None:
+        card_idx = len(segments)
+        segments.append((episode, ep))
     episode_idx = len(segments)
     segments.append((episode, ep))
     if new_outro is not None:
         segments.append((new_outro, merger.probe(ffprobe, new_outro)))
 
     trims = {episode_idx: (plan.keep_start, plan.keep_end)}
-    mutes = {episode_idx: plan.mute_head} if plan.mute_head > 0 else None
-    cmd = merger.build_command(ffmpeg, segments, episode_idx, output, settings, trims=trims, mutes=mutes)
-    expected = sum(p.duration for i, (_, p) in enumerate(segments) if i != episode_idx) + (plan.keep_end - plan.keep_start)
+    mutes = {episode_idx: plan.mute_head} if plan.mute_head > 0 else {}
+    card_len = 0.0
+    if card_idx is not None:
+        trims[card_idx] = plan.card
+        card_len = plan.card[1] - plan.card[0]
+        mutes[card_idx] = card_len + 1.0
+    cmd = merger.build_command(ffmpeg, segments, episode_idx, output, settings, trims=trims, mutes=mutes or None)
+    expected = (sum(p.duration for i, (_, p) in enumerate(segments) if i not in (episode_idx, card_idx))
+                + card_len + (plan.keep_end - plan.keep_start))
     tmp = output.with_name(f".{output.stem}.part{output.suffix}")
     cmd[-1] = str(tmp)  # last argument is the output path
     try:
@@ -183,6 +284,7 @@ class EpisodeAnalysis:
     outro: trova_sigla.Detection | None = None
     plan: CutPlan | None = None
     error: str | None = None
+    profile: Profile = PROFILES["standard"]
 
     def _sides(self) -> list[trova_sigla.Detection | None]:
         return ([self.intro] if self.want_intro else []) + ([self.outro] if self.want_outro else [])
@@ -214,6 +316,8 @@ class EpisodeAnalysis:
             return ""
         if (self.want_intro and self.plan.start_kind == "audio") or (self.want_outro and self.plan.end_kind == "audio"):
             return "taglio deciso solo dall'audio: controlla l'anteprima"
+        if self.want_intro and self.profile.title_card_in_intro and self.plan.card is None:
+            return "scheda del titolo non trovata dentro la vecchia sigla"
         return ""
 
     @property
@@ -223,7 +327,7 @@ class EpisodeAnalysis:
 
 def analizza(
     episodes: list[Path], intro_cfg, outro_cfg, ffmpeg: str, ffprobe: str, progress=None, cancelled=None,
-    keep_card: bool = True,
+    keep_card: bool = True, profile: Profile = PROFILES["standard"],
 ) -> list[EpisodeAnalysis]:
     """Finds the old sigle in every episode and decides the cut points. `intro_cfg`/`outro_cfg`:
     None (leave that sigla alone), "impara" (learn it from the episodes) or the Path of a sample
@@ -232,7 +336,7 @@ def analizza(
         if cancelled is not None and cancelled():
             raise Annullato()
 
-    results = {ep: EpisodeAnalysis(ep, want_intro=intro_cfg is not None, want_outro=outro_cfg is not None)
+    results = {ep: EpisodeAnalysis(ep, want_intro=intro_cfg is not None, want_outro=outro_cfg is not None, profile=profile)
                for ep in episodes}
     stages = [(name, zone, cfg) for name, zone, cfg in
               (("iniziale", "apertura", intro_cfg), ("finale", "chiusura", outro_cfg)) if cfg is not None]
@@ -273,7 +377,7 @@ def analizza(
             if res.status in ("Trovata", "Da verificare"):
                 res.plan = plan_cuts(ffmpeg, ep, res.duration,
                                      res.intro if res.want_intro else None, res.outro if res.want_outro else None,
-                                     keep_card=keep_card)
+                                     keep_card=keep_card, profile=profile)
         except (merger.MergeError, SostituisciError) as exc:
             res.error = str(exc)
     if progress:
@@ -330,13 +434,23 @@ def anteprima_giunzioni(
     if new_intro is not None:
         ni = merger.probe(ffprobe, new_intro)
         out = target_dir / f"{ana.episode.stem} - giunzione iniziale.mp4"
-        cmd = merger.build_command(
-            ffmpeg, [(new_intro, ni), (ana.episode, ep)], 1, out, settings,
-            trims={0: (max(ni.duration - 6.0, 0.0), ni.duration), 1: (plan.keep_start, plan.keep_start + 9.0)},
-            mutes={1: plan.mute_head} if plan.mute_head > 0 else None,
-        )
+        segs = [(new_intro, ni)]
+        trims = {0: (max(ni.duration - 6.0, 0.0), ni.duration)}
+        mutes: dict[int, float] = {}
+        card_len = 0.0
+        if plan.card is not None:  # the title card kept after the new opening, silent
+            segs.append((ana.episode, ep))
+            trims[1] = plan.card
+            card_len = plan.card[1] - plan.card[0]
+            mutes[1] = card_len + 1.0
+        segs.append((ana.episode, ep))
+        ep_idx = len(segs) - 1
+        trims[ep_idx] = (plan.keep_start, plan.keep_start + 9.0)
+        if plan.mute_head > 0:
+            mutes[ep_idx] = plan.mute_head
+        cmd = merger.build_command(ffmpeg, segs, ep_idx, out, settings, trims=trims, mutes=mutes or None)
         out.unlink(missing_ok=True)
-        merger.run_merge_pass(cmd, 15.0, None, None)
+        merger.run_merge_pass(cmd, 15.0 + card_len, None, None)
         clips.append(out)
     if new_outro is not None:
         no = merger.probe(ffprobe, new_outro)
