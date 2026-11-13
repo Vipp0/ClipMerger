@@ -184,17 +184,16 @@ class DividiTab(QWidget):
 
         top = QGridLayout()
         top.setSpacing(8)
-        top.addWidget(QLabel("File o cartella:"), 0, 0)
-        self.folder_edit = PathDropEdit("Trascina qui la cartella o i file da dividere, oppure sfoglia...")
+        top.addWidget(QLabel("File:"), 0, 0)
+        self.folder_edit = PathDropEdit("Nessun file: importali dalla libreria (anche trascinandoli qui)", read_only=True)
         self.folder_edit.paths_dropped.connect(self._on_paths_dropped)
         top.addWidget(self.folder_edit, 0, 1)
-        browse_folder = QPushButton("Cartella...")
+        browse_folder = QPushButton("Libreria...")
         browse_folder.setObjectName("secondary")
         browse_folder.clicked.connect(self._browse_folder)
         top.addWidget(browse_folder, 0, 2)
         browse_files = QPushButton("File...")
-        browse_files.setObjectName("secondary")
-        browse_files.clicked.connect(self._browse_files)
+        browse_files.hide()  # imports all go through the library
         top.addWidget(browse_files, 0, 3)
         top.addWidget(QLabel("Cartella output:"), 1, 0)
         self.output_edit = PathDropEdit("<cartella dei file>/puntate divise")
@@ -594,37 +593,24 @@ class DividiTab(QWidget):
 
     # ------------------------------------------------------------------ files
     def _browse_folder(self):
-        if self.is_busy():
-            return
-        folder = QFileDialog.getExistingDirectory(self, "Seleziona la cartella con i file da dividere")
-        if folder:
-            self._load_folder(folder)
-
-    def _browse_files(self):
-        if self.is_busy():
-            return
-        paths, _ = QFileDialog.getOpenFileNames(self, "Seleziona i file da dividere", "", "Video (*.mkv *.mp4 *.avi *.mov *.ts *.mpg *.mpeg)")
-        if paths:
-            self._set_files([Path(p) for p in paths], str(Path(paths[0]).parent))
+        self.win.open_library()
 
     def _browse_output(self):
         folder = QFileDialog.getExistingDirectory(self, "Seleziona la cartella di output")
         if folder:
             self.output_edit.setText(folder)
 
-    def _load_folder(self, folder: str):
-        self._on_paths_dropped([Path(folder)])
-
     def _on_paths_dropped(self, paths: list):
-        """A folder, or one or more files (dropped or chosen)."""
+        """Dropped here, the videos go into the library, which every tool follows."""
+        if not self.is_busy():
+            self.win.library_import(paths)
+
+    def use_library_files(self, files: list[Path]):
+        """The tool's files become the library's selected videos."""
         if self.is_busy():
             return
-        files = dropwidgets.video_files(paths)
-        if not files:
-            QMessageBox.warning(self, "Nessun video", "Nessun video trovato.")
-            return
-        folder = paths[0] if len(paths) == 1 and paths[0].is_dir() else files[0].parent
-        self._set_files(files, str(folder))
+        self._set_files(files, str(files[0].parent))
+        self.folder_edit.setText(f"{len(files)} file dalla libreria")
 
     def _on_output_dropped(self, paths: list):
         folder = dropwidgets.as_folder(paths)

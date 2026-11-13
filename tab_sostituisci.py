@@ -244,11 +244,11 @@ class SostituisciTab(QWidget):
 
         top = QGridLayout()
         top.setSpacing(8)
-        top.addWidget(QLabel("Cartella episodi:"), 0, 0)
-        self.folder_edit = PathDropEdit("Trascina qui la cartella o i file, oppure sfoglia...")
+        top.addWidget(QLabel("Episodi:"), 0, 0)
+        self.folder_edit = PathDropEdit("Nessun file: importali dalla libreria (anche trascinandoli qui)", read_only=True)
         self.folder_edit.paths_dropped.connect(self._on_paths_dropped)
         top.addWidget(self.folder_edit, 0, 1)
-        browse = QPushButton("Sfoglia...")
+        browse = QPushButton("Libreria...")
         browse.setObjectName("secondary")
         browse.clicked.connect(self._browse_folder)
         top.addWidget(browse, 0, 2)
@@ -441,11 +441,7 @@ class SostituisciTab(QWidget):
 
     # ------------------------------------------------------------------ folder
     def _browse_folder(self):
-        if self.is_busy():
-            return
-        folder = QFileDialog.getExistingDirectory(self, "Seleziona la cartella con gli episodi")
-        if folder:
-            self._load_folder(folder)
+        self.win.open_library()
 
     def _browse_output(self):
         folder = QFileDialog.getExistingDirectory(self, "Seleziona la cartella di output")
@@ -453,21 +449,21 @@ class SostituisciTab(QWidget):
             self.output_edit.setText(folder)
 
     def _on_paths_dropped(self, paths: list):
+        """Dropped here, the videos go into the library, which every tool follows."""
+        if not self.is_busy():
+            self.win.library_import(paths)
+
+    def use_library_files(self, files: list[Path]):
+        """The tool's episodes become the library's selected videos."""
         if self.is_busy():
             return
-        files = dropwidgets.video_files(paths)
-        folder = paths[0] if len(paths) == 1 and paths[0].is_dir() else (files[0].parent if files else paths[0])
-        self._load_video_files(files, str(folder))
+        self._load_video_files(files, str(files[0].parent))
+        self.folder_edit.setText(f"{len(files)} file dalla libreria")
 
     def _on_output_dropped(self, paths: list):
         folder = dropwidgets.as_folder(paths)
         if folder is not None and not self.is_busy():
             self.output_edit.setText(str(folder))
-
-    def _load_folder(self, folder: str):
-        if self.is_busy():
-            return
-        self._load_video_files(utils.list_video_files(Path(folder)), folder)
 
     def _load_video_files(self, files: list[Path], folder: str):
         sigle = [f for f in files if is_sigla_file(f)]
@@ -734,7 +730,7 @@ class SostituisciTab(QWidget):
         tools = self._tools()
         if news is None or tools is None:
             return
-        output_dir = Path(self.output_edit.text() or (Path(self.folder_edit.text()) / "sigle sostituite"))
+        output_dir = Path(self.output_edit.text()) if self.output_edit.text() else self.episodes[0].parent / "sigle sostituite"
         if any(p.resolve().parent == output_dir.resolve() for p in self.episodes):
             QMessageBox.warning(self, "Cartella di output", "La cartella di output coincide con quella degli episodi: sceglierne un'altra.")
             return

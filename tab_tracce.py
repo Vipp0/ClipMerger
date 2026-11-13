@@ -289,26 +289,24 @@ class TracceTab(QWidget):
         root.setSpacing(10)
 
         banner = QLabel(
-            "<b>Qui modifichi le tracce audio e i sottotitoli dei video elencati nella tabella</b> (quelli della "
-            "cartella scelta, oppure quelli già caricati nella coda di «Unisci sigle»). Non si ricodifica niente: "
-            "il risultato è un file nuovo in una cartella a parte, gli originali non vengono toccati.")
+            "<b>Qui modifichi le tracce audio e i sottotitoli dei video elencati nella tabella</b> (quelli selezionati "
+            "nella libreria). Non si ricodifica niente: il risultato è un file nuovo in una cartella a parte, "
+            "gli originali non vengono toccati.")
         banner.setWordWrap(True)
         root.addWidget(banner)
 
         top = QGridLayout()
         top.setSpacing(8)
-        top.addWidget(QLabel("Cartella video:"), 0, 0)
-        self.folder_edit = PathDropEdit("Trascina qui la cartella o i file, oppure sfoglia...")
+        top.addWidget(QLabel("Video:"), 0, 0)
+        self.folder_edit = PathDropEdit("Nessun file: importali dalla libreria (anche trascinandoli qui)", read_only=True)
         self.folder_edit.paths_dropped.connect(self._on_paths_dropped)
         top.addWidget(self.folder_edit, 0, 1)
-        browse = QPushButton("Sfoglia...")
+        browse = QPushButton("Libreria...")
         browse.setObjectName("secondary")
         browse.clicked.connect(self._browse_folder)
         top.addWidget(browse, 0, 2)
-        self.queue_btn = QPushButton("Usa i file della coda di «Unisci sigle»")
-        self.queue_btn.setObjectName("secondary")
-        self.queue_btn.clicked.connect(self._use_queue)
-        top.addWidget(self.queue_btn, 0, 3)
+        self.queue_btn = QPushButton("")  # kept only so the list of locked controls below stays valid
+        self.queue_btn.hide()
         top.addWidget(QLabel("Cartella output:"), 1, 0)
         self.output_edit = PathDropEdit("<cartella video>/tracce modificate")
         self.output_edit.paths_dropped.connect(self._on_output_dropped)
@@ -431,52 +429,30 @@ class TracceTab(QWidget):
 
     # ------------------------------------------------------------------ loading
     def _browse_folder(self):
-        if self.is_busy():
-            return
-        folder = QFileDialog.getExistingDirectory(self, "Seleziona la cartella con i video")
-        if folder:
-            self._load_folder(folder)
+        self.win.open_library()
 
     def _browse_output(self):
         folder = QFileDialog.getExistingDirectory(self, "Seleziona la cartella di output")
         if folder:
             self.output_edit.setText(folder)
 
-    def _load_folder(self, folder: str):
-        self._load_paths([Path(folder)])
-
     def _on_paths_dropped(self, paths: list):
-        self._load_paths(paths)
+        """Dropped here, the videos go into the library, which every tool follows."""
+        if not self.is_busy():
+            self.win.library_import(paths)
+
+    def use_library_files(self, files: list[Path]):
+        """The tool's videos become the library's selected videos."""
+        if self.is_busy():
+            return
+        self.folder_edit.setText(f"{len(files)} file dalla libreria")
+        self.output_edit.setText(str(files[0].parent / "tracce modificate"))
+        self._read_files(list(files))
 
     def _on_output_dropped(self, paths: list):
         folder = dropwidgets.as_folder(paths)
         if folder is not None and not self.is_busy():
             self.output_edit.setText(str(folder))
-
-    def _load_paths(self, paths: list[Path]):
-        """A folder, or one or more files (dropped or chosen)."""
-        if self.is_busy():
-            return
-        files = dropwidgets.video_files(paths)
-        if not files:
-            QMessageBox.warning(self, "Nessun video", "Nessun file video trovato.")
-            return
-        folder = paths[0] if len(paths) == 1 and paths[0].is_dir() else files[0].parent
-        self.folder_edit.setText(str(paths[0]) if len(paths) == 1 else str(folder))
-        self.output_edit.setText(str(folder / "tracce modificate"))
-        self._read_files(files)
-
-    def _use_queue(self):
-        if self.is_busy():
-            return
-        files = [item["path"] for item in getattr(self.win, "rows", [])]
-        if not files:
-            QMessageBox.information(
-                self, "Coda vuota", "Nella scheda «Unisci sigle» non c'è ancora nessun video: caricane prima una cartella.")
-            return
-        self.folder_edit.setText("(coda di «Unisci sigle»)")
-        self.output_edit.setText(str(Path(files[0]).parent / "tracce modificate"))
-        self._read_files(list(files))
 
     def _read_files(self, files: list[Path]):
         tools = self._tools()

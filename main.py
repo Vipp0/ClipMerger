@@ -21,7 +21,7 @@ from PySide6.QtWidgets import (
     QGroupBox, QLabel, QLineEdit, QPushButton, QFileDialog, QTableWidget,
     QTableWidgetItem, QProgressBar, QComboBox, QRadioButton, QButtonGroup,
     QStackedWidget, QSpinBox, QMessageBox, QCheckBox, QHeaderView, QAbstractItemView,
-    QToolButton, QMenu, QTabWidget, QDialog,
+    QToolButton, QMenu, QTabWidget, QDialog, QListWidget, QListWidgetItem,
 )
 
 import applog
@@ -36,10 +36,12 @@ from tab_tracce import TracceTab
 from fine_coda import CountdownDialog
 from dropwidgets import PathDropEdit
 from encoding_panel import EncodingPanel
+from libreria import Library
+from tab_libreria import LibraryPage
 
 APP_TITLE = "ClipMerger"
 AT_END_SECONDS = 10  # countdown before closing the program when the queue is done
-APP_VERSION = "0.9.0"
+APP_VERSION = "0.10.0"
 GITHUB_LATEST_RELEASE_API = "https://api.github.com/repos/Vipp0/ClipMerger/releases/latest"
 GITHUB_RELEASES_PAGE = "https://github.com/Vipp0/ClipMerger/releases/latest"
 
@@ -144,6 +146,16 @@ QToolButton#themeToggle {{
 }}
 QToolButton#themeToggle:hover {{ background-color: {c['disabled_bg']}; }}
 QToolButton#themeToggle:pressed {{ background-color: {c['input_border']}; }}
+QWidget#sidebar {{ background-color: {c['panel']}; border-right: 1px solid {c['border']}; }}
+QListWidget#nav {{ background: transparent; border: none; outline: none; font-size: 14px; }}
+QListWidget#nav::item {{ padding: 8px 10px; border-radius: 6px; margin: 1px 4px; }}
+QListWidget#nav::item:selected {{ background-color: {c['accent']}; color: {c['accent_text']}; }}
+QListWidget#nav::item:hover:!selected {{ background-color: {c['header_bg']}; }}
+QLabel#dropZone {{ border: 1px dashed {c['muted']}; border-radius: 8px; color: {c['muted']}; padding: 10px; background: transparent; }}
+QFrame#banner {{ background-color: {c['panel']}; border: 1px solid {c['accent']}; border-radius: 6px; }}
+QFrame#banner QWidget {{ background: transparent; }}
+QFrame#banner QPushButton {{ background-color: {c['disabled_bg']}; color: {c['text']}; }}
+QLabel#sideTitle {{ font-size: 16px; font-weight: 600; }}
 """
 
 
@@ -399,7 +411,7 @@ class MainWindow(QMainWindow):
         if saved_geometry is not None:
             self.restoreGeometry(saved_geometry)
         else:
-            self.resize(980, 640)
+            self.resize(1240, 800)
 
         self.ffmpeg_status = utils.check_ffmpeg()
         applog.log.info("ffmpeg: %s | ffprobe: %s", self.ffmpeg_status.ffmpeg_path, self.ffmpeg_status.ffprobe_path)
@@ -423,6 +435,8 @@ class MainWindow(QMainWindow):
         if self.theme_choice not in ("light", "dark", "auto"):
             self.theme_choice = "auto"
 
+        self.library = Library(lambda: self.ffmpeg_status.ffprobe_path)
+        self.lib_sig = None  # what the Unisci tool last took from the library
         self._build_ui()
         self._wire_signals()
         self._apply_theme(self._resolve_theme(self.theme_choice))
@@ -441,6 +455,8 @@ class MainWindow(QMainWindow):
             self.hw_thread.done.connect(self._on_hw_detected)
             self.hw_thread.start()
 
+        self.library.changed.connect(self._on_library_changed)
+        self.library.load()
         self.update_thread = UpdateCheckWorker()
         self.update_thread.checked.connect(self._on_update_checked)
         self.update_thread.start()
@@ -451,30 +467,14 @@ class MainWindow(QMainWindow):
         root = QVBoxLayout(central)
         root.setSpacing(10)
 
-        # Theme toggle: single minimal button, cycles auto -> light -> dark -> auto...
-        theme_row = QHBoxLayout()
-
-        self.update_label = QLabel("")
-        self.update_label.setOpenExternalLinks(True)
-        self.update_label.hide()
-        theme_row.addWidget(self.update_label)
-
-        theme_row.addStretch(1)
-
-        self.theme_toggle_btn = QToolButton()
-        self.theme_toggle_btn.setObjectName("themeToggle")
-        self._refresh_theme_toggle()
-        theme_row.addWidget(self.theme_toggle_btn)
-        root.addLayout(theme_row)
-
         # Sorgente / sigle / output
         top_grid = QGridLayout()
         top_grid.setSpacing(8)
 
-        top_grid.addWidget(QLabel("Cartella puntate:"), 0, 0)
-        self.folder_edit = PathDropEdit("Trascina qui la cartella o i file, oppure sfoglia...", read_only=True)
+        top_grid.addWidget(QLabel("Episodi:"), 0, 0)
+        self.folder_edit = PathDropEdit("Nessun file: importali dalla libreria (anche trascinandoli qui)", read_only=True)
         top_grid.addWidget(self.folder_edit, 0, 1)
-        browse_folder_btn = QPushButton("Sfoglia...")
+        browse_folder_btn = QPushButton("Libreria...")
         browse_folder_btn.setObjectName("secondary")
         browse_folder_btn.clicked.connect(self._browse_folder)
         top_grid.addWidget(browse_folder_btn, 0, 2)
@@ -536,45 +536,14 @@ class MainWindow(QMainWindow):
 
         root.addLayout(bottom)
 
-        tabs = QTabWidget()
-        tabs.addTab(central, "Unisci sigle")
-        self.sostituisci_tab = SostituisciTab(self)
-        tabs.addTab(self.sostituisci_tab, "Sostituisci sigla")
-        self.tracce_tab = TracceTab(self)
-        tabs.addTab(self.tracce_tab, "Modifica tracce")
-        self.dividi_tab = DividiTab(self)
-        tabs.addTab(self.dividi_tab, "Dividi puntate")
-        corner = QWidget()
-        corner_layout = QHBoxLayout(corner)
-        corner_layout.setContentsMargins(0, 0, 6, 0)
-        corner_layout.addWidget(QLabel("Quando la coda è finita:"))
-        self.at_end_combo = QComboBox()
-        self.at_end_combo.addItem("Non fare niente", "none")
-        self.at_end_combo.addItem("Chiudi il programma", "close")
-        self.at_end_combo.setToolTip(
-            "Vale per entrambe le schede, solo per questa sessione (all'avvio torna su «Non fare niente»). "
-            "Con «Chiudi il programma», a coda finita parte un conto alla rovescia di 10 secondi in cui si può annullare. "
-            "Non scatta se fermi tu l'elaborazione.")
-        corner_layout.addWidget(self.at_end_combo)
-        log_btn = QPushButton("Apri i log")
-        log_btn.setObjectName("secondary")
-        log_btn.setToolTip(
-            "Apre la cartella con il file di log del programma: se qualcosa va storto, "
-            "mandami il file «clipmerger.log» (e «crash.log», se c'è) che si trova lì.")
-        log_btn.clicked.connect(lambda: QDesktopServices.openUrl(QUrl.fromLocalFile(str(applog.log_dir()))))
-        corner_layout.addWidget(log_btn)
-        tabs.setCornerWidget(corner, Qt.TopRightCorner)
-        self.sostituisci_tab.queue_finished.connect(self._queue_finished)
-        self.tracce_tab.queue_finished.connect(self._queue_finished)
-        self.dividi_tab.queue_finished.connect(self._queue_finished)
-        self.setCentralWidget(tabs)
+        self._build_shell(central)
 
     def _wire_signals(self):
         self.theme_toggle_btn.clicked.connect(self._cycle_theme)
         QGuiApplication.styleHints().colorSchemeChanged.connect(self._on_system_theme_changed)
         self.table.folder_dropped.connect(self._load_folder)
         self.folder_edit.paths_dropped.connect(self._on_paths_dropped)
-        self.table.files_dropped.connect(self._load_files)
+        self.table.files_dropped.connect(self.library_import)
         self.intro_edit.paths_dropped.connect(lambda paths: self._on_sigla_dropped(self.intro_edit, paths))
         self.outro_edit.paths_dropped.connect(lambda paths: self._on_sigla_dropped(self.outro_edit, paths))
         self.output_edit.paths_dropped.connect(self._on_output_dropped)
@@ -648,6 +617,7 @@ class MainWindow(QMainWindow):
             self.pool.clear()
             self.pool.waitForDone(20000)
         self.qsettings.setValue("window_geometry", self.saveGeometry())
+        self.library.shutdown()
         for worker in [self.preflight_worker, *self.retired_workers]:
             if worker is not None and worker.isRunning():
                 worker.requestInterruption()
@@ -737,11 +707,7 @@ class MainWindow(QMainWindow):
         self.enc_panel.set_note(text)
 
     def _browse_folder(self):
-        if self._queue_locked():
-            return
-        folder = QFileDialog.getExistingDirectory(self, "Seleziona cartella puntate")
-        if folder:
-            self._load_folder(folder)
+        self.open_library()
 
     def _queue_locked(self) -> bool:
         """Replacing the queue under a running batch (or while it's being analyzed) makes
@@ -752,20 +718,8 @@ class MainWindow(QMainWindow):
         return False
 
     def _on_paths_dropped(self, paths: list):
-        """The episodes field: a folder, or one or more video files."""
-        if self._queue_locked():
-            return
-        if len(paths) == 1 and paths[0].is_dir():
-            self._load_folder(str(paths[0]))
-            return
-        files = dropwidgets.video_files(paths)
-        if not files:
-            QMessageBox.warning(self, "Nessun video", "Nessun file video trovato.")
-            return
-        self.folder_edit.setText(str(files[0].parent))
-        self._load_files(files)
-        if not self.output_edit.text():
-            self.output_edit.setText(str(files[0].parent / "output"))
+        """Something dropped on the episodes field: it goes into the library, which the tool then follows."""
+        self.library_import(paths)
 
     def _on_sigla_dropped(self, edit: QLineEdit, paths: list):
         """A sigla field: a file as it is, or the only video inside a dropped folder."""
@@ -781,16 +735,135 @@ class MainWindow(QMainWindow):
             self.output_edit.setText(str(folder))
 
     def _load_folder(self, folder: str):
+        self.library_import([Path(folder)])
+
+    def is_busy(self) -> bool:
+        return self.running or self.analyzing
+
+    def use_library_files(self, files: list[Path]):
+        """The tool's queue becomes the library's selected videos."""
         if self._queue_locked():
             return
-        self.folder_edit.setText(folder)
-        files = utils.list_video_files(Path(folder))
-        if not files:
-            QMessageBox.warning(self, "Nessun video", "Nessun file video trovato in questa cartella.")
-            return
+        self.folder_edit.setText(f"{len(files)} file dalla libreria")
         self._load_files(files)
         if not self.output_edit.text():
-            self.output_edit.setText(str(Path(folder) / "output"))
+            self.output_edit.setText(str(files[0].parent / "output"))
+
+    # ---------------------------------------------------------------- shell: sidebar, pages, library
+    def _build_shell(self, unisci_page: QWidget):
+        self.library_page = LibraryPage(self)
+        self.sostituisci_tab = SostituisciTab(self)
+        self.dividi_tab = DividiTab(self)
+        self.tracce_tab = TracceTab(self)
+        self.tool_tabs = {"unisci": self, "sostituisci": self.sostituisci_tab, "dividi": self.dividi_tab, "tracce": self.tracce_tab}
+        pages = [("lib", "Libreria", self.library_page), (None, "Strumenti", None),
+                 ("unisci", "Unisci sigle", unisci_page), ("sostituisci", "Sostituisci sigla", self.sostituisci_tab),
+                 ("dividi", "Dividi puntate", self.dividi_tab), ("tracce", "Modifica tracce", self.tracce_tab)]
+
+        self.pages = QStackedWidget()
+        self.nav = QListWidget()
+        self.nav.setObjectName("nav")
+        self.nav.setFocusPolicy(Qt.NoFocus)
+        self.row_key: dict[int, str] = {}
+        self.page_for_row: dict[int, int] = {}
+        for key, text, widget in pages:
+            item = QListWidgetItem(text)
+            self.nav.addItem(item)
+            row = self.nav.row(item)
+            if widget is None:  # a heading, not a destination
+                item.setFlags(Qt.NoItemFlags)
+                font = item.font()
+                font.setPointSizeF(font.pointSizeF() * 0.95)
+                item.setFont(font)
+                continue
+            self.pages.addWidget(widget)
+            self.row_key[row], self.page_for_row[row] = key, self.pages.indexOf(widget)
+        self.key_row = {k: r for r, k in self.row_key.items()}
+
+        side = QWidget()
+        side.setObjectName("sidebar")
+        side.setFixedWidth(210)
+        sl = QVBoxLayout(side)
+        sl.setContentsMargins(8, 12, 8, 10)
+        sl.setSpacing(8)
+        title = QLabel("ClipMerger")
+        title.setObjectName("sideTitle")
+        sl.addWidget(title)
+        sl.addWidget(self.nav, 1)
+
+        self.update_label = QLabel("")
+        self.update_label.setOpenExternalLinks(True)
+        self.update_label.setWordWrap(True)
+        self.update_label.hide()
+        sl.addWidget(self.update_label)
+        sl.addWidget(QLabel("Quando la coda è finita:"))
+        self.at_end_combo = QComboBox()
+        self.at_end_combo.addItem("Non fare niente", "none")
+        self.at_end_combo.addItem("Chiudi il programma", "close")
+        self.at_end_combo.setToolTip(
+            "Vale per tutti gli strumenti, solo per questa sessione (all'avvio torna su «Non fare niente»). "
+            "Con «Chiudi il programma», a coda finita parte un conto alla rovescia di 10 secondi in cui si può annullare. "
+            "Non scatta se fermi tu l'elaborazione.")
+        sl.addWidget(self.at_end_combo)
+        row = QHBoxLayout()
+        self.theme_toggle_btn = QToolButton()
+        self.theme_toggle_btn.setObjectName("themeToggle")
+        self._refresh_theme_toggle()
+        row.addWidget(self.theme_toggle_btn)
+        log_btn = QPushButton("Apri i log")
+        log_btn.setObjectName("secondary")
+        log_btn.setToolTip(
+            "Apre la cartella con il file di log del programma: se qualcosa va storto, "
+            "mandami il file «clipmerger.log» (e «crash.log», se c'è) che si trova lì.")
+        log_btn.clicked.connect(lambda: QDesktopServices.openUrl(QUrl.fromLocalFile(str(applog.log_dir()))))
+        row.addWidget(log_btn, 1)
+        sl.addLayout(row)
+
+        for tab in (self.sostituisci_tab, self.tracce_tab, self.dividi_tab):
+            tab.queue_finished.connect(self._queue_finished)
+        self.nav.currentRowChanged.connect(self._on_nav_row)
+        holder = QWidget()
+        hl = QHBoxLayout(holder)
+        hl.setContentsMargins(0, 0, 0, 0)
+        hl.setSpacing(0)
+        hl.addWidget(side)
+        hl.addWidget(self.pages, 1)
+        self.setCentralWidget(holder)
+        self.nav.setCurrentRow(0)
+
+    def open_library(self):
+        self.nav.setCurrentRow(self.key_row["lib"])
+
+    def open_tool(self, key: str):
+        if key in self.key_row:
+            self.nav.setCurrentRow(self.key_row[key])
+
+    def library_import(self, paths: list) -> int:
+        """The one way in for videos: a folder or files go into the library (selected), and the open tool follows."""
+        return self.library.add_paths([Path(p) for p in paths])
+
+    def _on_nav_row(self, row: int):
+        if row not in self.page_for_row:
+            return
+        self.pages.setCurrentIndex(self.page_for_row[row])
+        self._sync_tool(self.row_key[row])
+
+    def _on_library_changed(self):
+        n = len(self.library.items)
+        self.nav.item(self.key_row["lib"]).setText(f"Libreria  ({n})" if n else "Libreria")
+        self._sync_tool(self.row_key.get(self.nav.currentRow(), ""))
+
+    def _sync_tool(self, key: str):
+        """A tool shows the library's selected videos: when it is opened, or the library changes under it."""
+        tool = self.tool_tabs.get(key)
+        if tool is None or tool.is_busy():
+            return
+        files = self.library.selected_files()
+        sig = tuple(files)
+        if not files or getattr(tool, "lib_sig", None) == sig:
+            return
+        tool.lib_sig = sig
+        tool.use_library_files(files)
 
     def _load_files(self, files: list[Path]):
         if self._queue_locked():
@@ -1085,6 +1158,7 @@ class MainWindow(QMainWindow):
         self._update_start_stop_button()
 
     def _reset_all(self):
+        self.lib_sig = None
         self.folder_edit.clear()
         self.output_edit.clear()
         self.intro_edit.clear()
