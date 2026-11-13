@@ -26,6 +26,7 @@ from PySide6.QtWidgets import (
 
 import applog
 import dropwidgets
+import encoding
 import utils
 import merger
 from merger import MergeSettings, MergeResult
@@ -34,10 +35,11 @@ from tab_sostituisci import SostituisciTab
 from tab_tracce import TracceTab
 from fine_coda import CountdownDialog
 from dropwidgets import PathDropEdit
+from encoding_panel import EncodingPanel
 
 APP_TITLE = "ClipMerger"
 AT_END_SECONDS = 10  # countdown before closing the program when the queue is done
-APP_VERSION = "0.8.0"
+APP_VERSION = "0.9.0"
 GITHUB_LATEST_RELEASE_API = "https://api.github.com/repos/Vipp0/ClipMerger/releases/latest"
 GITHUB_RELEASES_PAGE = "https://github.com/Vipp0/ClipMerger/releases/latest"
 
@@ -46,7 +48,6 @@ def version_tuple(version: str) -> tuple[int, ...]:
     return tuple(int(n) for n in re.findall(r"\d+", version.split("-")[0]))
 
 
-PRESET_LABELS = [("Veloce", "fast"), ("Bilanciato", "medium"), ("Qualità", "slow")]
 CODEC_LABELS = [("H.264", "h264"), ("H.265 (HEVC)", "h265"), ("AV1", "av1")]
 
 # Theme cycle button: order, monochrome (non-emoji) glyph and tooltip per choice.
@@ -203,12 +204,12 @@ class MergeSignals(QObject):
 
 class MergeTask(QRunnable):
     def __init__(self, row: int, intro: Path | None, episode: Path, outro: Path | None, output: Path,
-                 settings: MergeSettings, ffmpeg_path: str, ffprobe_path: str,
+                 settings: MergeSettings, opts: encoding.EncodingOptions, ffmpeg_path: str, ffprobe_path: str,
                  signals: MergeSignals, cancel_event: threading.Event):
         super().__init__()
         self.row = row
         self.intro, self.episode, self.outro, self.output = intro, episode, outro, output
-        self.settings = settings
+        self.settings, self.opts = settings, opts
         self.ffmpeg_path, self.ffprobe_path = ffmpeg_path, ffprobe_path
         self.signals = signals
         self.cancel_event = cancel_event
@@ -217,12 +218,15 @@ class MergeTask(QRunnable):
     def run(self):
         self.signals.status.emit(self.row, "In elaborazione")
         try:
+            info = merger.probe(self.ffprobe_path, self.episode)
+            interlaced = encoding.resolve_interlaced(self.opts, self.ffmpeg_path, self.episode, info)
             result = merger.merge_episode(
                 self.ffmpeg_path, self.ffprobe_path,
                 self.intro, self.episode, self.outro, self.output,
                 self.settings,
                 progress_cb=lambda pct: self.signals.progress.emit(self.row, pct),
                 cancel_event=self.cancel_event,
+                episode_interlaced=interlaced,
             )
         except Exception as exc:  # defensive: never let a worker thread crash silently
             applog.log_exception(f"elaborazione di {self.episode.name}", exc)
@@ -503,143 +507,9 @@ class MainWindow(QMainWindow):
         top_box.setLayout(top_grid)
         root.addWidget(top_box)
 
-        # Encoding settings
-        enc_grid = QGridLayout()
-        enc_grid.setSpacing(8)
-
-        enc_grid.addWidget(QLabel("Codec:"), 0, 0)
-        self.codec_combo = QComboBox()
-        self.codec_combo.addItem("Come originale", "source")
-        for label, codec in CODEC_LABELS:
-            self.codec_combo.addItem(label, codec)
-        self.codec_combo.setToolTip(
-            "Come originale: ogni episodio esce nello stesso codec che ha adesso "
-            "(H.264, H.265 o AV1; se l'originale è un altro formato si usa H.265)."
-        )
-        enc_grid.addWidget(self.codec_combo, 0, 1)
-
-        self.gpu_check = QCheckBox("Usa GPU se disponibile (rilevamento in corso...)")
-        self.gpu_check.setEnabled(False)
-        enc_grid.addWidget(self.gpu_check, 0, 2, 1, 2)
-
-        enc_grid.addWidget(QLabel("Preset:"), 1, 0)
-        self.preset_combo = QComboBox()
-        for label, _ in PRESET_LABELS:
-            self.preset_combo.addItem(label)
-        self.preset_combo.setCurrentIndex(1)
-        enc_grid.addWidget(self.preset_combo, 1, 1)
-
-        enc_grid.addWidget(QLabel("Elaborazioni parallele:"), 1, 2)
-        self.parallel_spin = QSpinBox()
-        self.parallel_spin.setRange(1, 8)
-        self.parallel_spin.setValue(1)
-        self.parallel_spin.setFixedWidth(56)
-        self.parallel_spin.setAlignment(Qt.AlignCenter)
-        enc_grid.addWidget(self.parallel_spin, 1, 3, Qt.AlignLeft)
-
-        enc_grid.addWidget(QLabel("Bitrate:"), 2, 0)
-        bitrate_row = QHBoxLayout()
-        self.crf_radio = QRadioButton("Qualità (CRF)")
-        self.cbr_radio = QRadioButton("Bitrate costante")
-        self.orig_radio = QRadioButton("Come originale")
-        self.crf_radio.setChecked(True)
-        self.bitrate_group = QButtonGroup(self)
-        for i, btn in enumerate((self.crf_radio, self.cbr_radio, self.orig_radio)):
-            self.bitrate_group.addButton(btn, i)
-            bitrate_row.addWidget(btn)
-
-        self.bitrate_stack = QStackedWidget()
-        self.crf_spin = QSpinBox()
-        self.crf_spin.setRange(0, 51)
-        self.crf_spin.setValue(20)
-        self.crf_spin.setFixedWidth(56)
-        self.crf_spin.setAlignment(Qt.AlignCenter)
-        crf_wrap = QWidget()
-        crf_l = QHBoxLayout(crf_wrap)
-        crf_l.setContentsMargins(0, 0, 0, 0)
-        crf_l.addWidget(QLabel("CRF:"))
-        crf_l.addWidget(self.crf_spin)
-        self.bitrate_stack.addWidget(crf_wrap)
-
-        self.cbr_spin = QSpinBox()
-        self.cbr_spin.setRange(100, 50000)
-        self.cbr_spin.setValue(2000)
-        self.cbr_spin.setSuffix(" kbit/s")
-        self.cbr_spin.setFixedWidth(110)
-        self.cbr_spin.setAlignment(Qt.AlignCenter)
-        cbr_wrap = QWidget()
-        cbr_l = QHBoxLayout(cbr_wrap)
-        cbr_l.setContentsMargins(0, 0, 0, 0)
-        cbr_l.addWidget(QLabel("Bitrate:"))
-        cbr_l.addWidget(self.cbr_spin)
-        self.bitrate_stack.addWidget(cbr_wrap)
-
-        orig_label = QLabel("Verrà usato il bitrate video della puntata originale.")
-        orig_label.setWordWrap(True)
-        orig_wrap = QWidget()
-        orig_l = QHBoxLayout(orig_wrap)
-        orig_l.setContentsMargins(0, 0, 0, 0)
-        orig_l.addWidget(orig_label)
-        self.bitrate_stack.addWidget(orig_wrap)
-
-        bitrate_row.addSpacing(12)
-        bitrate_row.addWidget(self.bitrate_stack)
-        bitrate_row.addStretch(1)
-        enc_grid.addLayout(bitrate_row, 2, 1, 1, 3)
-
-        self.tune_check = QCheckBox("Ottimizza per cartoni animati (tune animation, solo codifica software H.264/H.265)")
-        enc_grid.addWidget(self.tune_check, 3, 0, 1, 4)
-
-        self.two_pass_check = QCheckBox(
-            "Codifica a 2 passaggi (qualità migliore a parità di dimensione, più lento — solo software, bitrate costante/originale)"
-        )
-        enc_grid.addWidget(self.two_pass_check, 4, 0, 1, 4)
-
-        enc_grid.addWidget(QLabel("Contenitore output:"), 5, 0)
-        self.container_combo = QComboBox()
-        self.container_combo.addItem("Come originale (stessa estensione dell'episodio)", "")
-        self.container_combo.addItem(".mp4", ".mp4")
-        self.container_combo.addItem(".mkv", ".mkv")
-        self.container_combo.addItem(".avi", ".avi")
-        enc_grid.addWidget(self.container_combo, 5, 1)
-
-        enc_grid.addWidget(QLabel("Audio:"), 6, 0)
-        self.audio_combo = QComboBox()
-        self.audio_combo.addItem("Come originale (stesso codec, canali e bitrate dell'episodio)", "original")
-        self.audio_combo.addItem("AAC, mantieni i canali originali (es. 5.1 resta 5.1)", "aac_keep")
-        self.audio_combo.addItem("AAC stereo 192k (compatto)", "aac_stereo")
-        self.audio_combo.addItem("FLAC senza perdita (file più grandi, canali originali)", "flac")
-        self.audio_combo.setToolTip(
-            "Se il formato originale non è ammesso dal contenitore scelto, "
-            "viene usato automaticamente l'AAC con i canali originali."
-        )
-        enc_grid.addWidget(self.audio_combo, 6, 1, 1, 3)
-
-        self.deinterlace_check = QCheckBox(
-            "Deinterlaccia i video interlacciati (vecchi DVD / registrazioni TV: senza, si vedrebbe l'effetto \"pettine\")"
-        )
-        self.deinterlace_check.setChecked(True)
-        enc_grid.addWidget(self.deinterlace_check, 7, 0, 1, 4)
-
-        self.ten_bit_check = QCheckBox(
-            "Mantieni i 10 bit se l'episodio è a 10 bit (solo H.265 / AV1 software; evita le bande nei gradienti)"
-        )
-        self.ten_bit_check.setChecked(True)
-        enc_grid.addWidget(self.ten_bit_check, 8, 0, 1, 4)
-
-        self.source_info_label = QLabel("")
-        self.source_info_label.setWordWrap(True)
-        self.source_info_label.hide()
-        enc_layout = QVBoxLayout()
-        enc_layout.addWidget(self.source_info_label)
-        enc_layout.addLayout(enc_grid)
-        enc_box = QGroupBox("Codifica")
-        enc_box.setLayout(enc_layout)
-        root.addWidget(enc_box)
-
-        self._update_tune_checkbox()
-        self._update_two_pass_checkbox()
-        self._update_ten_bit_checkbox()
+        # Encoding settings: the same panel as in every tool that re-encodes
+        self.enc_panel = EncodingPanel("unisci", self.qsettings)
+        root.addWidget(self.enc_panel)
 
         # Queue table
         self.table = DropTableWidget()
@@ -708,18 +578,7 @@ class MainWindow(QMainWindow):
         self.intro_edit.paths_dropped.connect(lambda paths: self._on_sigla_dropped(self.intro_edit, paths))
         self.outro_edit.paths_dropped.connect(lambda paths: self._on_sigla_dropped(self.outro_edit, paths))
         self.output_edit.paths_dropped.connect(self._on_output_dropped)
-        self.codec_combo.currentIndexChanged.connect(self._update_gpu_checkbox)
-        self.codec_combo.currentIndexChanged.connect(self._update_tune_checkbox)
-        self.codec_combo.currentIndexChanged.connect(self._update_two_pass_checkbox)
-        self.codec_combo.currentIndexChanged.connect(self._update_ten_bit_checkbox)
-        self.codec_combo.currentIndexChanged.connect(self._refresh_source_info)
-        self.bitrate_group.idClicked.connect(self._refresh_source_info)
-        self.cbr_spin.valueChanged.connect(self._refresh_source_info)
-        self.gpu_check.toggled.connect(self._update_tune_checkbox)
-        self.gpu_check.toggled.connect(self._update_two_pass_checkbox)
-        self.gpu_check.toggled.connect(self._update_ten_bit_checkbox)
-        self.bitrate_group.idClicked.connect(self.bitrate_stack.setCurrentIndex)
-        self.bitrate_group.idClicked.connect(self._update_two_pass_checkbox)
+        self.enc_panel.changed.connect(self._refresh_source_info)
         self.table.cellDoubleClicked.connect(self._show_row_detail)
         self.table.setContextMenuPolicy(Qt.CustomContextMenu)
         self.table.customContextMenuRequested.connect(self._show_queue_context_menu)
@@ -796,16 +655,11 @@ class MainWindow(QMainWindow):
         super().closeEvent(event)
 
     # ---------------------------------------------------------------- helpers
-    def _current_codec(self) -> str:
-        return self.codec_combo.currentData()
-
-    def _current_preset(self) -> str:
-        return PRESET_LABELS[self.preset_combo.currentIndex()][1]
-
     def _on_hw_detected(self, result: dict, reasons: dict):
         self.hw_encoders = result
         self.hw_reasons = reasons
-        self._update_gpu_checkbox()
+        for panel in (self.enc_panel, self.sostituisci_tab.enc_panel, self.dividi_tab.enc_panel):
+            panel.set_hardware(result, reasons)
 
     def _on_update_checked(self, latest_tag: str):
         if not latest_tag:
@@ -818,56 +672,6 @@ class MainWindow(QMainWindow):
                 f'<a href="{GITHUB_RELEASES_PAGE}">Nuova versione disponibile: {latest_tag}</a>'
             )
             self.update_label.show()
-
-    def _update_gpu_checkbox(self):
-        if not hasattr(self, "hw_thread"):
-            return
-        if self.hw_thread.isRunning():
-            return
-        codec = self._current_codec()
-        if codec == "source":  # every episode picks its own codec: any detected encoder can be used
-            encoder = ", ".join(e for e in self.hw_encoders.values() if e)
-            reasons = " | ".join(r for r in self.hw_reasons.values() if r)
-        else:
-            encoder = self.hw_encoders.get(codec)
-            reasons = self.hw_reasons.get(codec, "")
-        if encoder:
-            self.gpu_check.setEnabled(True)
-            self.gpu_check.setText(f"Usa GPU se disponibile (rilevato: {encoder})")
-            self.gpu_check.setToolTip("")
-        else:
-            self.gpu_check.setEnabled(False)
-            self.gpu_check.setChecked(False)
-            self.gpu_check.setText("Usa GPU se disponibile (nessun encoder hardware rilevato)")
-            self.gpu_check.setToolTip(reasons)
-        self._update_tune_checkbox()
-        self._update_two_pass_checkbox()
-        self._update_ten_bit_checkbox()
-
-    def _update_ten_bit_checkbox(self):
-        # Only disabled, never unchecked: the choice survives switching codec back and forth.
-        if not hasattr(self, "ten_bit_check"):
-            return
-        using_hw = self.gpu_check.isChecked() and self.gpu_check.isEnabled()
-        self.ten_bit_check.setEnabled(self._current_codec() in ("source", "h265", "av1") and not using_hw)
-
-    def _update_tune_checkbox(self):
-        if not hasattr(self, "tune_check"):
-            return
-        using_hw = self.gpu_check.isChecked() and self.gpu_check.isEnabled()
-        eligible = self._current_codec() in ("source", "h264", "h265") and not using_hw
-        self.tune_check.setEnabled(eligible)
-        if not eligible:
-            self.tune_check.setChecked(False)
-
-    def _update_two_pass_checkbox(self):
-        if not hasattr(self, "two_pass_check"):
-            return
-        using_hw = self.gpu_check.isChecked() and self.gpu_check.isEnabled()
-        eligible = (not using_hw) and not self.crf_radio.isChecked()
-        self.two_pass_check.setEnabled(eligible)
-        if not eligible:
-            self.two_pass_check.setChecked(False)
 
     def _scan_sources(self):
         """Re-read codec/bitrate of the queued originals in the background."""
@@ -891,47 +695,46 @@ class MainWindow(QMainWindow):
     def _codec_advice(self, infos: list[tuple[str, int | None]]) -> list[str]:
         """When the chosen codec is less efficient than the originals' and the bitrate is
         tied to theirs, the picture gets blockier: say so, with a bitrate that compensates."""
-        codec = self._current_codec()
-        if codec == "source" or self.crf_radio.isChecked():
+        opts = self.enc_panel.options()
+        if opts.codec == "source" or opts.quality not in ("cbr", "original"):
             return []
         rates: dict[str, list[int]] = {}
         for src_codec, bitrate in infos:
             if bitrate:
                 rates.setdefault(src_codec, []).append(bitrate // 1000)
-        out_name = merger.codec_display_name(codec)
+        out_name = merger.codec_display_name(opts.codec)
         advice = []
         for src_codec, values in rates.items():
             avg = sum(values) // len(values)
-            needed = merger.compensated_bitrate_kbps(src_codec, avg, codec)
+            needed = merger.compensated_bitrate_kbps(src_codec, avg, opts.codec)
             if needed is None:
                 continue
-            if self.cbr_radio.isChecked():
-                if self.cbr_spin.value() >= needed * 0.9:
+            if opts.quality == "cbr":
+                if opts.kbps >= needed * 0.9:
                     continue
-                now = f"a {format_kbps(self.cbr_spin.value())} kbit/s"
+                now = f"a {format_kbps(opts.kbps)} kbit/s"
             else:
                 now = "con lo stesso bitrate"
             advice.append(
                 f"Attenzione: gli originali sono {merger.codec_display_name(src_codec)} a ~{format_kbps(avg)} kbit/s; "
                 f"in {out_name} {now} la qualità scende (più \"quadrettoni\"). Per una qualità simile servono circa "
-                f"{format_kbps(needed)} kbit/s (Bitrate costante), oppure scegli Qualità (CRF), oppure il codec "
-                f"\"Come originale\"."
+                f"{format_kbps(needed)} kbit/s (Bitrate fisso), oppure scegli una Qualità, oppure il codec "
+                f"\"Come l'originale\"."
             )
         return advice
 
     def _refresh_source_info(self):
         """The note above the codec choice: what the queued originals are, plus any advice."""
         if not self.source_infos:
-            self.source_info_label.hide()
+            self.enc_panel.set_note("")
             return
         text = "Originali: " + describe_source_codecs(self.source_infos)
-        if self._current_codec() == "source":
+        if self.enc_panel.options().codec == "source":
             text += ". Ogni episodio esce nel suo codec."
         advice = self._codec_advice(self.source_infos)
         if advice:
             text += "\n" + "\n".join(advice)
-        self.source_info_label.setText(text)
-        self.source_info_label.show()
+        self.enc_panel.set_note(text)
 
     def _browse_folder(self):
         if self._queue_locked():
@@ -1174,33 +977,8 @@ class MainWindow(QMainWindow):
             self._launch_batch()
 
     def _launch_batch(self):
-        codec = self._current_codec()
-        source_mode = codec == "source"
-        if source_mode:
-            codec = "h265"  # only a placeholder: each episode gets the codec of its own original below
-        use_gpu = self.gpu_check.isChecked() and self.gpu_check.isEnabled()
-        encoder = self.hw_encoders.get(codec) if use_gpu else None
-        is_hardware = bool(encoder)
-        if not encoder:
-            encoder = utils.CODEC_ENCODERS[codec][0]
-
-        if self.crf_radio.isChecked():
-            bitrate_mode = "crf"
-        elif self.cbr_radio.isChecked():
-            bitrate_mode = "cbr"
-        else:
-            bitrate_mode = "original"
-
-        settings = MergeSettings(
-            codec=codec, encoder=encoder, is_hardware=is_hardware,
-            preset=self._current_preset(), bitrate_mode=bitrate_mode,
-            crf=self.crf_spin.value(), cbr_kbps=self.cbr_spin.value(),
-            tune_animation=self.tune_check.isChecked() and self.tune_check.isEnabled(),
-            two_pass=self.two_pass_check.isChecked() and self.two_pass_check.isEnabled(),
-            audio_mode=self.audio_combo.currentData(),
-            deinterlace=self.deinterlace_check.isChecked(),
-            keep_10bit=self.ten_bit_check.isChecked() and self.ten_bit_check.isEnabled(),
-        )
+        opts = self.enc_panel.options()
+        hw = self.enc_panel.hw_encoders
 
         output_dir = Path(self.output_edit.text())
         try:
@@ -1213,7 +991,7 @@ class MainWindow(QMainWindow):
         outro_path = Path(self.outro_edit.text()) if self.outro_edit.text() else None
 
         self.cancel_event = threading.Event()
-        self.pool.setMaxThreadCount(self.parallel_spin.value())
+        self.pool.setMaxThreadCount(opts.parallel)
         self.running = True
         self._set_controls_enabled(False)
         self.finished_count = 0
@@ -1228,34 +1006,18 @@ class MainWindow(QMainWindow):
 
         applog.log_batch_start(
             "Unisci sigle",
-            f"codec {'come originale' if source_mode else codec} ({encoder}{', scheda video' if is_hardware else ''}), "
-            f"preset {settings.preset}, modalità {bitrate_mode} (CRF {settings.crf}, CBR {settings.cbr_kbps} kbps), "
-            f"2 passaggi {'sì' if settings.two_pass else 'no'}, audio {settings.audio_mode}, "
-            f"sigla iniziale {'sì' if intro_path else 'no'}, finale {'sì' if outro_path else 'no'}",
-            self.total_count, self.parallel_spin.value())
+            f"codec {opts.codec}{', scheda video' if opts.use_gpu else ''}, velocità {opts.speed}, qualità {opts.quality} "
+            f"(CRF {opts.crf}, {opts.kbps} kbit/s), 2 passaggi {'sì' if opts.two_pass else 'no'}, audio {opts.audio}, "
+            f"deinterlaccia {opts.deinterlace}, sigla iniziale {'sì' if intro_path else 'no'}, finale {'sì' if outro_path else 'no'}",
+            self.total_count, opts.parallel)
 
-        container_suffix = self.container_combo.currentData()
         used_names: set[str] = set()
         self.row_notes = {}
         for row, item in enumerate(self.rows):
             episode_path = item["path"]
-            row_settings, row_codec = settings, codec
-            notes = []
-            if source_mode:
-                info = self.episode_sources.get(episode_path)
-                row_codec = merger.app_codec_for(info.video_codec) if info else codec
-                if row_codec is None:
-                    row_codec = "h265"
-                    notes.append(
-                        f"codec originale ({merger.codec_display_name(info.video_codec)}) "
-                        "non riscrivibile: usato H.265"
-                    )
-                row_encoder = self.hw_encoders.get(row_codec) if use_gpu else None
-                row_settings = dataclasses.replace(
-                    settings, codec=row_codec, encoder=row_encoder or utils.CODEC_ENCODERS[row_codec][0],
-                    is_hardware=bool(row_encoder),
-                )
-            suffix, changed = merger.pick_container(episode_path.suffix, row_codec, container_suffix)
+            row_settings, notes = encoding.build_settings(
+                opts, self.episode_sources.get(episode_path), hw, self.ffmpeg_status.ffmpeg_path)
+            suffix, changed = merger.pick_container(episode_path.suffix, row_settings.codec, opts.container)
             if changed:
                 notes.append(f"salvato come {suffix}: il formato {episode_path.suffix} non supporta questo codec")
             # Two episodes sharing a name (e.g. "Puntata 1.mp4" and "Puntata 1.avi") would
@@ -1274,7 +1036,7 @@ class MainWindow(QMainWindow):
             self._set_row_progress(row, 0.0)
             task = MergeTask(
                 row, intro_path, episode_path, outro_path, output_path,
-                row_settings, self.ffmpeg_status.ffmpeg_path, self.ffmpeg_status.ffprobe_path,
+                row_settings, opts, self.ffmpeg_status.ffmpeg_path, self.ffmpeg_status.ffprobe_path,
                 self.signals, self.cancel_event,
             )
             self.pool.start(task)
@@ -1319,12 +1081,7 @@ class MainWindow(QMainWindow):
 
     def _set_controls_enabled(self, enabled: bool):
         self.reset_btn.setEnabled(enabled)
-        for w in (self.codec_combo, self.gpu_check, self.preset_combo, self.parallel_spin,
-                  self.crf_radio, self.cbr_radio, self.orig_radio, self.crf_spin, self.cbr_spin,
-                  self.tune_check, self.two_pass_check, self.container_combo, self.audio_combo):
-            w.setEnabled(enabled)
-        if enabled:
-            self._update_gpu_checkbox()
+        self.enc_panel.setEnabled(enabled)
         self._update_start_stop_button()
 
     def _reset_all(self):

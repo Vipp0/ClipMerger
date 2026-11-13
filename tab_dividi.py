@@ -23,14 +23,13 @@ import profili
 import profili_ui
 import titoli
 import dropwidgets
+from encoding import EncodingOptions
+from encoding_panel import EncodingPanel
 from dropwidgets import PathDropEdit, PathDropTable
 from profili_ui import ProfileBar, SeriesPickDialog
 from tab_sostituisci import fmt_time, parse_time
 from utils import list_video_files
 
-PRESETS = [("Veloce", "fast"), ("Bilanciato", "medium"), ("Qualità", "slow")]
-CODECS = [("Come l'originale", "original"), ("H.265 (file più piccoli)", "h265")]
-DEINTERLACE = [("Automatico (solo se il video è interlacciato)", "auto"), ("Sempre", "always"), ("Mai", "never")]
 PROLOGUES = [("Unito alla prima puntata", "attach"), ("Scartato (la prima puntata parte dal suo stacco)", "drop")]
 ENDINGS = [("Pulita: finisce con la scena, senza la transizione", "clean"),
            ("Con la transizione e i titoli di coda (circa 8 secondi)", "credits")]
@@ -122,11 +121,11 @@ class ProcessSignals(QObject):
 
 class ProcessTask(QRunnable):
     def __init__(self, row: int, ffmpeg: str, ffprobe: str, src: Path, start: float, end: float, output: Path,
-                 crf: int, preset: str, codec: str, title: str, tail: tuple[float, float] | None, deinterlace: bool,
+                 opts: EncodingOptions, hw_encoders: dict, title: str, tail: tuple[float, float] | None, deinterlace: bool,
                  bars: tuple[int, int] | None, signals: ProcessSignals, cancel_event: threading.Event):
         super().__init__()
         self.row = row
-        self.args = (ffmpeg, ffprobe, src, start, end, output, crf, preset, codec, title)
+        self.args = (ffmpeg, ffprobe, src, start, end, output, opts, hw_encoders, title)
         self.tail, self.deinterlace, self.bars = tail, deinterlace, bars
         self.signals, self.cancel_event = signals, cancel_event
         self.setAutoDelete(True)
@@ -273,49 +272,20 @@ class DividiTab(QWidget):
         prof_box.setLayout(prof)
         root.addWidget(prof_box)
 
-        enc = QGridLayout()
-        enc.setSpacing(8)
-        enc.addWidget(QLabel("Qualità:"), 0, 0)
-        self.quality_combo = QComboBox()
-        for label, level in dividi.QUALITY_LEVELS:
-            self.quality_combo.addItem(f"{label}  (CRF {level})", level)
-        self.quality_combo.setCurrentIndex(1)
-        enc.addWidget(self.quality_combo, 0, 1)
-        enc.addWidget(QLabel("Preset:"), 0, 2)
-        self.preset_combo = QComboBox()
-        for label, value in PRESETS:
-            self.preset_combo.addItem(label, value)
-        self.preset_combo.setCurrentIndex(1)
-        enc.addWidget(self.preset_combo, 0, 3)
-        enc.addWidget(QLabel("Codec:"), 0, 4)
-        self.codec_combo = QComboBox()
-        for label, value in CODECS:
-            self.codec_combo.addItem(label, value)
-        enc.addWidget(self.codec_combo, 0, 5)
-        enc.addWidget(QLabel("Elaborazioni parallele:"), 0, 6)
-        self.parallel_spin = QSpinBox()
-        self.parallel_spin.setRange(1, 4)
-        self.parallel_spin.setValue(2)
-        enc.addWidget(self.parallel_spin, 0, 7)
-        enc.addWidget(QLabel("Fine di ogni puntata:"), 1, 0)
+        self.enc_panel = EncodingPanel("dividi", self.win.qsettings, EncodingOptions(cap_bitrate=True, parallel=2))
+        root.addWidget(self.enc_panel)
+
+        extra = QGridLayout()
+        extra.setSpacing(8)
+        extra.addWidget(QLabel("Fine di ogni puntata:"), 0, 0)
         self.ending_combo = QComboBox()
         for label, value in ENDINGS:
             self.ending_combo.addItem(label, value)
         self.ending_combo.setToolTip(
             "Se il file originale finisce con una transizione e dei titoli di coda (riconosciuti dal profilo), "
             "«Con la transizione e i titoli di coda» li mette alla fine di ogni puntata, come accade all'ultima.")
-        enc.addWidget(self.ending_combo, 1, 1, 1, 3)
-        enc.addWidget(QLabel("Deinterlaccia:"), 1, 4)
-        self.deint_combo = QComboBox()
-        for label, value in DEINTERLACE:
-            self.deint_combo.addItem(label, value)
-        self.deint_combo.setToolTip(
-            "Il materiale delle vecchie trasmissioni TV è spesso interlacciato (righe pari e dispari di due istanti "
-            "diversi) anche quando il file non lo dichiara. «Automatico» lo verifica guardando un minuto di immagini "
-            "di ogni file e, se serve, unisce i due semiquadri con il filtro bwdif, che è nitido e non cambia "
-            "i fotogrammi al secondo. Se il video non è interlacciato non viene toccato.")
-        enc.addWidget(self.deint_combo, 1, 5, 1, 3)
-        enc.addWidget(QLabel("Inizio senza titolo:"), 2, 0)
+        extra.addWidget(self.ending_combo, 0, 1)
+        extra.addWidget(QLabel("Inizio senza titolo:"), 1, 0)
         self.prologue_combo = QComboBox()
         for label, value in PROLOGUES:
             self.prologue_combo.addItem(label, value)
@@ -323,23 +293,17 @@ class DividiTab(QWidget):
             "Se ogni file comincia con una breve scenetta senza titolo (il «prologo»), prima del primo stacco, "
             "può restare attaccata alla prima puntata oppure essere scartata.")
         self.prologue_combo.currentIndexChanged.connect(self._apply_prologue_choice)
-        enc.addWidget(self.prologue_combo, 2, 1, 1, 3)
+        extra.addWidget(self.prologue_combo, 1, 1)
         self.bars_check = QCheckBox("Rendi neri i bordi verdi ai lati")
         self.bars_check.setChecked(True)
         self.bars_check.setToolTip(
             "In alcuni pezzi le bande ai lati dell'immagine sono verdi nel file originale invece che nere. "
             "Con questa casella diventano nere, senza toccare l'immagine.")
-        enc.addWidget(self.bars_check, 2, 4, 1, 4)
-        note = QLabel(
-            "Ogni pezzo viene ricodificato una sola volta (il taglio è preciso al fotogramma), con codifica software, "
-            "nello stesso formato del file. Il bitrate non supera mai quello dell'originale; l'audio resta com'è "
-            "(stesso codec e tracce). Con «Bilanciata» i pezzi escono più piccoli dell'originale.")
-        note.setWordWrap(True)
-        enc.addWidget(note, 3, 0, 1, 8)
-        enc.setColumnStretch(1, 1)
-        enc_box = QGroupBox("Codifica")
-        enc_box.setLayout(enc)
-        root.addWidget(enc_box)
+        extra.addWidget(self.bars_check, 2, 0, 1, 2)
+        extra.setColumnStretch(1, 1)
+        extra_box = QGroupBox("Tagli e pezzi")
+        extra_box.setLayout(extra)
+        root.addWidget(extra_box)
 
         buttons = QHBoxLayout()
         self.analyze_btn = QPushButton("Analizza")
@@ -420,9 +384,7 @@ class DividiTab(QWidget):
         """The tab as it is now (series, quality, names...), to be saved in a profile."""
         return {"serie": {"id": self.series_id or 0, "nome": self.name_edit.text().strip(),
                           "testo": self.series_edit.text().strip(), "etichetta": self.series_label},
-                "qualita": self.quality_combo.currentData(), "preset": self.preset_combo.currentData(),
-                "codec": self.codec_combo.currentData(), "paralleli": self.parallel_spin.value(),
-                "fine": self.ending_combo.currentData(), "deinterlaccia": self.deint_combo.currentData(),
+                "codifica": self.enc_panel.options().to_dict(), "fine": self.ending_combo.currentData(),
                 "prologo": self.prologue_combo.currentData(), "bordi": self.bars_check.isChecked(),
                 "stile": self.style_combo.currentData()}
 
@@ -440,20 +402,35 @@ class DividiTab(QWidget):
             self.series_edit.setText(str(serie.get("testo", "")) if self.series_id else "")
             self.name_edit.setText(str(serie.get("nome", "")))
             self._refresh_list_status()
-        for combo, name in ((self.quality_combo, "qualita"), (self.preset_combo, "preset"), (self.codec_combo, "codec"),
-                            (self.ending_combo, "fine"), (self.deint_combo, "deinterlaccia"),
-                            (self.prologue_combo, "prologo"), (self.style_combo, "stile")):
+        if isinstance(d.get("codifica"), dict):
+            self.enc_panel.set_options(EncodingOptions.from_dict(d["codifica"]))
+        elif "qualita" in d:  # a profile saved before the encoding panel was shared by all tools
+            self.enc_panel.set_options(self._legacy_options(d))
+        for combo, name in ((self.ending_combo, "fine"), (self.prologue_combo, "prologo"), (self.style_combo, "stile")):
             if name in d:
                 i = combo.findData(d[name])
                 if i >= 0:
                     combo.setCurrentIndex(i)
         if "bordi" in d:
             self.bars_check.setChecked(bool(d["bordi"]))
-        if "paralleli" in d:
-            try:
-                self.parallel_spin.setValue(int(d["paralleli"]))
-            except (TypeError, ValueError):
-                pass
+
+    @staticmethod
+    def _legacy_options(d: dict) -> EncodingOptions:
+        level = {14: "max", 16: "high", 18: "good", 20: "balanced", 23: "small"}.get(d.get("qualita"))
+        o = EncodingOptions(cap_bitrate=True, parallel=2)
+        if level:
+            o.quality = level
+        elif isinstance(d.get("qualita"), int):
+            o.quality, o.crf = "custom", d["qualita"]
+        if d.get("preset") in ("fast", "medium", "slow"):
+            o.speed = d["preset"]
+        if d.get("codec") in ("h265",):
+            o.codec = "h265"
+        if d.get("deinterlaccia") in ("auto", "always", "never"):
+            o.deinterlace = d["deinterlaccia"]
+        if isinstance(d.get("paralleli"), int):
+            o.parallel = min(max(d["paralleli"], 1), 8)
+        return o
 
     def _profile_changed(self, key: str = ""):
         profile = self._profile()
@@ -600,9 +577,8 @@ class DividiTab(QWidget):
         self.start_btn.setText("Stop" if self.state == "processing" else "Avvia")
         self.start_btn.setEnabled(self.state == "processing" or (idle and any(p is not None for _, p, _ in self.entries)))
         for w in (self.folder_edit, self.output_edit, self.profile_bar, self.series_edit, self.search_btn,
-                  self.season_spin, self.key_edit, self.list_btn, self.quality_combo, self.preset_combo, self.codec_combo, self.ending_combo,
-                  self.deint_combo, self.prologue_combo, self.bars_check, self.style_combo, self.name_edit,
-                  self.parallel_spin):
+                  self.season_spin, self.key_edit, self.list_btn, self.enc_panel, self.ending_combo,
+                  self.prologue_combo, self.bars_check, self.style_combo, self.name_edit):
             w.setEnabled(idle)
         self.table.setEditTriggers(
             (QAbstractItemView.DoubleClicked | QAbstractItemView.EditKeyPressed) if idle else QAbstractItemView.NoEditTriggers)
@@ -978,15 +954,15 @@ class DividiTab(QWidget):
         if reply != QMessageBox.Yes:
             return
         self._save_settings()
+        opts = self.enc_panel.options()
         applog.log_batch_start(
             "Dividi puntate",
-            f"qualità {self.quality_combo.currentText()}, preset {self.preset_combo.currentData()}, "
-            f"codec {self.codec_combo.currentData()}, fine {self.ending_combo.currentData()}, "
-            f"deinterlaccia {self.deint_combo.currentData()}, prologo {self.prologue_combo.currentData()}, "
+            f"codec {opts.codec}, velocità {opts.speed}, qualità {opts.quality} (CRF {opts.crf}, {opts.kbps} kbit/s), "
+            f"fine {self.ending_combo.currentData()}, deinterlaccia {opts.deinterlace}, prologo {self.prologue_combo.currentData()}, "
             f"bordi verdi {'neri' if self.bars_check.isChecked() else 'lasciati'}, cartella di output {output_dir}",
-            len(rows), self.parallel_spin.value())
+            len(rows), opts.parallel)
         self.cancel_event = threading.Event()
-        self.pool.setMaxThreadCount(self.parallel_spin.value())
+        self.pool.setMaxThreadCount(opts.parallel)
         self.started = set()
         self.job_rows = rows
         self.total_count, self.finished_count = len(rows), 0
@@ -995,14 +971,14 @@ class DividiTab(QWidget):
         self.info_label.setText("")
         self.row_pct = {r: 0.0 for r in rows}
         self._set_state("processing")
-        mode = self.deint_combo.currentData()
+        mode = opts.deinterlace
         for row in rows:
             path, piece, _ = self.entries[row]
             self.table.item(row, COL_STATUS).setText("In coda")
             self.table.cellWidget(row, COL_PROGRESS).setValue(0)
             self.pool.start(ProcessTask(
                 row, tools[0], tools[1], path, piece.start, piece.end, output_dir / (names[row] + path.suffix),
-                self.quality_combo.currentData(), self.preset_combo.currentData(), self.codec_combo.currentData(),
+                opts, self.enc_panel.hw_encoders,
                 names[row], piece.tail if self.ending_combo.currentData() == "credits" else None,
                 mode == "always" or (mode == "auto" and piece.interlaced),
                 piece.bars if self.bars_check.isChecked() else None,

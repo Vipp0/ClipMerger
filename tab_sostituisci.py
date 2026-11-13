@@ -17,6 +17,8 @@ from PySide6.QtWidgets import (
 
 import applog
 import dropwidgets
+from encoding import EncodingOptions
+from encoding_panel import EncodingPanel
 import merger
 import profili_ui
 import sostituisci
@@ -25,13 +27,6 @@ from dropwidgets import PathDropEdit, PathDropTable
 from profili_ui import ProfileBar
 from sostituisci import EpisodeAnalysis
 
-PRESETS = [("Veloce", "fast"), ("Bilanciato", "medium"), ("Qualità", "slow")]
-AUDIO_MODES = [
-    ("Come originale (stesso codec, canali e bitrate dell'episodio)", "original"),
-    ("AAC, mantieni i canali originali", "aac_keep"),
-    ("AAC stereo 192k (compatto)", "aac_stereo"),
-    ("FLAC senza perdita (file più grandi)", "flac"),
-]
 COL_CHECK, COL_NAME, COL_INTRO, COL_OUTRO, COL_CUT_IN, COL_CUT_OUT, COL_CONF, COL_STATUS, COL_PROGRESS = range(9)
 
 
@@ -111,11 +106,11 @@ class ProcessSignals(QObject):
 
 class ProcessTask(QRunnable):
     def __init__(self, row: int, ffmpeg: str, ffprobe: str, ana: EpisodeAnalysis, new_intro, new_outro,
-                 output_dir: Path, quality: int, preset: str, audio_mode: str,
+                 output_dir: Path, opts: EncodingOptions, hw_encoders: dict,
                  signals: ProcessSignals, cancel_event: threading.Event):
         super().__init__()
         self.row = row
-        self.args = (ffmpeg, ffprobe, ana, new_intro, new_outro, output_dir, quality, preset, audio_mode)
+        self.args = (ffmpeg, ffprobe, ana, new_intro, new_outro, output_dir, opts, hw_encoders)
         self.signals, self.cancel_event = signals, cancel_event
         self.setAutoDelete(True)
 
@@ -291,40 +286,10 @@ class SostituisciTab(QWidget):
             "(muta). Spegni per togliere tutto fino alla fine della musica.")
         root.addWidget(self.card_check)
 
-        enc = QGridLayout()
-        enc.setSpacing(8)
-        enc.addWidget(QLabel("Qualità:"), 0, 0)
-        self.quality_combo = QComboBox()
-        for label, level in sostituisci.QUALITY_LEVELS:
-            self.quality_combo.addItem(f"{label}  (CRF {level})", level)
-        self.quality_combo.setCurrentIndex(1)
-        enc.addWidget(self.quality_combo, 0, 1)
-        enc.addWidget(QLabel("Preset:"), 0, 2)
-        self.preset_combo = QComboBox()
-        for label, value in PRESETS:
-            self.preset_combo.addItem(label, value)
-        self.preset_combo.setCurrentIndex(2)
-        enc.addWidget(self.preset_combo, 0, 3)
-        enc.addWidget(QLabel("Elaborazioni parallele:"), 0, 4)
-        self.parallel_spin = QSpinBox()
-        self.parallel_spin.setRange(1, 4)
-        self.parallel_spin.setValue(1)
-        enc.addWidget(self.parallel_spin, 0, 5)
-        enc.addWidget(QLabel("Audio:"), 1, 0)
-        self.audio_combo = QComboBox()
-        for label, value in AUDIO_MODES:
-            self.audio_combo.addItem(label, value)
-        enc.addWidget(self.audio_combo, 1, 1, 1, 5)
-        note = QLabel(
-            "Il video resta nel codec dell'episodio (H.264, H.265 o AV1; per altri formati si usa H.265) e viene "
-            "ricodificato una sola volta, con codifica software. Qualità più alta = file più grande."
-        )
-        note.setWordWrap(True)
-        enc.addWidget(note, 2, 0, 1, 6)
-        enc.setColumnStretch(1, 1)
-        enc_box = QGroupBox("Codifica")
-        enc_box.setLayout(enc)
-        root.addWidget(enc_box)
+        # the encoding panel, the same as in the other tools; this one's own default is high quality, slow
+        self.enc_panel = EncodingPanel("sostituisci", self.win.qsettings,
+                                       EncodingOptions(quality="high", speed="slow"))
+        root.addWidget(self.enc_panel)
 
         buttons = QHBoxLayout()
         self.analyze_btn = QPushButton("Analizza")
@@ -395,9 +360,7 @@ class SostituisciTab(QWidget):
     def collect_settings(self) -> dict:
         """The tab as it is now (new sigle, quality, audio...), to be saved in a profile."""
         return {"iniziale": self.intro_group.settings(), "finale": self.outro_group.settings(),
-                "scheda": self.card_check.isChecked(), "qualita": self.quality_combo.currentData(),
-                "preset": self.preset_combo.currentData(), "paralleli": self.parallel_spin.value(),
-                "audio": self.audio_combo.currentData()}
+                "scheda": self.card_check.isChecked(), "codifica": self.enc_panel.options().to_dict()}
 
     def apply_settings(self, d: dict) -> None:
         """Puts a profile's saved settings in the tab (only what the profile has: the rest stays as it is)."""
@@ -409,16 +372,8 @@ class SostituisciTab(QWidget):
             self.outro_group.apply_settings(d["finale"])
         if "scheda" in d:
             self.card_check.setChecked(bool(d["scheda"]))
-        for combo, name in ((self.quality_combo, "qualita"), (self.preset_combo, "preset"), (self.audio_combo, "audio")):
-            if name in d:
-                i = combo.findData(d[name])
-                if i >= 0:
-                    combo.setCurrentIndex(i)
-        if "paralleli" in d:
-            try:
-                self.parallel_spin.setValue(int(d["paralleli"]))
-            except (TypeError, ValueError):
-                pass
+        if isinstance(d.get("codifica"), dict):
+            self.enc_panel.set_options(EncodingOptions.from_dict(d["codifica"]))
 
     def _new_profile(self) -> str | None:
         return profili_ui.edit_sostituisci(self, None, self.collect_settings())
@@ -467,8 +422,7 @@ class SostituisciTab(QWidget):
         self.start_btn.setText("Stop" if self.state == "processing" else "Elabora")
         self.start_btn.setEnabled(self.state == "processing" or (idle and any(a.ready for a in self.analyses)))
         self.preview_btn.setEnabled(idle and any(a.ready for a in self.analyses))
-        for w in (self.folder_edit, self.output_edit, self.quality_combo, self.preset_combo, self.parallel_spin,
-                  self.audio_combo, self.card_check, self.profile_bar):
+        for w in (self.folder_edit, self.output_edit, self.enc_panel, self.card_check, self.profile_bar):
             w.setEnabled(idle)
         self.table.setEditTriggers(
             (QAbstractItemView.DoubleClicked | QAbstractItemView.EditKeyPressed) if idle
@@ -792,13 +746,14 @@ class SostituisciTab(QWidget):
         )
         if reply != QMessageBox.Yes:
             return
+        opts = self.enc_panel.options()
         applog.log_batch_start(
             "Sostituisci sigla",
-            f"qualità {self.quality_combo.currentText()}, preset {self.preset_combo.currentData()}, "
-            f"audio {self.audio_combo.currentData()}, cartella di output {output_dir}",
-            len(rows), self.parallel_spin.value())
+            f"codec {opts.codec}, velocità {opts.speed}, qualità {opts.quality} (CRF {opts.crf}, {opts.kbps} kbit/s), "
+            f"audio {opts.audio}, deinterlaccia {opts.deinterlace}, cartella di output {output_dir}",
+            len(rows), opts.parallel)
         self.cancel_event = threading.Event()
-        self.pool.setMaxThreadCount(self.parallel_spin.value())
+        self.pool.setMaxThreadCount(opts.parallel)
         self.started = set()
         self.job_rows = rows
         self.total_count, self.finished_count = len(rows), 0
@@ -812,7 +767,7 @@ class SostituisciTab(QWidget):
             self.table.cellWidget(row, COL_PROGRESS).setValue(0)
             self.pool.start(ProcessTask(
                 row, tools[0], tools[1], self.analyses[row], news[0], news[1], output_dir,
-                self.quality_combo.currentData(), self.preset_combo.currentData(), self.audio_combo.currentData(),
+                opts, self.enc_panel.hw_encoders,
                 self.signals, self.cancel_event,
             ))
 

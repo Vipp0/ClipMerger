@@ -16,6 +16,7 @@ from pathlib import Path
 
 import numpy as np
 
+import encoding
 import merger
 import profili
 import trova_sigla
@@ -245,10 +246,12 @@ def plan_cuts(
 def replace_sigle(
     ffmpeg: str, ffprobe: str, episode: Path, new_intro: Path | None, new_outro: Path | None,
     plan: CutPlan, output: Path, settings: merger.MergeSettings,
-    progress_cb=None, cancel_event=None,
+    progress_cb=None, cancel_event=None, episode_interlaced: bool | None = None,
 ) -> merger.ProbeResult:
     """Builds and runs the single re-encode: new opening + kept part of the episode + new closing."""
     ep = merger.probe(ffprobe, episode)
+    if episode_interlaced is not None:  # decided by the caller (looking at the picture), whatever the file's flag says
+        ep.interlaced = episode_interlaced
     segments: list[tuple[Path, merger.ProbeResult]] = []
     if new_intro is not None:
         segments.append((new_intro, merger.probe(ffprobe, new_intro)))
@@ -269,13 +272,12 @@ def replace_sigle(
         trims[card_idx] = plan.card
         card_len = plan.card[1] - plan.card[0]
         mutes[card_idx] = card_len + 1.0
-    cmd = merger.build_command(ffmpeg, segments, episode_idx, output, settings, trims=trims, mutes=mutes or None)
     expected = (sum(p.duration for i, (_, p) in enumerate(segments) if i not in (episode_idx, card_idx))
                 + card_len + (plan.keep_end - plan.keep_start))
     tmp = output.with_name(f".{output.stem}.part{output.suffix}")
-    cmd[-1] = str(tmp)  # last argument is the output path
     try:
-        merger.run_merge_pass(cmd, expected, progress_cb, cancel_event)
+        merger.run_encode(ffmpeg, segments, episode_idx, tmp, settings, expected, progress_cb, cancel_event,
+                          trims=trims, mutes=mutes or None)
         merger.verify_output(ffprobe, tmp, expected)
         tmp.replace(output)
     finally:
@@ -286,10 +288,6 @@ def replace_sigle(
 # ----------------------------------------------------------------------------------------
 # Analysis of a whole folder, and the per-episode work, as used by the "Sostituisci sigla" tab
 
-# Quality levels of the tab (CRF of H.264; the other codecs get a nearby value that measured
-# about the same picture fidelity on a 40 s cartoon excerpt: H.265 needs one point less, AV1 one more).
-QUALITY_LEVELS = [("Massima (file molto grandi)", 14), ("Alta (consigliata)", 16), ("Bilanciata", 20), ("Compatta", 23)]
-_CRF_OFFSET = {"h264": 0, "h265": -1, "av1": 1}
 CONFIDENCE_OK = 70  # below this a found sigla is shown as "Da verificare"
 
 
@@ -410,30 +408,30 @@ def analizza(
 
 def elabora_episodio(
     ffmpeg: str, ffprobe: str, ana: EpisodeAnalysis, new_intro: Path | None, new_outro: Path | None,
-    output_dir: Path, quality: int, preset: str, audio_mode: str, progress_cb=None, cancel_event=None,
+    output_dir: Path, opts: "encoding.EncodingOptions", hw_encoders: dict | None = None, progress_cb=None, cancel_event=None,
 ) -> merger.MergeResult:
-    """Replaces the sigle of one analysed episode. The video keeps the episode's own codec
-    (H.265 when that isn't H.264/H.265/AV1) and its container where that can hold it."""
+    """Replaces the sigle of one analysed episode, encoding as `opts` says (by default the episode's own codec,
+    H.265 when that isn't H.264/H.265/AV1, and its container where that can hold it)."""
     suffix = ana.episode.suffix
     output = output_dir / (ana.episode.stem + suffix)
     try:
         if ana.plan is None:
             raise SostituisciError("Episodio non analizzato.")
         info = merger.probe(ffprobe, ana.episode)
-        codec = merger.app_codec_for(info.video_codec) or "h265"
-        suffix, changed = merger.pick_container(ana.episode.suffix, codec)
+        settings, notes = encoding.build_settings(opts, info, hw_encoders, ffmpeg)
+        suffix, changed = merger.pick_container(ana.episode.suffix, settings.codec, opts.container)
         output = output_dir / (ana.episode.stem + suffix)
         if output.exists():
             return merger.MergeResult(output_path=output, success=True, skipped=True)
         output_dir.mkdir(parents=True, exist_ok=True)
-        settings = merger.MergeSettings(
-            codec=codec, encoder=utils.CODEC_ENCODERS[codec][0], is_hardware=False, preset=preset,
-            bitrate_mode="crf", crf=quality + _CRF_OFFSET[codec], audio_mode=audio_mode,
-        )
+        interlaced = encoding.resolve_interlaced(opts, ffmpeg, ana.episode, info)
         replace_sigle(ffmpeg, ffprobe, ana.episode, new_intro, new_outro, ana.plan, output, settings,
-                      progress_cb=progress_cb, cancel_event=cancel_event)
-        note = f"salvato come {suffix}: il formato {ana.episode.suffix} non supporta questo codec" if changed else None
-        return merger.MergeResult(output_path=output, success=True, note=note)
+                      progress_cb=progress_cb, cancel_event=cancel_event, episode_interlaced=interlaced)
+        if changed:
+            notes.append(f"salvato come {suffix}: il formato {ana.episode.suffix} non supporta questo codec")
+        if interlaced and settings.deinterlace:
+            notes.append("video interlacciato: deinterlacciato")
+        return merger.MergeResult(output_path=output, success=True, note="; ".join(notes) or None)
     except merger.Cancelled:
         return merger.MergeResult(output_path=output, success=False, error="Annullato")
     except (merger.MergeError, SostituisciError) as exc:

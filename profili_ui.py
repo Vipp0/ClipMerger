@@ -35,9 +35,10 @@ class ProfileBar(QWidget):
 
     selected = Signal(str)  # the key of the profile chosen (also after the list is reloaded)
 
-    def __init__(self, kind: str, loader, new_cb, edit_cb, update_cb):
+    def __init__(self, kind: str, loader, new_cb, edit_cb, update_cb, noun: str = "profilo", plural: str = "profili"):
         super().__init__()
         self.kind, self.loader, self.new_cb, self.edit_cb, self.update_cb = kind, loader, new_cb, edit_cb, update_cb
+        self.noun = noun
         self.profiles: dict = {}
         layout = QHBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -45,12 +46,12 @@ class ProfileBar(QWidget):
         self.combo.setMinimumWidth(260)
         self.combo.currentIndexChanged.connect(lambda _: self.selected.emit(self.current_key()))
         layout.addWidget(self.combo, 1)
-        self.button = QPushButton("Gestisci profili ▾")
+        self.button = QPushButton(f"Gestisci {plural} ▾")
         self.button.setObjectName("secondary")
         self.menu = QMenu(self)
-        self.act_new = self.menu.addAction("Nuovo profilo...", self._new)
-        self.act_edit = self.menu.addAction("Modifica questo profilo...", self._edit)
-        self.act_update = self.menu.addAction("Salva le impostazioni attuali nel profilo", self._update)
+        self.act_new = self.menu.addAction(f"Nuovo {noun}...", self._new)
+        self.act_edit = self.menu.addAction(f"Modifica questo {noun}...", self._edit)
+        self.act_update = self.menu.addAction(f"Salva le impostazioni attuali nel {noun}", self._update)
         self.menu.addSeparator()
         self.act_dup = self.menu.addAction("Duplica...", self._duplicate)
         self.act_del = self.menu.addAction("Elimina...", self._delete)
@@ -71,6 +72,7 @@ class ProfileBar(QWidget):
     def reload(self, select: str | None = None) -> None:
         wanted = select or (self.combo.currentData() if self.combo.count() else "standard")
         self.profiles = self.loader()
+        applog.log.info("Profili %s: %s -> %s", self.kind, profili.folder(self.kind), ", ".join(p.name for p in self.profiles.values()))
         self.combo.blockSignals(True)
         self.combo.clear()
         for key, p in self.profiles.items():
@@ -99,16 +101,16 @@ class ProfileBar(QWidget):
         key = self.current_key()
         if self.update_cb(key):
             self.reload(key)
-            QMessageBox.information(self, "Profilo aggiornato", f"Le impostazioni attuali sono salvate nel profilo «{self.current().name}».")
+            QMessageBox.information(self, "Aggiornato", f"Le impostazioni attuali sono salvate nel {self.noun} «{self.current().name}».")
 
     def _duplicate(self) -> None:
         current = self.current()
-        name, ok = QInputDialog.getText(self, "Duplica il profilo", "Nome della copia:", text=f"Copia di {current.name}")
+        name, ok = QInputDialog.getText(self, f"Duplica il {self.noun}", "Nome della copia:", text=f"Copia di {current.name}")
         name = name.strip()
         if not ok or not name:
             return
         if profili.name_taken(self.kind, name) or name.lower() == "standard":
-            QMessageBox.warning(self, "Nome già usato", "Esiste già un profilo con questo nome.")
+            QMessageBox.warning(self, "Nome già usato", f"Esiste già un {self.noun} con questo nome.")
             return
         try:
             if current.builtin:  # «Standard» is not a file: copy it from what it would contain
@@ -124,7 +126,7 @@ class ProfileBar(QWidget):
         current = self.current()
         if current is None or current.builtin:
             return
-        if QMessageBox.question(self, "Elimina il profilo", f"Eliminare il profilo «{current.name}»?\nNon si può annullare.",
+        if QMessageBox.question(self, f"Elimina il {self.noun}", f"Eliminare il {self.noun} «{current.name}»?\nNon si può annullare.",
                                 QMessageBox.Yes | QMessageBox.No, QMessageBox.No) != QMessageBox.Yes:
             return
         try:
@@ -137,9 +139,9 @@ class ProfileBar(QWidget):
     def _export(self) -> None:
         current = self.current()
         if current is None or current.builtin:
-            QMessageBox.information(self, "Esporta", "Il profilo Standard è già in ogni copia del programma: esporta uno dei tuoi.")
+            QMessageBox.information(self, "Esporta", f"Quello predefinito è già in ogni copia del programma: esporta uno dei tuoi.")
             return
-        dest, _ = QFileDialog.getSaveFileName(self, "Esporta il profilo", f"{profili.slug(current.name)}.zip", "Profilo ClipMerger (*.zip)")
+        dest, _ = QFileDialog.getSaveFileName(self, f"Esporta il {self.noun}", f"{profili.slug(current.name)}.zip", "File ClipMerger (*.zip)")
         if not dest:
             return
         try:
@@ -148,7 +150,7 @@ class ProfileBar(QWidget):
             QMessageBox.warning(self, "Profilo non esportato", str(exc))
 
     def _import(self) -> None:
-        src, _ = QFileDialog.getOpenFileName(self, "Importa un profilo", "", "Profilo ClipMerger (*.zip)")
+        src, _ = QFileDialog.getOpenFileName(self, f"Importa un {self.noun}", "", "File ClipMerger (*.zip)")
         if not src:
             return
         try:

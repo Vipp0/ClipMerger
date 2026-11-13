@@ -25,6 +25,7 @@ from pathlib import Path
 import numpy as np
 
 import applog
+import encoding
 import merger
 import ocr_windows
 import profili
@@ -544,32 +545,24 @@ def analizza(files: list[Path], profile: Profile, catalogue: list[titoli.Episodi
 
 
 # ---------------------------------------------------------------------------- cutting
-QUALITY_LEVELS = [("Alta", 18), ("Bilanciata (consigliata)", 20), ("Compatta", 23)]
-
-
-def cut_piece(ffmpeg: str, ffprobe: str, src: Path, start: float, end: float, output: Path, crf: int, preset: str,
-              codec: str, title: str = "", progress_cb=None, cancel_event=None,
-              tail: tuple[float, float] | None = None, deinterlace: bool = False,
+def cut_piece(ffmpeg: str, ffprobe: str, src: Path, start: float, end: float, output: Path,
+              opts: "encoding.EncodingOptions", hw_encoders: dict | None = None, title: str = "", progress_cb=None,
+              cancel_event=None, tail: tuple[float, float] | None = None, deinterlace: bool = False,
               bars: tuple[int, int] | None = None) -> merger.MergeResult:
-    """One piece: [start, end) of `src`, re-encoded once, in the same container, never above the source's video
-    bitrate. The audio keeps its codec and track layout. `deinterlace` merges the fields (one frame per frame pair,
-    sharp bwdif filter); whether to do it is the caller's decision. With `tail` = (start, end) of the same file, that stretch
+    """One piece: [start, end) of `src`, re-encoded once as `opts` says (by default in the same codec and container,
+    never above the source's video bitrate). `deinterlace` merges the fields (one frame per frame pair, sharp bwdif
+    filter); whether to do it is the caller's decision. With `tail` = (start, end) of the same file, that stretch
     (the file's own ending) is joined after the piece, in the same single encode."""
     try:
         info = merger.probe(ffprobe, src)
         info.interlaced = deinterlace  # the caller decides, whatever the file's own flag says
-        use = codec if codec != "original" else (merger.app_codec_for(info.video_codec) or "h264")
-        suffix, changed = merger.pick_container(src.suffix, use)
+        settings, notes = encoding.build_settings(opts, info, hw_encoders, ffmpeg)
+        settings.deinterlace = True
+        suffix, changed = merger.pick_container(src.suffix, settings.codec, opts.container)
         output = output.with_suffix(suffix)
         if output.exists():
             return merger.MergeResult(output_path=output, success=True, skipped=True)
         output.parent.mkdir(parents=True, exist_ok=True)
-        cap = (info.video_bitrate // 1000) if info.video_bitrate else 0
-        settings = merger.MergeSettings(
-            codec=use, encoder=utils.CODEC_ENCODERS[use][0], is_hardware=False, preset=preset,
-            bitrate_mode="crf", crf=crf + (-1 if use == "h265" else 0), audio_mode="original",
-            max_kbps=cap if use in ("h264", "h265") else 0, deinterlace=True, deint_filter=deint_filter(ffmpeg),
-        )
         segments = [(src, info)] + ([(src, info)] if tail else [])
         windows = {0: (start, end - 0.01)}
         if tail:
@@ -578,21 +571,23 @@ def cut_piece(ffmpeg: str, ffprobe: str, src: Path, start: float, end: float, ou
         if bars:  # black out the green side bars of the piece (not of the ending taken from elsewhere in the file)
             prefilters = {0: f"drawbox=x=0:y=0:w={bars[0]}:h=ih:color=black:t=fill,"
                              f"drawbox=x={bars[1]}:y=0:w=iw-{bars[1]}:h=ih:color=black:t=fill"}
-        cmd = merger.build_command(ffmpeg, segments, 0, output, settings, windows=windows, prefilters=prefilters)
-        if title:
-            at = len(cmd) - 1 - cmd[::-1].index("-progress")
-            cmd[at:at] = ["-metadata", f"title={title}"]
+        def add_title(cmd: list[str]) -> list[str]:
+            if title:
+                at = len(cmd) - 1 - cmd[::-1].index("-progress")
+                cmd[at:at] = ["-metadata", f"title={title}"]
+            return cmd
         tmp = output.with_name(f".{output.stem}.part{output.suffix}")
-        cmd[-1] = str(tmp)
         try:
             expected = end - start + ((tail[1] - tail[0]) if tail else 0.0)
-            merger.run_merge_pass(cmd, expected, progress_cb, cancel_event)
+            merger.run_encode(ffmpeg, segments, 0, tmp, settings, expected, progress_cb, cancel_event,
+                              edit_command=add_title, windows=windows, prefilters=prefilters)
             merger.verify_output(ffprobe, tmp, expected)
             tmp.replace(output)
         finally:
             tmp.unlink(missing_ok=True)
-        note = f"salvato come {suffix}: il formato {src.suffix} non supporta questo codec" if changed else None
-        return merger.MergeResult(output_path=output, success=True, note=note)
+        if changed:
+            notes.append(f"salvato come {suffix}: il formato {src.suffix} non supporta questo codec")
+        return merger.MergeResult(output_path=output, success=True, note="; ".join(notes) or None)
     except merger.Cancelled:
         return merger.MergeResult(output_path=output, success=False, error="Annullato")
     except (merger.MergeError, DividiError) as exc:

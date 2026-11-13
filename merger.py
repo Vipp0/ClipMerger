@@ -885,12 +885,54 @@ def _extract_cover(
     return CoverFile(path=target, mimetype=mimetype, filename=cover.filename or f"cover{ext}")
 
 
+def run_encode(
+    ffmpeg_path: str, segments: list[tuple[Path, ProbeResult]], episode_idx: int, tmp_output: Path,
+    settings: MergeSettings, expected_duration: float,
+    progress_cb: Callable[[float], None] | None = None, cancel_event: threading.Event | None = None,
+    edit_command: Callable[[list[str]], list[str]] | None = None, **build_kwargs,
+) -> None:
+    """One encode of `segments` into `tmp_output`, in one pass or (average-bitrate modes with `two_pass`) two.
+    `build_kwargs` go to build_command (trims, mutes, windows, prefilters); `edit_command` may change the final
+    command (e.g. add metadata). The two-pass statistics files are removed afterwards."""
+    use_two_pass = (
+        settings.two_pass and settings.bitrate_mode in ("cbr", "original") and settings.encoder in TWO_PASS_ENCODERS
+    )
+    passlog_prefix = str(tmp_output.with_name(f".{tmp_output.stem}.2pass"))
+    try:
+        if use_two_pass:
+            cmd1 = build_command(ffmpeg_path, segments, episode_idx, tmp_output, settings,
+                                 pass_num=1, passlog_prefix=passlog_prefix, **build_kwargs)
+            run_merge_pass(cmd1, expected_duration, (lambda pct: progress_cb(pct * 0.5)) if progress_cb else None, cancel_event)
+            cmd = build_command(ffmpeg_path, segments, episode_idx, tmp_output, settings,
+                                pass_num=2, passlog_prefix=passlog_prefix, **build_kwargs)
+            second_pass = (lambda pct: progress_cb(0.5 + pct * 0.5)) if progress_cb else None
+        else:
+            cmd = build_command(ffmpeg_path, segments, episode_idx, tmp_output, settings, **build_kwargs)
+            second_pass = progress_cb
+        if edit_command is not None:
+            cmd = edit_command(cmd)
+        run_merge_pass(cmd, expected_duration, second_pass, cancel_event)
+    finally:
+        if use_two_pass:
+            prefix = Path(passlog_prefix).name  # a plain prefix match: file names often contain "[...]", which glob() mis-reads
+            try:
+                for entry in os.scandir(tmp_output.parent):
+                    if entry.is_file() and entry.name.startswith(prefix):
+                        try:
+                            os.unlink(entry.path)
+                        except OSError:
+                            pass
+            except OSError:
+                pass
+
+
 def merge_episode(
     ffmpeg_path: str, ffprobe_path: str,
     intro_path: Path | None, episode_path: Path, outro_path: Path | None, output_path: Path,
     settings: MergeSettings,
     progress_cb: Callable[[float], None] | None = None,
     cancel_event: threading.Event | None = None,
+    episode_interlaced: bool | None = None,
 ) -> MergeResult:
     if output_path.exists():
         return MergeResult(output_path=output_path, success=True, skipped=True)
@@ -913,6 +955,8 @@ def merge_episode(
         paths = [p for p in (intro_path, episode_path, outro_path) if p is not None]
         episode_idx = 1 if intro_path is not None else 0
         probes = [probe(ffprobe_path, p) for p in paths]
+        if episode_interlaced is not None:  # the caller looked at the picture, whatever the file's flag says
+            probes[episode_idx].interlaced = episode_interlaced
         segments = list(zip(paths, probes))
         episode = probes[episode_idx]
         expected_duration = sum(p.duration for p in probes)
