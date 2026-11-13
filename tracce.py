@@ -240,7 +240,10 @@ def build_command(ffmpeg: str, source: Path, plan: FileTracks, output: Path) -> 
     subs = [t for t in plan.subs if _sub_allowed(suffix, t.codec)]
     if len(subs) != len(plan.subs):
         notes.append(f"{len(plan.subs) - len(subs)} sottotitoli non supportati dal formato {suffix}: saltati")
-    cmd = [ffmpeg, "-y", "-hide_banner", "-loglevel", "error", "-i", str(source), "-map", "0:v?"]
+    # old containers (avi, mpg...) often have no usable timestamps on some streams: have ffmpeg generate them,
+    # or the mkv muxer refuses the copy ("unknown timestamp")
+    genpts = ["-fflags", "+genpts"] if Path(source).suffix.lower() in (".avi", ".mpg", ".mpeg", ".wmv", ".flv") else []
+    cmd = [ffmpeg, "-y", "-hide_banner", "-loglevel", "error", *genpts, "-i", str(source), "-map", "0:v?"]
     for t in plan.audio:
         cmd += ["-map", f"0:a:{t.src}"]
     for t in subs:
