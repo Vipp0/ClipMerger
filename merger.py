@@ -521,6 +521,7 @@ def _build_filter_complex(
     segments: list[ProbeResult], episode_idx: int, plans: list[AudioPlan], deinterlace: bool = True,
     deint_filter: str = "",
     trims: dict[int, tuple[float, float]] | None = None, mutes: dict[int, float] | None = None,
+    prefilters: dict[int, str] | None = None,
 ) -> tuple[str, list[str]]:
     """Returns (filter_complex_string, output_audio_labels). `segments` holds every
     clip being concatenated, in input order - sigla iniziale and sigla finale are
@@ -543,6 +544,8 @@ def _build_filter_complex(
         # The interlaced flag can't survive re-encoding, so unless it's switched off the
         # fields are merged here (one output frame per input frame, parity auto-detected).
         deint = (deint_filter or "yadif=mode=0:parity=-1:deint=0") + "," if deinterlace and seg.interlaced else ""
+        if (prefilters or {}).get(i):  # picture clean-up on the clip's own frame (e.g. blacking out side bars)
+            deint += prefilters[i] + ","
         trim = (trims or {}).get(i)
         if trim:
             deint = f"trim=start={trim[0]:.3f}:end={trim[1]:.3f},setpts=PTS-STARTPTS," + deint
@@ -636,7 +639,7 @@ def build_command(
     pass_num: int | None = None, passlog_prefix: str | None = None,
     chapters_file: Path | None = None, cover_files: list[CoverFile] = (),
     trims: dict[int, tuple[float, float]] | None = None, mutes: dict[int, float] | None = None,
-    windows: dict[int, tuple[float, float]] | None = None,
+    windows: dict[int, tuple[float, float]] | None = None, prefilters: dict[int, str] | None = None,
 ) -> list[str]:
     """`windows` (segment index -> (start, end)) reads only that stretch of a clip, by seeking in the input
     (frame-exact, because the picture is re-encoded anyway); unlike `trims` it doesn't decode everything
@@ -647,7 +650,7 @@ def build_command(
     plans = _plan_audios(ffmpeg_path, settings, episode, output_path.suffix.lower())
     filter_complex, audio_labels = _build_filter_complex(
         probes, episode_idx, plans, deinterlace=settings.deinterlace, deint_filter=settings.deint_filter,
-        trims=trims, mutes=mutes,
+        trims=trims, mutes=mutes, prefilters=prefilters,
     )
 
     cmd = [ffmpeg_path, "-y", "-hide_banner", "-loglevel", "error"]

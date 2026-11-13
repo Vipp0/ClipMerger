@@ -11,7 +11,7 @@ from pathlib import Path
 from PySide6.QtCore import QObject, QRect, QRunnable, QSize, Qt, QThread, QThreadPool, Signal
 from PySide6.QtGui import QBrush, QColor, QIcon, QPixmap
 from PySide6.QtWidgets import (
-    QAbstractItemView, QComboBox, QDialog, QFileDialog, QGridLayout, QGroupBox, QHBoxLayout, QHeaderView, QLabel,
+    QAbstractItemView, QCheckBox, QComboBox, QDialog, QFileDialog, QGridLayout, QGroupBox, QHBoxLayout, QHeaderView, QLabel,
     QLineEdit, QMessageBox, QProgressBar, QPushButton, QSpinBox, QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget,
 )
 
@@ -25,6 +25,7 @@ from utils import list_video_files
 PRESETS = [("Veloce", "fast"), ("Bilanciato", "medium"), ("Qualità", "slow")]
 CODECS = [("Come l'originale", "original"), ("H.265 (file più piccoli)", "h265")]
 DEINTERLACE = [("Automatico (solo se il video è interlacciato)", "auto"), ("Sempre", "always"), ("Mai", "never")]
+PROLOGUES = [("Unito alla prima puntata", "attach"), ("Scartato (la prima puntata parte dal bicchiere)", "drop")]
 ENDINGS = [("Pulita: finisce con la scena, senza la transizione", "clean"),
            ("Con la transizione e i titoli di coda (circa 8 secondi)", "credits")]
 COL_CHECK, COL_FILE, COL_START, COL_END, COL_DUR, COL_NUM, COL_TITLE, COL_STATUS, COL_SHOT, COL_PROGRESS = range(10)
@@ -96,11 +97,11 @@ class ProcessSignals(QObject):
 class ProcessTask(QRunnable):
     def __init__(self, row: int, ffmpeg: str, ffprobe: str, src: Path, start: float, end: float, output: Path,
                  crf: int, preset: str, codec: str, title: str, tail: tuple[float, float] | None, deinterlace: bool,
-                 signals: ProcessSignals, cancel_event: threading.Event):
+                 bars: tuple[int, int] | None, signals: ProcessSignals, cancel_event: threading.Event):
         super().__init__()
         self.row = row
         self.args = (ffmpeg, ffprobe, src, start, end, output, crf, preset, codec, title)
-        self.tail, self.deinterlace = tail, deinterlace
+        self.tail, self.deinterlace, self.bars = tail, deinterlace, bars
         self.signals, self.cancel_event = signals, cancel_event
         self.setAutoDelete(True)
 
@@ -109,7 +110,8 @@ class ProcessTask(QRunnable):
         try:
             result = dividi.cut_piece(
                 *self.args, progress_cb=lambda pct: self.signals.progress.emit(self.row, pct),
-                cancel_event=self.cancel_event, tail=self.tail, deinterlace=self.deinterlace)
+                cancel_event=self.cancel_event, tail=self.tail, deinterlace=self.deinterlace,
+                bars=self.bars)
         except Exception as exc:
             applog.log_exception("Dividi puntate", exc)
             result = merger.MergeResult(output_path=Path(), success=False, error=applog.describe_exception(exc))
@@ -277,12 +279,27 @@ class DividiTab(QWidget):
             "di ogni file e, se serve, unisce i due semiquadri con il filtro bwdif, che è nitido e non cambia "
             "i fotogrammi al secondo. Se il video non è interlacciato non viene toccato.")
         enc.addWidget(self.deint_combo, 1, 5, 1, 3)
+        enc.addWidget(QLabel("Inizio senza titolo:"), 2, 0)
+        self.prologue_combo = QComboBox()
+        for label, value in PROLOGUES:
+            self.prologue_combo.addItem(label, value)
+        self.prologue_combo.setToolTip(
+            "Ogni file comincia con una breve scenetta senza titolo (il «prologo»), prima del primo bicchiere. "
+            "Può restare attaccata alla prima puntata oppure essere scartata.")
+        self.prologue_combo.currentIndexChanged.connect(self._apply_prologue_choice)
+        enc.addWidget(self.prologue_combo, 2, 1, 1, 3)
+        self.bars_check = QCheckBox("Rendi neri i bordi verdi ai lati")
+        self.bars_check.setChecked(True)
+        self.bars_check.setToolTip(
+            "In alcuni sketch (es. «Foto a sorpresa», «Il look») le bande ai lati dell'immagine sono verdi nel file "
+            "originale invece che nere. Con questa casella diventano nere, senza toccare l'immagine.")
+        enc.addWidget(self.bars_check, 2, 4, 1, 4)
         note = QLabel(
             "Ogni pezzo viene ricodificato una sola volta (il taglio è preciso al fotogramma), con codifica software, "
             "nello stesso formato del file. Il bitrate non supera mai quello dell'originale; l'audio resta com'è "
             "(stesso codec e tracce). Con «Bilanciata» i pezzi escono più piccoli dell'originale.")
         note.setWordWrap(True)
-        enc.addWidget(note, 2, 0, 1, 8)
+        enc.addWidget(note, 3, 0, 1, 8)
         enc.setColumnStretch(1, 1)
         enc_box = QGroupBox("Codifica")
         enc_box.setLayout(enc)
@@ -393,7 +410,8 @@ class DividiTab(QWidget):
         self.start_btn.setEnabled(self.state == "processing" or (idle and any(p is not None for _, p, _ in self.entries)))
         for w in (self.folder_edit, self.output_edit, self.profile_combo, self.series_spin, self.season_spin, self.key_edit,
                   self.list_btn, self.quality_combo, self.preset_combo, self.codec_combo, self.ending_combo,
-                  self.deint_combo, self.style_combo, self.name_edit, self.parallel_spin):
+                  self.deint_combo, self.prologue_combo, self.bars_check, self.style_combo, self.name_edit,
+                  self.parallel_spin):
             w.setEnabled(idle)
         self.table.setEditTriggers(
             (QAbstractItemView.DoubleClicked | QAbstractItemView.EditKeyPressed) if idle else QAbstractItemView.NoEditTriggers)
@@ -544,6 +562,7 @@ class DividiTab(QWidget):
         for path, piece, error in self.entries:
             self._add_row(path, piece, error)
         self._filling = False
+        self._apply_prologue_choice()
         sure = sum(1 for _, p, _ in self.entries if p is not None and p.sure)
         total = sum(1 for _, p, _ in self.entries if p is not None)
         self.progress.setValue(100)
@@ -605,7 +624,7 @@ class DividiTab(QWidget):
     @staticmethod
     def _status_text(piece: dividi.Piece) -> str:
         if piece.sure:
-            return "Sicura"
+            return "Sicura" + (" (bordi verdi)" if piece.bars else "")
         reasons = []
         if piece.ambiguous:
             reasons.append("stesso titolo con più numeri in TMDB")
@@ -695,6 +714,18 @@ class DividiTab(QWidget):
         layout.addWidget(label)
         dialog.exec()
 
+    def _apply_prologue_choice(self):
+        """The first piece of each file starts either with the untitled opening bit or at its own cup."""
+        drop = self.prologue_combo.currentData() == "drop"
+        self._filling = True
+        for row, (_, piece, _) in enumerate(self.entries):
+            if piece is None or piece.prologue_start is None:
+                continue
+            piece.start = piece.cup_cut if drop else piece.prologue_start
+            self.table.item(row, COL_START).setText(fmt_time(piece.start))
+            self.table.item(row, COL_DUR).setText(fmt_time(piece.duration))
+        self._filling = False
+
     # ------------------------------------------------------------------ processing
     def _on_start_clicked(self):
         if self.state == "processing":
@@ -741,7 +772,8 @@ class DividiTab(QWidget):
             "Dividi puntate",
             f"qualità {self.quality_combo.currentText()}, preset {self.preset_combo.currentData()}, "
             f"codec {self.codec_combo.currentData()}, fine {self.ending_combo.currentData()}, "
-            f"deinterlaccia {self.deint_combo.currentData()}, cartella di output {output_dir}",
+            f"deinterlaccia {self.deint_combo.currentData()}, prologo {self.prologue_combo.currentData()}, "
+            f"bordi verdi {'neri' if self.bars_check.isChecked() else 'lasciati'}, cartella di output {output_dir}",
             len(rows), self.parallel_spin.value())
         self.cancel_event = threading.Event()
         self.pool.setMaxThreadCount(self.parallel_spin.value())
@@ -763,6 +795,7 @@ class DividiTab(QWidget):
                 self.quality_combo.currentData(), self.preset_combo.currentData(), self.codec_combo.currentData(),
                 names[row], piece.tail if self.ending_combo.currentData() == "credits" else None,
                 mode == "always" or (mode == "auto" and piece.interlaced),
+                piece.bars if self.bars_check.isChecked() else None,
                 self.signals, self.cancel_event))
 
     def _cancel_processing(self):

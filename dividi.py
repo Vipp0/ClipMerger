@@ -83,6 +83,8 @@ class Piece:
     score: float = 0.0
     ambiguous: bool = False
     interlaced: bool = False  # the picture of its file is interlaced (old TV material)
+    bars: tuple[int, int] | None = None  # green side bars: black out columns < first and >= second
+    prologue_start: float | None = None  # first piece of a file: where its short untitled opening bit begins
     tail: tuple[float, float] | None = None  # the file's own ending (TV switching off + closing credits): (start, end)
 
     @property
@@ -242,6 +244,29 @@ def deint_filter(ffmpeg: str) -> str:
     return "bwdif=mode=send_frame:parity=auto:deint=all" if _has_filter(ffmpeg, "bwdif") else ""
 
 
+def detect_bars(ffmpeg: str, path: Path, start: float, end: float, width: int) -> tuple[int, int] | None:
+    """Some sketches have dark green bars on the sides of the picture where the others have black ones (it is in the
+    source). Looks at four frames of the stretch for columns that are pure green; returns where to black out
+    (columns before the first / from the second value on), or None when the bars are black as they should be."""
+    length = end - start - 6.0
+    if length < 4 or width < 64:
+        return None
+    proc = subprocess.run(
+        [ffmpeg, "-v", "error", "-nostdin", "-ss", f"{start + 3.0:.2f}", "-t", f"{length:.2f}", "-i", str(path), "-an", "-sn",
+         "-vf", f"fps={4 / length:.5f},scale={width}:6:flags=area,format=rgb24", "-frames:v", "4", "-f", "rawvideo", "-"],
+        capture_output=True, creationflags=CREATE_NO_WINDOW)
+    n = len(proc.stdout) // (width * 6 * 3)
+    if n < 2:
+        return None
+    cols = np.frombuffer(proc.stdout[: n * width * 6 * 3], dtype=np.uint8).reshape(n, 6, width, 3).astype(int).mean(axis=(0, 1))
+    green = (cols[:, 0] < 8) & (cols[:, 1] > 40) & (cols[:, 2] > 15)
+    left = [x for x in np.where(green)[0] if x < width * 0.25]
+    right = [x for x in np.where(green)[0] if x > width * 0.75]
+    if len(left) < 4 or len(right) < 4:
+        return None
+    return int(max(left)) + 3, int(min(right)) - 2
+
+
 def _snap(ffmpeg: str, path: Path, t: float, radius: float) -> float:
     cut = scene_cut_near(ffmpeg, path, t, radius)
     return round(cut, 3) if cut is not None else t
@@ -369,9 +394,12 @@ def analizza_file(ffmpeg: str, ffprobe: str, path: Path, profile: Profile, sampl
     for i, (cut, ok, seen) in enumerate(cuts):
         end = starts[i + 1] if i + 1 < len(starts) else end_of_file
         res.pieces.append(Piece(start=starts[i], end=end, cup_cut=cut, cup_found=seen, snapped=ok,
+                                prologue_start=starts[i] if i == 0 and starts[i] < cut - 1.0 else None,
                                 interlaced=res.interlaced,
                                 tail=(res.tail_start, res.duration) if res.tail_start else None))
 
+    for piece in res.pieces:
+        piece.bars = detect_bars(ffmpeg, path, piece.start, piece.end, info.width)
     if progress:
         progress(0.9, f"{path.name}: leggo i titoli")
     read_titles(ffmpeg, path, res.pieces, first_no, profile, work, catalogue, used, cancelled)
@@ -416,7 +444,8 @@ QUALITY_LEVELS = [("Alta", 18), ("Bilanciata (consigliata)", 20), ("Compatta", 2
 
 def cut_piece(ffmpeg: str, ffprobe: str, src: Path, start: float, end: float, output: Path, crf: int, preset: str,
               codec: str, title: str = "", progress_cb=None, cancel_event=None,
-              tail: tuple[float, float] | None = None, deinterlace: bool = False) -> merger.MergeResult:
+              tail: tuple[float, float] | None = None, deinterlace: bool = False,
+              bars: tuple[int, int] | None = None) -> merger.MergeResult:
     """One piece: [start, end) of `src`, re-encoded once, in the same container, never above the source's video
     bitrate. The audio keeps its codec and track layout. `deinterlace` merges the fields (one frame per frame pair,
     sharp bwdif filter); whether to do it is the caller's decision. With `tail` = (start, end) of the same file, that stretch
@@ -440,7 +469,11 @@ def cut_piece(ffmpeg: str, ffprobe: str, src: Path, start: float, end: float, ou
         windows = {0: (start, end - 0.01)}
         if tail:
             windows[1] = tail
-        cmd = merger.build_command(ffmpeg, segments, 0, output, settings, windows=windows)
+        prefilters = None
+        if bars:  # black out the green side bars of the piece (not of the ending taken from elsewhere in the file)
+            prefilters = {0: f"drawbox=x=0:y=0:w={bars[0]}:h=ih:color=black:t=fill,"
+                             f"drawbox=x={bars[1]}:y=0:w=iw-{bars[1]}:h=ih:color=black:t=fill"}
+        cmd = merger.build_command(ffmpeg, segments, 0, output, settings, windows=windows, prefilters=prefilters)
         if title:
             at = len(cmd) - 1 - cmd[::-1].index("-progress")
             cmd[at:at] = ["-metadata", f"title={title}"]
