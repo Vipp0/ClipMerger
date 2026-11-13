@@ -12,6 +12,7 @@ from PySide6.QtWidgets import (
 
 import libreria
 import utils
+from style import PageHeader
 from dropwidgets import PathDropTable, dropped_paths, video_files
 
 COL_CHECK, COL_NAME, COL_DUR, COL_VIDEO, COL_AUDIO, COL_SUBS, COL_SIZE, COL_STATE = range(8)
@@ -69,15 +70,14 @@ class LibraryPage(QWidget):
         root = QVBoxLayout(self)
         root.setSpacing(10)
 
-        head = QHBoxLayout()
-        title = QLabel("<b style='font-size:16px'>Libreria</b>")
-        head.addWidget(title)
-        head.addStretch(1)
-        for text, slot in (("Importa cartella...", self._import_folder), ("Importa file...", self._import_files)):
+        head = PageHeader("Libreria", "I video con cui lavorano tutti gli strumenti: importali una volta sola.")
+        for text, slot, secondary in (("Importa file...", self._import_files, True), ("Importa cartella...", self._import_folder, False)):
             btn = QPushButton(text)
+            if secondary:
+                btn.setObjectName("secondary")
             btn.clicked.connect(slot)
-            head.addWidget(btn)
-        root.addLayout(head)
+            head.add_action(btn)
+        root.addWidget(head)
 
         self.zone = DropZone("Trascina qui cartelle o file video: restano in libreria e tutti gli strumenti li usano")
         self.zone.paths_dropped.connect(self.import_paths)

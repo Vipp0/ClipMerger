@@ -14,7 +14,7 @@ import urllib.request
 from collections import Counter
 from pathlib import Path
 
-from PySide6.QtCore import Qt, QObject, Signal, QRunnable, QThreadPool, QThread, QSettings, QUrl, QTimer
+from PySide6.QtCore import Qt, QObject, Signal, QRunnable, QThreadPool, QThread, QSettings, QUrl, QTimer, QSize
 from PySide6.QtGui import QDesktopServices, QDragEnterEvent, QDropEvent, QGuiApplication
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QGridLayout,
@@ -37,14 +37,16 @@ from tab_tracce import TracceTab
 from fine_coda import CountdownDialog
 from dropwidgets import PathDropEdit
 from encoding_panel import EncodingPanel
+import style
 from coda import QueueManager
 from libreria import Library
+from style import PageHeader
 from tab_coda import QueueBar, QueuePage
 from tab_libreria import LibraryPage
 
 APP_TITLE = "ClipMerger"
 AT_END_SECONDS = 10  # countdown before closing the program when the queue is done
-APP_VERSION = "0.11.0"
+APP_VERSION = "0.12.0"
 GITHUB_LATEST_RELEASE_API = "https://api.github.com/repos/Vipp0/ClipMerger/releases/latest"
 GITHUB_RELEASES_PAGE = "https://github.com/Vipp0/ClipMerger/releases/latest"
 
@@ -57,7 +59,7 @@ CODEC_LABELS = [("H.264", "h264"), ("H.265 (HEVC)", "h265"), ("AV1", "av1")]
 
 # Theme cycle button: order, monochrome (non-emoji) glyph and tooltip per choice.
 THEME_CYCLE = ["auto", "light", "dark"]
-THEME_GLYPHS = {"light": "☼", "dark": "☾", "auto": "◐"}
+THEME_ICONS = {"light": "sole", "dark": "luna", "auto": "auto"}
 THEME_TOOLTIPS = {
     "light": "Tema: Chiaro (clic per cambiare)",
     "dark": "Tema: Scuro (clic per cambiare)",
@@ -65,104 +67,6 @@ THEME_TOOLTIPS = {
 }
 
 COL_NAME, COL_STATUS, COL_PROGRESS = range(3)
-
-THEMES = {
-    "dark": dict(
-        bg="#1e1f24", panel="#24252b", border="#33343c", input_bg="#2a2b32",
-        input_border="#3a3b44", text="#e8e8ec", muted="#9fa3ad",
-        accent="#3a6df0", accent_hover="#4f7ef5", accent_text="#ffffff",
-        disabled_bg="#34353d", disabled_text="#7a7c85",
-        danger="#c0392b", danger_hover="#d8483a",
-        header_bg="#2a2b32", selection_bg="#3a6df0", selection_text="#ffffff",
-    ),
-    "light": dict(
-        bg="#f3f4f6", panel="#ffffff", border="#d7d9de", input_bg="#ffffff",
-        input_border="#c7c9d1", text="#1c1d21", muted="#5b5e66",
-        accent="#3a6df0", accent_hover="#588bf5", accent_text="#ffffff",
-        disabled_bg="#e4e5e9", disabled_text="#9a9ca3",
-        danger="#c0392b", danger_hover="#d8483a",
-        header_bg="#eef0f3", selection_bg="#3a6df0", selection_text="#ffffff",
-    ),
-}
-
-
-def build_stylesheet(theme: str) -> str:
-    c = THEMES[theme]
-    up_icon = utils.resource_path("assets/spin_up.svg")
-    down_icon = utils.resource_path("assets/spin_down.svg")
-    return f"""
-QMainWindow, QWidget {{ background-color: {c['bg']}; color: {c['text']}; font-size: 13px; }}
-QGroupBox {{ background-color: {c['panel']}; border: 1px solid {c['border']}; border-radius: 6px; margin-top: 10px; padding-top: 10px; font-weight: 600; }}
-QGroupBox::title {{ subcontrol-origin: margin; left: 10px; padding: 0 4px; color: {c['muted']}; }}
-QLineEdit, QComboBox, QSpinBox {{ background-color: {c['input_bg']}; border: 1px solid {c['input_border']}; border-radius: 4px; padding: 5px; color: {c['text']}; }}
-QLineEdit:read-only {{ color: {c['muted']}; }}
-QComboBox::drop-down {{ border: none; width: 22px; }}
-QComboBox::down-arrow {{ image: url({down_icon}); width: 9px; height: 6px; }}
-QSpinBox {{ padding-right: 2px; }}
-QSpinBox::up-button, QSpinBox::down-button {{
-    subcontrol-origin: border; width: 16px; border: none;
-    background-color: {c['disabled_bg']};
-}}
-QSpinBox::up-button {{ subcontrol-position: top right; border-top-right-radius: 4px; margin: 1px 1px 0 0; }}
-QSpinBox::down-button {{ subcontrol-position: bottom right; border-bottom-right-radius: 4px; margin: 0 1px 1px 0; }}
-QSpinBox::up-button:hover, QSpinBox::down-button:hover {{ background-color: {c['input_border']}; }}
-QSpinBox::up-button:pressed, QSpinBox::down-button:pressed {{ background-color: {c['accent']}; }}
-QSpinBox::up-arrow {{ image: url({up_icon}); width: 9px; height: 6px; }}
-QSpinBox::down-arrow {{ image: url({down_icon}); width: 9px; height: 6px; }}
-QComboBox QAbstractItemView {{
-    background-color: {c['input_bg']}; color: {c['text']};
-    border: 1px solid {c['input_border']};
-    selection-background-color: {c['selection_bg']}; selection-color: {c['selection_text']};
-    outline: none;
-}}
-QPushButton {{ background-color: {c['accent']}; border: none; border-radius: 4px; padding: 6px 14px; color: {c['accent_text']}; font-weight: 600; }}
-QPushButton:hover {{ background-color: {c['accent_hover']}; }}
-QPushButton:disabled {{ background-color: {c['disabled_bg']}; color: {c['disabled_text']}; }}
-QPushButton#secondary {{ background-color: {c['disabled_bg']}; color: {c['text']}; }}
-QPushButton#secondary:hover {{ background-color: {c['input_border']}; }}
-QPushButton#danger {{ background-color: {c['danger']}; }}
-QPushButton#danger:hover {{ background-color: {c['danger_hover']}; }}
-QPushButton#danger:disabled {{ background-color: {c['disabled_bg']}; color: {c['disabled_text']}; }}
-QTableWidget {{ background-color: {c['panel']}; border: 1px solid {c['border']}; gridline-color: {c['border']}; color: {c['text']}; }}
-QHeaderView::section {{ background-color: {c['header_bg']}; color: {c['muted']}; border: none; padding: 6px; }}
-QProgressBar {{ border: 1px solid {c['input_border']}; border-radius: 4px; text-align: center; background-color: {c['input_bg']}; color: {c['text']}; }}
-QProgressBar::chunk {{ background-color: {c['accent']}; border-radius: 3px; }}
-QRadioButton, QCheckBox, QLabel {{ color: {c['text']}; background: transparent; }}
-QRadioButton:disabled, QCheckBox:disabled {{ color: {c['disabled_text']}; }}
-QRadioButton::indicator, QCheckBox::indicator {{ width: 14px; height: 14px; }}
-QRadioButton::indicator {{ border-radius: 8px; }}
-QCheckBox::indicator {{ border-radius: 3px; }}
-QRadioButton::indicator:unchecked, QCheckBox::indicator:unchecked {{
-    border: 1px solid {c['muted']}; background-color: {c['input_bg']};
-}}
-QRadioButton::indicator:checked, QCheckBox::indicator:checked {{
-    border: 1px solid {c['accent']}; background-color: {c['accent']};
-}}
-QRadioButton::indicator:disabled, QCheckBox::indicator:disabled {{
-    border: 1px solid {c['disabled_bg']}; background-color: {c['disabled_bg']};
-}}
-QToolTip {{ background-color: {c['panel']}; color: {c['text']}; border: 1px solid {c['border']}; }}
-QToolButton#themeToggle {{
-    background-color: {c['input_bg']}; border: 1px solid {c['input_border']};
-    border-radius: 6px; padding: 3px 8px; font-size: 14px; color: {c['text']};
-    min-width: 20px;
-}}
-QToolButton#themeToggle:hover {{ background-color: {c['disabled_bg']}; }}
-QToolButton#themeToggle:pressed {{ background-color: {c['input_border']}; }}
-QWidget#sidebar {{ background-color: {c['panel']}; border-right: 1px solid {c['border']}; }}
-QListWidget#nav {{ background: transparent; border: none; outline: none; font-size: 14px; }}
-QListWidget#nav::item {{ padding: 8px 10px; border-radius: 6px; margin: 1px 4px; }}
-QListWidget#nav::item:selected {{ background-color: {c['accent']}; color: {c['accent_text']}; }}
-QListWidget#nav::item:hover:!selected {{ background-color: {c['header_bg']}; }}
-QLabel#dropZone {{ border: 1px dashed {c['muted']}; border-radius: 8px; color: {c['muted']}; padding: 10px; background: transparent; }}
-QFrame#banner {{ background-color: {c['panel']}; border: 1px solid {c['accent']}; border-radius: 6px; }}
-QFrame#banner QWidget {{ background: transparent; }}
-QFrame#queueBar {{ background-color: {c['panel']}; border-top: 1px solid {c['border']}; }}
-QTreeWidget {{ background-color: {c['panel']}; border: 1px solid {c['border']}; color: {c['text']}; }}
-QFrame#banner QPushButton {{ background-color: {c['disabled_bg']}; color: {c['text']}; }}
-QLabel#sideTitle {{ font-size: 16px; font-weight: 600; }}
-"""
-
 
 class DropTableWidget(QTableWidget):
     """Video queue table; accepts a dropped folder or a set of video files."""
@@ -535,7 +439,8 @@ class MainWindow(QMainWindow):
     def _apply_theme(self, theme: str):
         self.theme = theme
         app = QApplication.instance()
-        app.setStyleSheet(build_stylesheet(theme))
+        app.setStyleSheet(style.build_stylesheet(theme))
+        self._refresh_icons()
 
     def _on_theme_choice_changed(self, choice: str):
         self.theme_choice = choice
@@ -548,7 +453,9 @@ class MainWindow(QMainWindow):
         self._on_theme_choice_changed(next_choice)
 
     def _refresh_theme_toggle(self):
-        self.theme_toggle_btn.setText(THEME_GLYPHS[self.theme_choice])
+        colors = style.THEMES[getattr(self, "theme", None) or self._resolve_theme(self.theme_choice)]
+        self.theme_toggle_btn.setIcon(style.icon(THEME_ICONS[self.theme_choice], colors["text"], size=18))
+        self.theme_toggle_btn.setIconSize(QSize(18, 18))
         self.theme_toggle_btn.setToolTip(THEME_TOOLTIPS[self.theme_choice])
 
     def _on_system_theme_changed(self, *_args):
@@ -713,6 +620,15 @@ class MainWindow(QMainWindow):
         self.tracce_tab = TracceTab(self)
         self.queue_page = QueuePage(self)
         self.tool_tabs = {"unisci": self, "sostituisci": self.sostituisci_tab, "dividi": self.dividi_tab, "tracce": self.tracce_tab}
+        for widget, title, subtitle in (
+                (unisci_page, "Unisci sigle", "Aggiunge una sigla iniziale e/o finale a ogni episodio."),
+                (self.sostituisci_tab, "Sostituisci sigla", "Toglie la vecchia sigla dagli episodi e ci mette quella nuova."),
+                (self.dividi_tab, "Dividi puntate", "Taglia un file lungo in tanti file, uno per puntata o per sketch."),
+                (self.tracce_tab, "Modifica tracce", "Cambia audio e sottotitoli dei video senza ricodificarli.")):
+            widget.layout().insertWidget(0, PageHeader(title, subtitle))
+        for widget in (self.library_page, unisci_page, self.sostituisci_tab, self.dividi_tab, self.tracce_tab, self.queue_page):
+            widget.layout().setContentsMargins(24, 20, 24, 16)
+            widget.layout().setSpacing(12)
         pages = [("lib", "Libreria", self.library_page), (None, "Strumenti", None),
                  ("unisci", "Unisci sigle", unisci_page), ("sostituisci", "Sostituisci sigla", self.sostituisci_tab),
                  ("dividi", "Dividi puntate", self.dividi_tab), ("tracce", "Modifica tracce", self.tracce_tab),
@@ -722,6 +638,8 @@ class MainWindow(QMainWindow):
         self.nav = QListWidget()
         self.nav.setObjectName("nav")
         self.nav.setFocusPolicy(Qt.NoFocus)
+        self.nav.setIconSize(QSize(20, 20))
+        self.nav.setSpacing(1)
         self.row_key: dict[int, str] = {}
         self.page_for_row: dict[int, int] = {}
         for key, text, widget in pages:
@@ -737,6 +655,10 @@ class MainWindow(QMainWindow):
             self.pages.addWidget(widget)
             self.row_key[row], self.page_for_row[row] = key, self.pages.indexOf(widget)
         self.key_row = {k: r for r, k in self.row_key.items()}
+        for tool in self.tool_tabs.values():  # the row numbers add nothing
+            tool.table.verticalHeader().hide()
+        self.nav_icons = {"lib": "libreria", "unisci": "unisci", "sostituisci": "sostituisci", "dividi": "dividi",
+                          "tracce": "tracce", "coda": "coda"}
 
         side = QWidget()
         side.setObjectName("sidebar")
@@ -747,6 +669,10 @@ class MainWindow(QMainWindow):
         title = QLabel("ClipMerger")
         title.setObjectName("sideTitle")
         sl.addWidget(title)
+        version = QLabel(f"versione {APP_VERSION}")
+        version.setObjectName("sideVersion")
+        sl.addWidget(version)
+        sl.addSpacing(6)
         sl.addWidget(self.nav, 1)
 
         self.update_label = QLabel("")
@@ -796,7 +722,17 @@ class MainWindow(QMainWindow):
         rl.addWidget(self.queue_bar)
         hl.addWidget(right, 1)
         self.setCentralWidget(holder)
+        self._refresh_icons()
         self.nav.setCurrentRow(0)
+
+    def _refresh_icons(self):
+        """The icons take the colours of the current theme."""
+        if not hasattr(self, "nav_icons"):
+            return
+        colors = style.THEMES[getattr(self, "theme", None) or self._resolve_theme(self.theme_choice)]
+        for row, key in self.row_key.items():
+            self.nav.item(row).setIcon(style.icon(self.nav_icons[key], colors["muted"], colors["accent_text"]))
+        self._refresh_theme_toggle()
 
     def open_library(self):
         self.nav.setCurrentRow(self.key_row["lib"])

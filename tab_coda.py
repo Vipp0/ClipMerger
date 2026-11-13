@@ -13,6 +13,7 @@ from PySide6.QtWidgets import (
 
 import coda
 import utils
+from style import PageHeader
 
 COL_JOB, COL_DETAIL, COL_STATE, COL_BAR = range(4)
 JOB_STATES = {"waiting": "In attesa", "running": "In corso", "stopped": "Fermato", "done": "Completato"}
@@ -46,17 +47,15 @@ class QueuePage(QWidget):
         root = QVBoxLayout(self)
         root.setSpacing(10)
 
-        head = QHBoxLayout()
-        head.addWidget(QLabel("<b style='font-size:16px'>Coda</b>"))
-        head.addStretch(1)
-        self.start_btn = QPushButton("Avvia la coda")
-        self.start_btn.clicked.connect(self._start_stop)
-        head.addWidget(self.start_btn)
+        head = PageHeader("Coda", "I lavori in fila e il loro avanzamento.")
         self.clear_btn = QPushButton("Togli i completati")
         self.clear_btn.setObjectName("secondary")
         self.clear_btn.clicked.connect(self.q.clear_finished)
-        head.addWidget(self.clear_btn)
-        root.addLayout(head)
+        head.add_action(self.clear_btn)
+        self.start_btn = QPushButton("Avvia la coda")
+        self.start_btn.clicked.connect(self._start_stop)
+        head.add_action(self.start_btn)
+        root.addWidget(head)
 
         self.summary = QLabel("")
         root.addWidget(self.summary)
