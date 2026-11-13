@@ -17,6 +17,7 @@ import sys
 import tempfile
 import time
 from dataclasses import dataclass, field
+from functools import lru_cache
 from pathlib import Path
 
 import numpy as np
@@ -58,12 +59,13 @@ class Profile:
     caption_from: float = 6.0   # the on-screen title appears this long after the cut ...
     caption_len: float = 8.0    # ... and is looked for during this long
     series_id: int | None = None
+    series_name: str = ""
     credits: bool = True        # the file ends with orange closing credits to leave out
 
 
 PROFILES = {
     "camera_cafe": Profile("camera_cafe", "Sketch senza sigle (Camera Café)", "camera_cafe.npz", 0.30,
-                           series_id=63809),
+                           series_id=63809, series_name="Camera Café"),
 }
 
 
@@ -80,6 +82,7 @@ class Piece:
     title: str = ""
     score: float = 0.0
     ambiguous: bool = False
+    interlaced: bool = False  # the picture of its file is interlaced (old TV material)
     tail: tuple[float, float] | None = None  # the file's own ending (TV switching off + closing credits): (start, end)
 
     @property
@@ -97,6 +100,8 @@ class FileAnalysis:
     duration: float = 0.0
     opening_end: float = 0.0
     credits_start: float | None = None
+    interlaced: bool = False
+    interlace_note: str = ""  # how it was found out, for the tooltip
     tail_start: float | None = None  # where the ending begins (the "TV switching off" effect, else the credits)
     pieces: list[Piece] = field(default_factory=list)
     error: str | None = None
@@ -198,6 +203,45 @@ def scene_cut_near(ffmpeg: str, path: Path, t: float, radius: float = SNAP_RADIU
     return max(cuts, key=lambda c: c[1])[0] if cuts else None
 
 
+_IDET_RE = re.compile(r"Multi frame detection:\s*TFF:\s*(\d+)\s*BFF:\s*(\d+)\s*Progressive:\s*(\d+)")
+
+
+def detect_interlaced(ffmpeg: str, path: Path, flagged: bool, duration: float) -> tuple[bool, str]:
+    """Is the picture interlaced? Old TV material often is without saying so in the file, so besides the
+    file's own flag a minute of picture from the first third is looked at (ffmpeg's idet filter)."""
+    if flagged:
+        return True, "il file lo dichiara interlacciato"
+    start = max(duration * 0.3 - 30.0, 0.0)
+    proc = subprocess.run(
+        [ffmpeg, "-hide_banner", "-nostdin", "-ss", f"{start:.1f}", "-t", "60", "-i", str(path), "-an", "-sn",
+         "-vf", "idet", "-f", "null", "-"],
+        capture_output=True, text=True, encoding="utf-8", errors="replace", creationflags=CREATE_NO_WINDOW)
+    found = _IDET_RE.findall(proc.stderr)
+    if not found:
+        return False, "non verificabile"
+    tff, bff, prog = (int(x) for x in found[-1])
+    total = tff + bff + prog
+    if total == 0:
+        return False, "non verificabile"
+    share = (tff + bff) / total
+    return share >= 0.5, f"{share * 100:.0f}% dei fotogrammi analizzati risulta interlacciato"
+
+
+@lru_cache(maxsize=4)
+def _has_filter(ffmpeg: str, name: str) -> bool:
+    try:
+        out = subprocess.run([ffmpeg, "-hide_banner", "-filters"], capture_output=True, text=True, encoding="utf-8",
+                             errors="replace", timeout=15, creationflags=CREATE_NO_WINDOW).stdout
+    except (subprocess.SubprocessError, OSError):
+        return False
+    return any(len(parts) > 1 and parts[1] == name for parts in (line.split() for line in out.splitlines()))
+
+
+def deint_filter(ffmpeg: str) -> str:
+    """The deinterlacer: bwdif (sharper than yadif, one frame per frame, no frame-rate change) when ffmpeg has it."""
+    return "bwdif=mode=send_frame:parity=auto:deint=all" if _has_filter(ffmpeg, "bwdif") else ""
+
+
 def _snap(ffmpeg: str, path: Path, t: float, radius: float) -> float:
     cut = scene_cut_near(ffmpeg, path, t, radius)
     return round(cut, 3) if cut is not None else t
@@ -289,6 +333,7 @@ def analizza_file(ffmpeg: str, ffprobe: str, path: Path, profile: Profile, sampl
     res = FileAnalysis(path)
     info = merger.probe(ffprobe, path)
     res.duration = info.duration
+    res.interlaced, res.interlace_note = detect_interlaced(ffmpeg, path, info.interlaced, info.duration)
     if progress:
         progress(0.0, f"{path.name}: cerco i bicchieri")
     cups = find_cups(ffmpeg, path, sample, res.duration,
@@ -324,6 +369,7 @@ def analizza_file(ffmpeg: str, ffprobe: str, path: Path, profile: Profile, sampl
     for i, (cut, ok, seen) in enumerate(cuts):
         end = starts[i + 1] if i + 1 < len(starts) else end_of_file
         res.pieces.append(Piece(start=starts[i], end=end, cup_cut=cut, cup_found=seen, snapped=ok,
+                                interlaced=res.interlaced,
                                 tail=(res.tail_start, res.duration) if res.tail_start else None))
 
     if progress:
@@ -370,12 +416,14 @@ QUALITY_LEVELS = [("Alta", 18), ("Bilanciata (consigliata)", 20), ("Compatta", 2
 
 def cut_piece(ffmpeg: str, ffprobe: str, src: Path, start: float, end: float, output: Path, crf: int, preset: str,
               codec: str, title: str = "", progress_cb=None, cancel_event=None,
-              tail: tuple[float, float] | None = None) -> merger.MergeResult:
+              tail: tuple[float, float] | None = None, deinterlace: bool = False) -> merger.MergeResult:
     """One piece: [start, end) of `src`, re-encoded once, in the same container, never above the source's video
-    bitrate. The audio keeps its codec and track layout. With `tail` = (start, end) of the same file, that stretch
+    bitrate. The audio keeps its codec and track layout. `deinterlace` merges the fields (one frame per frame pair,
+    sharp bwdif filter); whether to do it is the caller's decision. With `tail` = (start, end) of the same file, that stretch
     (the file's own ending) is joined after the piece, in the same single encode."""
     try:
         info = merger.probe(ffprobe, src)
+        info.interlaced = deinterlace  # the caller decides, whatever the file's own flag says
         use = codec if codec != "original" else (merger.app_codec_for(info.video_codec) or "h264")
         suffix, changed = merger.pick_container(src.suffix, use)
         output = output.with_suffix(suffix)
@@ -386,7 +434,7 @@ def cut_piece(ffmpeg: str, ffprobe: str, src: Path, start: float, end: float, ou
         settings = merger.MergeSettings(
             codec=use, encoder=utils.CODEC_ENCODERS[use][0], is_hardware=False, preset=preset,
             bitrate_mode="crf", crf=crf + (-1 if use == "h265" else 0), audio_mode="original",
-            max_kbps=cap if use in ("h264", "h265") else 0,
+            max_kbps=cap if use in ("h264", "h265") else 0, deinterlace=True, deint_filter=deint_filter(ffmpeg),
         )
         segments = [(src, info)] + ([(src, info)] if tail else [])
         windows = {0: (start, end - 0.01)}

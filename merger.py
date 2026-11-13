@@ -126,6 +126,7 @@ class MergeSettings:
     deinterlace: bool = True  # deinterlace sources flagged as interlaced (the flag can't survive re-encoding)
     keep_10bit: bool = True  # keep 10-bit sources 10-bit (software H.265/AV1 only)
     max_kbps: int = 0  # >0: in CRF mode, never go above this video bitrate (x264/x265 only: -maxrate)
+    deint_filter: str = ""  # the ffmpeg deinterlacing filter to use ("" = the default yadif)
 
 
 @dataclass
@@ -518,6 +519,7 @@ def _plan_audios(ffmpeg_path: str, settings: MergeSettings, episode: ProbeResult
 
 def _build_filter_complex(
     segments: list[ProbeResult], episode_idx: int, plans: list[AudioPlan], deinterlace: bool = True,
+    deint_filter: str = "",
     trims: dict[int, tuple[float, float]] | None = None, mutes: dict[int, float] | None = None,
 ) -> tuple[str, list[str]]:
     """Returns (filter_complex_string, output_audio_labels). `segments` holds every
@@ -540,7 +542,7 @@ def _build_filter_complex(
     for i, seg in enumerate(segments):
         # The interlaced flag can't survive re-encoding, so unless it's switched off the
         # fields are merged here (one output frame per input frame, parity auto-detected).
-        deint = "yadif=mode=0:parity=-1:deint=0," if deinterlace and seg.interlaced else ""
+        deint = (deint_filter or "yadif=mode=0:parity=-1:deint=0") + "," if deinterlace and seg.interlaced else ""
         trim = (trims or {}).get(i)
         if trim:
             deint = f"trim=start={trim[0]:.3f}:end={trim[1]:.3f},setpts=PTS-STARTPTS," + deint
@@ -644,7 +646,8 @@ def build_command(
     episode = probes[episode_idx]
     plans = _plan_audios(ffmpeg_path, settings, episode, output_path.suffix.lower())
     filter_complex, audio_labels = _build_filter_complex(
-        probes, episode_idx, plans, deinterlace=settings.deinterlace, trims=trims, mutes=mutes,
+        probes, episode_idx, plans, deinterlace=settings.deinterlace, deint_filter=settings.deint_filter,
+        trims=trims, mutes=mutes,
     )
 
     cmd = [ffmpeg_path, "-y", "-hide_banner", "-loglevel", "error"]

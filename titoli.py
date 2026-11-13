@@ -64,6 +64,18 @@ def cached_season(series_id: int, season: int) -> list[Episodio] | None:
         return None
 
 
+def cached_series_name(series_id: int) -> str:
+    """The series' name saved with any of its downloaded seasons ("" when none has it)."""
+    for f in sorted(cache_dir().glob(f"serie_{series_id}_stagione_*.json")):
+        try:
+            name = str(json.loads(f.read_text(encoding="utf-8")).get("nome") or "").strip()
+        except (OSError, ValueError):
+            continue
+        if name:
+            return name
+    return ""
+
+
 def download_season(series_id: int, season: int, key: str) -> list[Episodio]:
     """Downloads the list from TMDB (Italian titles) and stores the copy. Never writes the key anywhere."""
     key = key.strip()
@@ -82,13 +94,21 @@ def download_season(series_id: int, season: int, key: str) -> list[Episodio]:
         raise TitoliError(f"TMDB ha risposto con un errore ({exc.code}).") from exc
     except (urllib.error.URLError, OSError, ValueError) as exc:
         raise TitoliError("Impossibile contattare TMDB: controlla la connessione a internet.") from exc
+    series_name = ""
+    try:  # the series' own name (non-essential: the list is useful without it)
+        info_req = urllib.request.Request(f"{API}/tv/{series_id}?language=it-IT&api_key={key}",
+                                          headers={"Accept": "application/json", "User-Agent": "ClipMerger"})
+        with urllib.request.urlopen(info_req, timeout=30) as resp:
+            series_name = str(json.load(resp).get("name") or "").strip()
+    except (urllib.error.URLError, OSError, ValueError):
+        pass
     episodes = [Episodio(int(e["episode_number"]), str(e.get("name") or "").strip()) for e in data.get("episodes", [])]
     episodes = [e for e in episodes if e.title]
     if not episodes:
         raise TitoliError(f"TMDB non ha episodi per la serie {series_id}, stagione {season}.")
     _cache_file(series_id, season).write_text(
-        json.dumps({"serie": series_id, "stagione": season, "episodi": [[e.number, e.title] for e in episodes]},
-                   ensure_ascii=False), encoding="utf-8")
+        json.dumps({"serie": series_id, "nome": series_name, "stagione": season,
+                    "episodi": [[e.number, e.title] for e in episodes]}, ensure_ascii=False), encoding="utf-8")
     applog.log.info("Lista TMDB scaricata: serie %s stagione %s, %d episodi", series_id, season, len(episodes))
     return episodes
 
@@ -166,12 +186,24 @@ def find_by_title(text: str, catalogue: list[Episodio]) -> Episodio | None:
 _FORBIDDEN = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
 
 
-def file_stem(season: int, number: int | None, title: str) -> str:
-    """"1x012 Il camionista" (or just the title when there is no number)."""
-    title = re.sub(r"\s+", " ", _FORBIDDEN.sub("", title)).strip(" .")
+NAME_STYLES = [
+    ("filebot", "Serie - S01E005 - Titolo   (il formato di FileBot, Plex e Jellyfin)"),
+    ("x", "Serie - 1x005 - Titolo"),
+    ("short", "1x005 Titolo   (senza il nome della serie)"),
+]
+
+
+def file_stem(season: int, number: int | None, title: str, series: str = "", style: str = "filebot") -> str:
+    """The file name without extension: "Camera Café - S01E318 - La patente" in the default style. The episode
+    number has at least three digits, so that files sort properly in a season of hundreds of episodes."""
+    clean = lambda t: re.sub(r"\s+", " ", _FORBIDDEN.sub("", t)).strip(" .")
+    title, series = clean(title), clean(series)
     if number is None:
-        return title or "senza titolo"
-    return f"{season}x{number:03d} {title}".strip()
+        return clean(f"{series} - {title}" if series and style != "short" else title) or "senza titolo"
+    code = {"filebot": f"S{season:02d}E{number:03d}", "x": f"{season}x{number:03d}", "short": f"{season}x{number:03d}"}[style]
+    if style == "short" or not series:
+        return f"{code} {title}".strip()
+    return f"{series} - {code} - {title}".strip(" -")
 
 
 def season_from_names(names: list[str]) -> int | None:

@@ -24,6 +24,7 @@ from utils import list_video_files
 
 PRESETS = [("Veloce", "fast"), ("Bilanciato", "medium"), ("Qualità", "slow")]
 CODECS = [("Come l'originale", "original"), ("H.265 (file più piccoli)", "h265")]
+DEINTERLACE = [("Automatico (solo se il video è interlacciato)", "auto"), ("Sempre", "always"), ("Mai", "never")]
 ENDINGS = [("Pulita: finisce con la scena, senza la transizione", "clean"),
            ("Con la transizione e i titoli di coda (circa 8 secondi)", "credits")]
 COL_CHECK, COL_FILE, COL_START, COL_END, COL_DUR, COL_NUM, COL_TITLE, COL_STATUS, COL_SHOT, COL_PROGRESS = range(10)
@@ -94,12 +95,12 @@ class ProcessSignals(QObject):
 
 class ProcessTask(QRunnable):
     def __init__(self, row: int, ffmpeg: str, ffprobe: str, src: Path, start: float, end: float, output: Path,
-                 crf: int, preset: str, codec: str, title: str, tail: tuple[float, float] | None,
+                 crf: int, preset: str, codec: str, title: str, tail: tuple[float, float] | None, deinterlace: bool,
                  signals: ProcessSignals, cancel_event: threading.Event):
         super().__init__()
         self.row = row
         self.args = (ffmpeg, ffprobe, src, start, end, output, crf, preset, codec, title)
-        self.tail = tail
+        self.tail, self.deinterlace = tail, deinterlace
         self.signals, self.cancel_event = signals, cancel_event
         self.setAutoDelete(True)
 
@@ -108,7 +109,7 @@ class ProcessTask(QRunnable):
         try:
             result = dividi.cut_piece(
                 *self.args, progress_cb=lambda pct: self.signals.progress.emit(self.row, pct),
-                cancel_event=self.cancel_event, tail=self.tail)
+                cancel_event=self.cancel_event, tail=self.tail, deinterlace=self.deinterlace)
         except Exception as exc:
             applog.log_exception("Dividi puntate", exc)
             result = merger.MergeResult(output_path=Path(), success=False, error=applog.describe_exception(exc))
@@ -123,6 +124,7 @@ class DividiTab(QWidget):
         self.win = main_window
         self.files: list[Path] = []
         self.entries: list[tuple[Path, dividi.Piece | None, str]] = []  # (file, piece or None, error text)
+        self.file_notes: dict[Path, dividi.FileAnalysis] = {}
         self.catalogue: list[titoli.Episodio] = []
         self.season = 1
         self.state = "idle"  # "idle" | "analyzing" | "processing"
@@ -215,6 +217,19 @@ class DividiTab(QWidget):
         prof.addWidget(self.list_btn, 3, 3)
         self.list_label = QLabel("")
         prof.addWidget(self.list_label, 3, 4, 1, 2)
+        prof.addWidget(QLabel("Nome dei file:"), 4, 0)
+        self.style_combo = QComboBox()
+        for key, label in titoli.NAME_STYLES:
+            self.style_combo.addItem(label, key)
+        self.style_combo.setToolTip(
+            "Come si chiameranno i file. Il primo è il formato che FileBot, Plex e Jellyfin riconoscono da soli "
+            "(Serie - S01E318 - Titolo): se poi li passi da FileBot con TMDB, il nome è già quello giusto.")
+        prof.addWidget(self.style_combo, 4, 1, 1, 3)
+        prof.addWidget(QLabel("Nome della serie:"), 4, 4)
+        self.name_edit = QLineEdit()
+        self.name_edit.setPlaceholderText("come lo scrive TMDB")
+        self.name_edit.editingFinished.connect(self._save_settings)
+        prof.addWidget(self.name_edit, 4, 5)
         prof.setColumnStretch(5, 1)
         prof_box = QGroupBox("Profilo e titoli (TMDB)")
         prof_box.setLayout(prof)
@@ -251,7 +266,17 @@ class DividiTab(QWidget):
         self.ending_combo.setToolTip(
             "Il file originale finisce con l'effetto del televisore che si spegne e i titoli di coda arancioni. "
             "«Con la transizione e i titoli di coda» li mette alla fine di ogni puntata, come accade all'ultima.")
-        enc.addWidget(self.ending_combo, 1, 1, 1, 7)
+        enc.addWidget(self.ending_combo, 1, 1, 1, 3)
+        enc.addWidget(QLabel("Deinterlaccia:"), 1, 4)
+        self.deint_combo = QComboBox()
+        for label, value in DEINTERLACE:
+            self.deint_combo.addItem(label, value)
+        self.deint_combo.setToolTip(
+            "Il materiale delle vecchie trasmissioni TV è spesso interlacciato (righe pari e dispari di due istanti "
+            "diversi) anche quando il file non lo dichiara. «Automatico» lo verifica guardando un minuto di immagini "
+            "di ogni file e, se serve, unisce i due semiquadri con il filtro bwdif, che è nitido e non cambia "
+            "i fotogrammi al secondo. Se il video non è interlacciato non viene toccato.")
+        enc.addWidget(self.deint_combo, 1, 5, 1, 3)
         note = QLabel(
             "Ogni pezzo viene ricodificato una sola volta (il taglio è preciso al fotogramma), con codifica software, "
             "nello stesso formato del file. Il bitrate non supera mai quello dell'originale; l'audio resta com'è "
@@ -313,6 +338,9 @@ class DividiTab(QWidget):
         self.series_spin.setValue(int(qs.value("dividi/serie", dividi.PROFILES["camera_cafe"].series_id or 1)))
         self.season_spin.setValue(int(qs.value("dividi/stagione", 1)))
         self.key_edit.setText(str(qs.value("dividi/chiave", "")))
+        self.name_edit.setText(str(qs.value("dividi/nome_serie", "")) or self._default_series_name())
+        index = self.style_combo.findData(str(qs.value("dividi/stile", "filebot")))
+        self.style_combo.setCurrentIndex(max(index, 0))
         self._refresh_list_status()
 
     def _save_settings(self):
@@ -320,6 +348,11 @@ class DividiTab(QWidget):
         qs.setValue("dividi/serie", self.series_spin.value())
         qs.setValue("dividi/stagione", self.season_spin.value())
         qs.setValue("dividi/chiave", self.key_edit.text().strip())
+        qs.setValue("dividi/nome_serie", self.name_edit.text().strip())
+        qs.setValue("dividi/stile", self.style_combo.currentData())
+
+    def _default_series_name(self) -> str:
+        return titoli.cached_series_name(self.series_spin.value()) or self._profile().series_name
 
     def _profile(self) -> dividi.Profile:
         return dividi.PROFILES[self.profile_combo.currentData()]
@@ -360,7 +393,7 @@ class DividiTab(QWidget):
         self.start_btn.setEnabled(self.state == "processing" or (idle and any(p is not None for _, p, _ in self.entries)))
         for w in (self.folder_edit, self.output_edit, self.profile_combo, self.series_spin, self.season_spin, self.key_edit,
                   self.list_btn, self.quality_combo, self.preset_combo, self.codec_combo, self.ending_combo,
-                  self.parallel_spin):
+                  self.deint_combo, self.style_combo, self.name_edit, self.parallel_spin):
             w.setEnabled(idle)
         self.table.setEditTriggers(
             (QAbstractItemView.DoubleClicked | QAbstractItemView.EditKeyPressed) if idle else QAbstractItemView.NoEditTriggers)
@@ -433,6 +466,9 @@ class DividiTab(QWidget):
     def _after_download(self, text: str):
         self.list_btn.setEnabled(self.state == "idle")
         self._refresh_list_status()
+        name = titoli.cached_series_name(self.series_spin.value())
+        if name and text:
+            self.name_edit.setText(name)
         if text:
             self.list_label.setText(text)
 
@@ -497,6 +533,7 @@ class DividiTab(QWidget):
         self.analyze_worker = None
         self.catalogue = catalogue
         self.entries = []
+        self.file_notes = {fa.path: fa for fa in analyses}
         for fa in analyses:
             if fa.error or not fa.pieces:
                 self.entries.append((fa.path, None, fa.error or "Nessuna puntata trovata"))
@@ -510,9 +547,11 @@ class DividiTab(QWidget):
         sure = sum(1 for _, p, _ in self.entries if p is not None and p.sure)
         total = sum(1 for _, p, _ in self.entries if p is not None)
         self.progress.setValue(100)
+        n_interlaced = sum(1 for fa in analyses if fa.interlaced)
         self.info_label.setText(
             f"Puntate trovate: {total} — sicure: {sure}, da controllare: {total - sure}"
-            + (" (guarda la colonna «Titolo sullo schermo» e correggi)" if total - sure else ""))
+            + (" (guarda la colonna «Titolo sullo schermo» e correggi)" if total - sure else "")
+            + (f" — file interlacciati: {n_interlaced}" if n_interlaced else ""))
         self._set_state("idle")
         self._refresh_list_status()
 
@@ -536,7 +575,9 @@ class DividiTab(QWidget):
         check.setCheckState(Qt.Checked if piece is not None and piece.sure else Qt.Unchecked)
         self.table.setItem(row, COL_CHECK, check)
         self.table.setItem(row, COL_FILE, self._ro_item(short_name(path)))
-        self.table.item(row, COL_FILE).setToolTip(path.name)
+        fa = self.file_notes.get(path)
+        self.table.item(row, COL_FILE).setToolTip(
+            path.name + (f"\nInterlacciato: {'sì' if fa.interlaced else 'no'} ({fa.interlace_note})" if fa else ""))
         if piece is None:
             for col in range(COL_START, COL_SHOT + 1):
                 self.table.setItem(row, col, self._ro_item(""))
@@ -666,7 +707,7 @@ class DividiTab(QWidget):
         seen: dict[str, int] = {}
         for row in rows:
             piece = self.entries[row][1]
-            stem = titoli.file_stem(self.season, piece.number, piece.title)
+            stem = titoli.file_stem(self.season, piece.number, piece.title, self.name_edit.text(), self.style_combo.currentData())
             if stem == "senza titolo":
                 stem = f"{short_name(self.entries[row][0])} puntata {row + 1}"
             seen[stem.lower()] = seen.get(stem.lower(), 0) + 1
@@ -699,7 +740,8 @@ class DividiTab(QWidget):
         applog.log_batch_start(
             "Dividi puntate",
             f"qualità {self.quality_combo.currentText()}, preset {self.preset_combo.currentData()}, "
-            f"codec {self.codec_combo.currentData()}, fine {self.ending_combo.currentData()}, cartella di output {output_dir}",
+            f"codec {self.codec_combo.currentData()}, fine {self.ending_combo.currentData()}, "
+            f"deinterlaccia {self.deint_combo.currentData()}, cartella di output {output_dir}",
             len(rows), self.parallel_spin.value())
         self.cancel_event = threading.Event()
         self.pool.setMaxThreadCount(self.parallel_spin.value())
@@ -711,6 +753,7 @@ class DividiTab(QWidget):
         self.info_label.setText("")
         self.row_pct = {r: 0.0 for r in rows}
         self._set_state("processing")
+        mode = self.deint_combo.currentData()
         for row in rows:
             path, piece, _ = self.entries[row]
             self.table.item(row, COL_STATUS).setText("In coda")
@@ -719,6 +762,7 @@ class DividiTab(QWidget):
                 row, tools[0], tools[1], path, piece.start, piece.end, output_dir / (names[row] + path.suffix),
                 self.quality_combo.currentData(), self.preset_combo.currentData(), self.codec_combo.currentData(),
                 names[row], piece.tail if self.ending_combo.currentData() == "credits" else None,
+                mode == "always" or (mode == "auto" and piece.interlaced),
                 self.signals, self.cancel_event))
 
     def _cancel_processing(self):
