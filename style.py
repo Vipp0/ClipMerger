@@ -186,6 +186,8 @@ QMenu::item:disabled {{ color: {c['faint']}; }}
 QMenu::separator {{ height: 1px; background: {c['border']}; margin: 6px 8px; }}
 QToolTip {{ background-color: {c['surface']}; color: {c['text']}; border: 1px solid {c['border_strong']}; padding: 5px 8px; }}
 
+QScrollArea {{ background: transparent; border: none; }}
+QScrollArea > QWidget > QWidget {{ background: transparent; }}
 QWidget#sidebar {{ background-color: {c['surface']}; border-right: 1px solid {c['border']}; }}
 QListWidget#nav {{ background: transparent; border: none; border-radius: 0; outline: none; font-size: 14px; }}
 QListWidget#nav::item {{ padding: 9px 12px; border-radius: 8px; margin: 2px 4px; color: {c['muted']}; }}

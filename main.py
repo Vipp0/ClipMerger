@@ -21,7 +21,7 @@ from PySide6.QtWidgets import (
     QGroupBox, QLabel, QLineEdit, QPushButton, QFileDialog, QTableWidget,
     QTableWidgetItem, QProgressBar, QComboBox, QRadioButton, QButtonGroup,
     QStackedWidget, QSpinBox, QMessageBox, QCheckBox, QHeaderView, QAbstractItemView,
-    QToolButton, QMenu, QTabWidget, QDialog, QListWidget, QListWidgetItem,
+    QToolButton, QMenu, QTabWidget, QDialog, QListWidget, QListWidgetItem, QScrollArea, QFrame,
 )
 
 import applog
@@ -46,7 +46,7 @@ from tab_libreria import LibraryPage
 
 APP_TITLE = "ClipMerger"
 AT_END_SECONDS = 10  # countdown before closing the program when the queue is done
-APP_VERSION = "0.12.0"
+APP_VERSION = "0.12.1"
 GITHUB_LATEST_RELEASE_API = "https://api.github.com/repos/Vipp0/ClipMerger/releases/latest"
 GITHUB_RELEASES_PAGE = "https://github.com/Vipp0/ClipMerger/releases/latest"
 
@@ -283,6 +283,7 @@ class MainWindow(QMainWindow):
             self.restoreGeometry(saved_geometry)
         else:
             self.resize(1240, 800)
+        self.setMinimumSize(900, 560)
 
         self.ffmpeg_status = utils.check_ffmpeg()
         applog.log.info("ffmpeg: %s | ffprobe: %s", self.ffmpeg_status.ffmpeg_path, self.ffmpeg_status.ffprobe_path)
@@ -652,9 +653,20 @@ class MainWindow(QMainWindow):
                 font.setPointSizeF(font.pointSizeF() * 0.95)
                 item.setFont(font)
                 continue
-            self.pages.addWidget(widget)
-            self.row_key[row], self.page_for_row[row] = key, self.pages.indexOf(widget)
+            holder = widget
+            if key in ("unisci", "sostituisci", "dividi", "tracce"):
+                # a tool page is tall: when the window is lower than it, it scrolls instead of squeezing its fields
+                holder = QScrollArea()
+                holder.setWidgetResizable(True)
+                holder.setFrameShape(QFrame.NoFrame)
+                holder.setWidget(widget)
+            self.pages.addWidget(holder)
+            self.row_key[row], self.page_for_row[row] = key, self.pages.indexOf(holder)
         self.key_row = {k: r for r, k in self.row_key.items()}
+        for tool in self.tool_tabs.values():  # long choices must not set the minimum width of a page
+            for box in tool.findChildren(QComboBox):
+                box.setSizeAdjustPolicy(QComboBox.AdjustToMinimumContentsLengthWithIcon)
+                box.setMinimumContentsLength(12)
         for tool in self.tool_tabs.values():  # the row numbers add nothing
             tool.table.verticalHeader().hide()
         self.nav_icons = {"lib": "libreria", "unisci": "unisci", "sostituisci": "sostituisci", "dividi": "dividi",
