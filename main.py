@@ -14,7 +14,7 @@ import urllib.request
 from collections import Counter
 from pathlib import Path
 
-from PySide6.QtCore import Qt, QObject, Signal, QRunnable, QThreadPool, QThread, QSettings, QUrl
+from PySide6.QtCore import Qt, QObject, Signal, QRunnable, QThreadPool, QThread, QSettings, QUrl, QTimer
 from PySide6.QtGui import QDesktopServices, QDragEnterEvent, QDropEvent, QGuiApplication
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QGridLayout,
@@ -25,6 +25,7 @@ from PySide6.QtWidgets import (
 )
 
 import applog
+import coda
 import dropwidgets
 import encoding
 import utils
@@ -36,12 +37,14 @@ from tab_tracce import TracceTab
 from fine_coda import CountdownDialog
 from dropwidgets import PathDropEdit
 from encoding_panel import EncodingPanel
+from coda import QueueManager
 from libreria import Library
+from tab_coda import QueueBar, QueuePage
 from tab_libreria import LibraryPage
 
 APP_TITLE = "ClipMerger"
 AT_END_SECONDS = 10  # countdown before closing the program when the queue is done
-APP_VERSION = "0.10.0"
+APP_VERSION = "0.11.0"
 GITHUB_LATEST_RELEASE_API = "https://api.github.com/repos/Vipp0/ClipMerger/releases/latest"
 GITHUB_RELEASES_PAGE = "https://github.com/Vipp0/ClipMerger/releases/latest"
 
@@ -154,6 +157,8 @@ QListWidget#nav::item:hover:!selected {{ background-color: {c['header_bg']}; }}
 QLabel#dropZone {{ border: 1px dashed {c['muted']}; border-radius: 8px; color: {c['muted']}; padding: 10px; background: transparent; }}
 QFrame#banner {{ background-color: {c['panel']}; border: 1px solid {c['accent']}; border-radius: 6px; }}
 QFrame#banner QWidget {{ background: transparent; }}
+QFrame#queueBar {{ background-color: {c['panel']}; border-top: 1px solid {c['border']}; }}
+QTreeWidget {{ background-color: {c['panel']}; border: 1px solid {c['border']}; color: {c['text']}; }}
 QFrame#banner QPushButton {{ background-color: {c['disabled_bg']}; color: {c['text']}; }}
 QLabel#sideTitle {{ font-size: 16px; font-weight: 600; }}
 """
@@ -206,44 +211,6 @@ class DropTableWidget(QTableWidget):
             files = [p for p in paths if p.is_file() and p.suffix.lower() in utils.VIDEO_EXTENSIONS]
             if files:
                 self.files_dropped.emit(files)
-
-
-class MergeSignals(QObject):
-    progress = Signal(int, float)
-    status = Signal(int, str)
-    finished = Signal(int, object)
-
-
-class MergeTask(QRunnable):
-    def __init__(self, row: int, intro: Path | None, episode: Path, outro: Path | None, output: Path,
-                 settings: MergeSettings, opts: encoding.EncodingOptions, ffmpeg_path: str, ffprobe_path: str,
-                 signals: MergeSignals, cancel_event: threading.Event):
-        super().__init__()
-        self.row = row
-        self.intro, self.episode, self.outro, self.output = intro, episode, outro, output
-        self.settings, self.opts = settings, opts
-        self.ffmpeg_path, self.ffprobe_path = ffmpeg_path, ffprobe_path
-        self.signals = signals
-        self.cancel_event = cancel_event
-        self.setAutoDelete(True)
-
-    def run(self):
-        self.signals.status.emit(self.row, "In elaborazione")
-        try:
-            info = merger.probe(self.ffprobe_path, self.episode)
-            interlaced = encoding.resolve_interlaced(self.opts, self.ffmpeg_path, self.episode, info)
-            result = merger.merge_episode(
-                self.ffmpeg_path, self.ffprobe_path,
-                self.intro, self.episode, self.outro, self.output,
-                self.settings,
-                progress_cb=lambda pct: self.signals.progress.emit(self.row, pct),
-                cancel_event=self.cancel_event,
-                episode_interlaced=interlaced,
-            )
-        except Exception as exc:  # defensive: never let a worker thread crash silently
-            applog.log_exception(f"elaborazione di {self.episode.name}", exc)
-            result = MergeResult(output_path=self.output, success=False, error=applog.describe_exception(exc))
-        self.signals.finished.emit(self.row, result)
 
 
 class HwDetectWorker(QThread):
@@ -418,10 +385,6 @@ class MainWindow(QMainWindow):
         self.hw_encoders: dict[str, str | None] = {c: None for _, c in CODEC_LABELS}
         self.hw_reasons: dict[str, str] = {c: "" for _, c in CODEC_LABELS}
         self.rows: list[dict] = []  # {path, output}
-        self.pool = QThreadPool()
-        self.signals = MergeSignals()
-        self.cancel_event = threading.Event()
-        self.running = False
         self.analyzing = False  # pre-start file analysis in progress
         self.preflight_worker: PreflightWorker | None = None
         self.retired_workers: list[PreflightWorker] = []  # cancelled but possibly still finishing
@@ -436,6 +399,8 @@ class MainWindow(QMainWindow):
             self.theme_choice = "auto"
 
         self.library = Library(lambda: self.ffmpeg_status.ffprobe_path)
+        self.queue = QueueManager(self._tool_paths)
+        self.job_rows: dict[int, list[int]] = {}  # job id -> the table row of each of its units
         self.lib_sig = None  # what the Unisci tool last took from the library
         self._build_ui()
         self._wire_signals()
@@ -457,6 +422,8 @@ class MainWindow(QMainWindow):
 
         self.library.changed.connect(self._on_library_changed)
         self.library.load()
+        self.queue.load()
+        QTimer.singleShot(600, self._offer_resume)
         self.update_thread = UpdateCheckWorker()
         self.update_thread.checked.connect(self._on_update_checked)
         self.update_thread.start()
@@ -531,7 +498,11 @@ class MainWindow(QMainWindow):
         self.reset_btn.setObjectName("secondary")
         bottom.addWidget(self.reset_btn)
 
-        self.start_btn = QPushButton("Avvia")
+        self.queue_btn = QPushButton("Aggiungi alla coda")
+        self.queue_btn.setObjectName("secondary")
+        self.queue_btn.clicked.connect(self._on_queue_clicked)
+        bottom.addWidget(self.queue_btn)
+        self.start_btn = QPushButton("Avvia ora")
         bottom.addWidget(self.start_btn)
 
         root.addLayout(bottom)
@@ -554,9 +525,6 @@ class MainWindow(QMainWindow):
         self.table.delete_requested.connect(self._remove_selected_rows)
         self.start_btn.clicked.connect(self._on_start_stop_clicked)
         self.reset_btn.clicked.connect(self._reset_all)
-        self.signals.progress.connect(self._on_progress)
-        self.signals.status.connect(self._on_status)
-        self.signals.finished.connect(self._on_finished)
 
     def _resolve_theme(self, choice: str) -> str:
         if choice != "auto":
@@ -589,11 +557,11 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event):
         busy_tabs = [tab for tab in (self.sostituisci_tab, self.tracce_tab, self.dividi_tab) if tab.is_busy()]
-        if busy_tabs:
+        if self.queue.running or busy_tabs:
             reply = QMessageBox.question(
                 self, "Elaborazione in corso",
-                "Nelle schede «Sostituisci sigla» / «Modifica tracce» / «Dividi puntate» c'è un'elaborazione in corso: chiudendo il "
-                "programma verrà interrotta e i file parziali eliminati. Chiudere comunque?",
+                "C'è un'elaborazione in corso: chiudendo il programma verrà interrotta e i file parziali eliminati. "
+                "La coda resta salvata: al prossimo avvio potrai riprenderla. Chiudere comunque?",
                 QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
             )
             if reply != QMessageBox.Yes:
@@ -601,21 +569,9 @@ class MainWindow(QMainWindow):
                 return
             for tab in busy_tabs:
                 tab.shutdown()
-        if self.running:
-            reply = QMessageBox.question(
-                self, "Codifica in corso",
-                "C'è una codifica in corso: chiudendo il programma verrà interrotta e i file "
-                "parziali eliminati. Chiudere comunque?",
-                QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
-            )
-            if reply != QMessageBox.Yes:
-                event.ignore()
-                return
             # Let the running tasks stop their ffmpeg and delete their partial files
             # before the process goes away (otherwise those files are left behind).
-            self.cancel_event.set()
-            self.pool.clear()
-            self.pool.waitForDone(20000)
+            self.queue.shutdown()
         self.qsettings.setValue("window_geometry", self.saveGeometry())
         self.library.shutdown()
         for worker in [self.preflight_worker, *self.retired_workers]:
@@ -712,8 +668,8 @@ class MainWindow(QMainWindow):
     def _queue_locked(self) -> bool:
         """Replacing the queue under a running batch (or while it's being analyzed) makes
         row indices point at the wrong rows, and used to leave Stop/Reset dead for good."""
-        if self.running or self.analyzing:
-            self.summary_label.setText("Non puoi cambiare la coda mentre è in corso un'elaborazione.")
+        if self.analyzing:
+            self.summary_label.setText("Non puoi cambiare l'elenco mentre i file vengono analizzati.")
             return True
         return False
 
@@ -738,7 +694,7 @@ class MainWindow(QMainWindow):
         self.library_import([Path(folder)])
 
     def is_busy(self) -> bool:
-        return self.running or self.analyzing
+        return self.analyzing
 
     def use_library_files(self, files: list[Path]):
         """The tool's queue becomes the library's selected videos."""
@@ -755,10 +711,12 @@ class MainWindow(QMainWindow):
         self.sostituisci_tab = SostituisciTab(self)
         self.dividi_tab = DividiTab(self)
         self.tracce_tab = TracceTab(self)
+        self.queue_page = QueuePage(self)
         self.tool_tabs = {"unisci": self, "sostituisci": self.sostituisci_tab, "dividi": self.dividi_tab, "tracce": self.tracce_tab}
         pages = [("lib", "Libreria", self.library_page), (None, "Strumenti", None),
                  ("unisci", "Unisci sigle", unisci_page), ("sostituisci", "Sostituisci sigla", self.sostituisci_tab),
-                 ("dividi", "Dividi puntate", self.dividi_tab), ("tracce", "Modifica tracce", self.tracce_tab)]
+                 ("dividi", "Dividi puntate", self.dividi_tab), ("tracce", "Modifica tracce", self.tracce_tab),
+                 (None, "", None), ("coda", "Coda", self.queue_page)]
 
         self.pages = QStackedWidget()
         self.nav = QListWidget()
@@ -819,20 +777,61 @@ class MainWindow(QMainWindow):
         row.addWidget(log_btn, 1)
         sl.addLayout(row)
 
-        for tab in (self.sostituisci_tab, self.tracce_tab, self.dividi_tab):
-            tab.queue_finished.connect(self._queue_finished)
+        self.queue.changed.connect(self._on_queue_changed)
+        self.queue.unit_changed.connect(self._dispatch_unit)
+        self.queue.job_finished.connect(self._dispatch_job_finished)
+        self.queue.queue_finished.connect(lambda ok: self._queue_finished())
         self.nav.currentRowChanged.connect(self._on_nav_row)
         holder = QWidget()
         hl = QHBoxLayout(holder)
         hl.setContentsMargins(0, 0, 0, 0)
         hl.setSpacing(0)
         hl.addWidget(side)
-        hl.addWidget(self.pages, 1)
+        right = QWidget()
+        rl = QVBoxLayout(right)
+        rl.setContentsMargins(0, 0, 0, 0)
+        rl.setSpacing(0)
+        rl.addWidget(self.pages, 1)
+        self.queue_bar = QueueBar(self)
+        rl.addWidget(self.queue_bar)
+        hl.addWidget(right, 1)
         self.setCentralWidget(holder)
         self.nav.setCurrentRow(0)
 
     def open_library(self):
         self.nav.setCurrentRow(self.key_row["lib"])
+
+    def open_queue(self):
+        self.nav.setCurrentRow(self.key_row["coda"])
+
+    def _on_queue_changed(self):
+        n = len(self.queue.active_jobs)
+        self.nav.item(self.key_row["coda"]).setText(f"Coda  ({n})" if n else "Coda")
+
+    def _dispatch_unit(self, job, idx: int):
+        tool = self.tool_tabs.get(job.tool)
+        if tool is not None:
+            tool.queue_unit_changed(job, idx)
+
+    def _dispatch_job_finished(self, job):
+        tool = self.tool_tabs.get(job.tool)
+        if tool is not None:
+            tool.queue_job_finished(job)
+
+    def _offer_resume(self):
+        """At start-up: the queue of the last session was not finished. Nothing starts without asking."""
+        if not self.queue.has_unfinished() or self.queue.running:
+            return
+        jobs = [j for j in self.queue.jobs if j.pending]
+        units = sum(j.count("waiting", "running") for j in jobs)
+        reply = QMessageBox.question(
+            self, "Coda da riprendere",
+            f"L'ultima volta la coda non era finita: {len(jobs)} lavori, {units} elementi ancora da fare.\n\n"
+            "Riprenderla adesso? (Quello interrotto riparte dall'inizio del suo file.)",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes)
+        if reply == QMessageBox.Yes:
+            self.queue.start()
+        self.open_queue()
 
     def open_tool(self, key: str):
         if key in self.key_row:
@@ -847,6 +846,8 @@ class MainWindow(QMainWindow):
             return
         self.pages.setCurrentIndex(self.page_for_row[row])
         self._sync_tool(self.row_key[row])
+        if hasattr(self, "queue_bar"):
+            self.queue_bar.refresh()
 
     def _on_library_changed(self):
         n = len(self.library.items)
@@ -943,9 +944,10 @@ class MainWindow(QMainWindow):
         return sorted({idx.row() for idx in self.table.selectionModel().selectedRows()})
 
     def _remove_selected_rows(self):
-        if self.running or self.analyzing:
+        if self.analyzing:
             return
         rows = [r for r in self._selected_rows() if r < len(self.rows)]
+        self.job_rows = {}  # the rows shift: the tables of running jobs can no longer be followed
         for row in reversed(rows):  # bottom-up, so earlier indices stay valid
             self.table.removeRow(row)
             del self.rows[row]
@@ -953,7 +955,7 @@ class MainWindow(QMainWindow):
             self._scan_sources()
 
     def _show_queue_context_menu(self, pos):
-        if self.running or self.analyzing:
+        if self.analyzing:
             return
         row = self.table.rowAt(pos.y())
         if row < 0 or row >= len(self.rows):
@@ -983,7 +985,8 @@ class MainWindow(QMainWindow):
             return "Seleziona la cartella di output."
         return None
 
-    def _start_batch(self):
+    def _start_batch(self, start_now: bool = True):
+        self._start_now = start_now
         error = self._validate()
         if error:
             QMessageBox.warning(self, "Dati mancanti", error)
@@ -1028,7 +1031,7 @@ class MainWindow(QMainWindow):
             return
         self._end_preflight()
         if [item["path"] for item in self.rows] != self.preflight_paths:
-            self.summary_label.setText("L'elenco dei file è cambiato durante l'analisi: premi di nuovo Avvia.")
+            self.summary_label.setText("L'elenco dei file è cambiato durante l'analisi: riprova.")
             return
 
         output_dir = Path(self.output_edit.text()).resolve()
@@ -1047,49 +1050,27 @@ class MainWindow(QMainWindow):
             QMessageBox.Yes | QMessageBox.Cancel, QMessageBox.Yes,
         )
         if reply == QMessageBox.Yes:
-            self._launch_batch()
+            self._launch_batch(self._start_now)
 
-    def _launch_batch(self):
+    def _launch_batch(self, start_now: bool = True):
+        """The analysis is done and confirmed: the episodes go to the queue as one job."""
         opts = self.enc_panel.options()
         hw = self.enc_panel.hw_encoders
-
         output_dir = Path(self.output_edit.text())
         try:
             output_dir.mkdir(parents=True, exist_ok=True)
         except OSError as exc:
             QMessageBox.critical(self, "Errore output", f"Impossibile creare la cartella output: {exc}")
             return
-
         intro_path = Path(self.intro_edit.text()) if self.intro_edit.text() else None
         outro_path = Path(self.outro_edit.text()) if self.outro_edit.text() else None
 
-        self.cancel_event = threading.Event()
-        self.pool.setMaxThreadCount(opts.parallel)
-        self.running = True
-        self._set_controls_enabled(False)
-        self.finished_count = 0
-        self.total_count = len(self.rows)
-        self.ok_count = self.skip_count = self.err_count = 0
-        self.summary_label.setText("")
-        self.global_progress.setValue(0)
-        self.batch_start_time = time.monotonic()
-        self.row_pct = {row: 0.0 for row in range(self.total_count)}
-        self.row_start_time = {}
-        self.eta_label.setText("")
-
-        applog.log_batch_start(
-            "Unisci sigle",
-            f"codec {opts.codec}{', scheda video' if opts.use_gpu else ''}, velocità {opts.speed}, qualità {opts.quality} "
-            f"(CRF {opts.crf}, {opts.kbps} kbit/s), 2 passaggi {'sì' if opts.two_pass else 'no'}, audio {opts.audio}, "
-            f"deinterlaccia {opts.deinterlace}, sigla iniziale {'sì' if intro_path else 'no'}, finale {'sì' if outro_path else 'no'}",
-            self.total_count, opts.parallel)
-
+        units = []
         used_names: set[str] = set()
-        self.row_notes = {}
         for row, item in enumerate(self.rows):
             episode_path = item["path"]
-            row_settings, notes = encoding.build_settings(
-                opts, self.episode_sources.get(episode_path), hw, self.ffmpeg_status.ffmpeg_path)
+            info = self.episode_sources.get(episode_path)
+            row_settings, notes = encoding.build_settings(opts, info, hw, self.ffmpeg_status.ffmpeg_path)
             suffix, changed = merger.pick_container(episode_path.suffix, row_settings.codec, opts.container)
             if changed:
                 notes.append(f"salvato come {suffix}: il formato {episode_path.suffix} non supporta questo codec")
@@ -1102,58 +1083,41 @@ class MainWindow(QMainWindow):
             used_names.add(f"{stem}{suffix}".lower())
             if n > 1:
                 notes.append(f"nome già usato da un altro episodio: salvato come {stem}{suffix}")
-            self.row_notes[row] = notes
             output_path = output_dir / (stem + suffix)
             item["output"] = output_path
+            seconds = info.duration if info else 1.0
+            units.append(coda.Unit(episode_path.name, {
+                "intro": str(intro_path) if intro_path else "", "episode": str(episode_path),
+                "outro": str(outro_path) if outro_path else "", "output": str(output_path),
+                "settings": dataclasses.asdict(row_settings), "opts": opts.to_dict(), "pre_notes": notes}, weight=max(seconds, 1.0)))
+        sigle = " + ".join(x for x, p in (("sigla iniziale", intro_path), ("sigla finale", outro_path)) if p)
+        job = coda.Job("unisci", f"Unisci sigle · {len(units)} episodi", f"{sigle} · {encoding.summary(opts)}", opts.parallel,
+                       units, str(output_dir))
+        for row in range(len(units)):
             self._set_row_status(row, "In coda")
             self._set_row_progress(row, 0.0)
-            task = MergeTask(
-                row, intro_path, episode_path, outro_path, output_path,
-                row_settings, opts, self.ffmpeg_status.ffmpeg_path, self.ffmpeg_status.ffprobe_path,
-                self.signals, self.cancel_event,
-            )
-            self.pool.start(task)
+        self.queue.add_job(job, start_now)
+        self.job_rows[job.id] = list(range(len(units)))
+        self.summary_label.setText("Aggiunti alla coda: " + str(len(units)) + (" (partono subito)" if start_now and self.queue.running else ""))
+
+    def _on_queue_clicked(self):
+        self._start_batch(False)
 
     def _on_start_stop_clicked(self):
         if self.analyzing:
             self._cancel_preflight()
-        elif self.running:
-            self._cancel_batch()
         else:
-            self._start_batch()
+            self._start_batch(True)
 
     def _update_start_stop_button(self):
-        if self.running or self.analyzing:
-            self.start_btn.setText("Stop" if self.running else "Annulla")
-            self.start_btn.setObjectName("danger")
-        else:
-            self.start_btn.setText("Avvia")
-            self.start_btn.setObjectName("")
+        self.start_btn.setText("Annulla" if self.analyzing else "Avvia ora")
+        self.start_btn.setObjectName("danger" if self.analyzing else "")
         self.start_btn.style().unpolish(self.start_btn)
         self.start_btn.style().polish(self.start_btn)
 
-    def _cancel_batch(self):
-        self.cancel_event.set()
-        self.pool.clear()
-        # Tasks still queued (not yet started) are silently discarded by pool.clear()
-        # and never run, so they'd never emit `finished` - without this, finished_count
-        # never reaches total_count and every control (including Reset) stays disabled.
-        for row in range(self.total_count):
-            if row not in self.row_start_time:
-                self._set_row_status(row, "Annullato")
-                self.row_pct[row] = 1.0
-                self.finished_count += 1
-        self._update_batch_eta()
-        if self.finished_count >= self.total_count:
-            self.running = False
-            self._set_controls_enabled(True)
-            self.eta_label.setText("")
-            self.summary_label.setText(
-                f"Completati: {self.ok_count}  Saltati: {self.skip_count}  Falliti: {self.err_count}"
-            )
-
     def _set_controls_enabled(self, enabled: bool):
         self.reset_btn.setEnabled(enabled)
+        self.queue_btn.setEnabled(enabled)
         self.enc_panel.setEnabled(enabled)
         self._update_start_stop_button()
 
@@ -1164,75 +1128,38 @@ class MainWindow(QMainWindow):
         self.intro_edit.clear()
         self.outro_edit.clear()
         self.rows = []
+        self.job_rows = {}
         self.table.setRowCount(0)
         self._scan_sources()
         self.global_progress.setValue(0)
         self.summary_label.setText("")
         self.eta_label.setText("")
 
-    def _on_progress(self, row: int, pct: float):
-        self._set_row_progress(row, pct)
-        self.row_pct[row] = pct
-        start = self.row_start_time.get(row)
-        if start is not None and pct > 0.02:
-            elapsed = time.monotonic() - start
-            remaining = elapsed * (1 - pct) / pct
-            self._set_row_status(row, f"In elaborazione (~{utils.format_duration(remaining)} rimanenti)")
-        self._update_batch_eta()
-
-    def _on_status(self, row: int, status: str):
-        self._set_row_status(row, status)
-        if status == "In elaborazione":
-            self.row_start_time[row] = time.monotonic()
-
-    def _update_batch_eta(self):
-        if not self.total_count:
+    # ---------------------------------------------------------------- the queue reports back
+    def queue_unit_changed(self, job, idx: int):
+        rows = self.job_rows.get(job.id)
+        if not rows or idx >= len(rows) or rows[idx] >= self.table.rowCount():
             return
-        overall = sum(self.row_pct.values()) / self.total_count
-        self.global_progress.setValue(int(overall * 100))
-        if overall > 0.02:
-            elapsed = time.monotonic() - self.batch_start_time
-            remaining = elapsed * (1 - overall) / overall
-            self.eta_label.setText(f"Tempo rimanente stimato: {utils.format_duration(remaining)}")
+        row, u = rows[idx], job.units[idx]
+        self._set_row_progress(row, u.pct)
+        self._set_row_status(row, coda.unit_status_text(u))
 
-    def _on_finished(self, row: int, result: MergeResult):
-        applog.log_result("Unisci sigle", self.rows[row]["path"].name if row < len(self.rows) else f"riga {row}", result)
-        self.row_pct[row] = 1.0
-        if result.skipped:
-            self._set_row_status(row, "Già presente, saltato")
-            self._set_row_progress(row, 1.0)
-            self.skip_count += 1
-        elif result.success:
-            notes = [*self.row_notes.get(row, []), *([result.note] if result.note else [])]
-            self._set_row_status(row, "Completato" + (f" — {'; '.join(notes)}" if notes else ""))
-            self._set_row_progress(row, 1.0)
-            self.ok_count += 1
-        else:
-            self._set_row_status(row, f"Errore: {result.error}")
-            self.err_count += 1
-
-        self.finished_count += 1
-        self._update_batch_eta()
-
-        if self.finished_count >= self.total_count:
-            self.running = False
-            self._set_controls_enabled(True)
-            self.global_progress.setValue(100)
-            self.eta_label.setText("")
-            self.summary_label.setText(
-                f"Completati: {self.ok_count}  Saltati: {self.skip_count}  Falliti: {self.err_count}"
-            )
-            if not self.cancel_event.is_set():
-                self._queue_finished()
+    def queue_job_finished(self, job):
+        if job.id in self.job_rows:
+            self.summary_label.setText(f"Completati: {job.count('done')}  Saltati: {job.count('skipped')}  Falliti: {job.count('error')}")
 
     def _queue_finished(self):
-        """A queue ended on its own (either tab): do what the corner selector says."""
+        """The queue ran dry by itself: do what the selector in the sidebar says."""
         if self.at_end_combo.currentData() != "close":
             return
-        if self.running or self.analyzing or self.sostituisci_tab.is_busy() or self.tracce_tab.is_busy() or self.dividi_tab.is_busy():
-            return  # another queue is still going
+        if self.queue.running or self.queue.has_unfinished() or self.analyzing or self.sostituisci_tab.is_busy() or self.tracce_tab.is_busy() or self.dividi_tab.is_busy():
+            return  # something else is still going
         if CountdownDialog(self, AT_END_SECONDS).exec() == QDialog.Accepted:
             self.close()
+
+    def _tool_paths(self):
+        status = self.ffmpeg_status
+        return (status.ffmpeg_path, status.ffprobe_path) if status.ffmpeg_path and status.ffprobe_path else None
 
 
 def main():

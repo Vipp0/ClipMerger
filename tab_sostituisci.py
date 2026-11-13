@@ -16,7 +16,9 @@ from PySide6.QtWidgets import (
 )
 
 import applog
+import coda
 import dropwidgets
+import encoding
 from encoding import EncodingOptions
 from encoding_panel import EncodingPanel
 import merger
@@ -96,36 +98,6 @@ class PreviewWorker(QThread):
         except Exception as exc:
             applog.log_exception("Sostituisci sigla (anteprima)", exc)
             self.failed.emit(applog.describe_exception(exc))
-
-
-class ProcessSignals(QObject):
-    progress = Signal(int, float)
-    status = Signal(int, str)
-    finished = Signal(int, object)
-
-
-class ProcessTask(QRunnable):
-    def __init__(self, row: int, ffmpeg: str, ffprobe: str, ana: EpisodeAnalysis, new_intro, new_outro,
-                 output_dir: Path, opts: EncodingOptions, hw_encoders: dict,
-                 signals: ProcessSignals, cancel_event: threading.Event):
-        super().__init__()
-        self.row = row
-        self.args = (ffmpeg, ffprobe, ana, new_intro, new_outro, output_dir, opts, hw_encoders)
-        self.signals, self.cancel_event = signals, cancel_event
-        self.setAutoDelete(True)
-
-    def run(self):
-        self.signals.status.emit(self.row, "In elaborazione")
-        try:
-            result = sostituisci.elabora_episodio(
-                *self.args,
-                progress_cb=lambda pct: self.signals.progress.emit(self.row, pct),
-                cancel_event=self.cancel_event,
-            )
-        except Exception as exc:
-            applog.log_exception("Sostituisci sigla", exc)
-            result = merger.MergeResult(output_path=Path(), success=False, error=applog.describe_exception(exc))
-        self.signals.finished.emit(self.row, result)
 
 
 class SigleGroup(QGroupBox):
@@ -213,29 +185,18 @@ class SigleGroup(QGroupBox):
 
 
 class SostituisciTab(QWidget):
-    queue_finished = Signal()  # an Elabora run ended by itself (not stopped by the user)
-
     def __init__(self, main_window):
         super().__init__()
         self.win = main_window
         self.episodes: list[Path] = []
         self.analyses: list[EpisodeAnalysis] = []
-        self.state = "idle"  # "idle" | "analyzing" | "processing"
+        self.state = "idle"  # "idle" | "analyzing"
         self.analyze_worker: AnalyzeWorker | None = None
         self.preview_worker: PreviewWorker | None = None
         self.retired_workers: list[QThread] = []
-        self.pool = QThreadPool()
-        self.signals = ProcessSignals()
-        self.cancel_event = threading.Event()
-        self.started: set[int] = set()
-        self.finished_count = self.total_count = 0
-        self.ok_count = self.skip_count = self.err_count = 0
-        self.job_rows: list[int] = []
+        self.job_rows: dict[int, list[int]] = {}  # queue job id -> the table row of each of its elements
         self._filling = False  # True while the table is being filled by code (ignores itemChanged)
         self._build_ui()
-        self.signals.progress.connect(self._on_progress)
-        self.signals.status.connect(self._on_status)
-        self.signals.finished.connect(self._on_finished)
 
     # ------------------------------------------------------------------ UI
     def _build_ui(self):
@@ -300,7 +261,11 @@ class SostituisciTab(QWidget):
         self.preview_btn.clicked.connect(self._preview_selected)
         buttons.addWidget(self.preview_btn)
         buttons.addStretch(1)
-        self.start_btn = QPushButton("Elabora")
+        self.queue_btn = QPushButton("Aggiungi alla coda")
+        self.queue_btn.setObjectName("secondary")
+        self.queue_btn.clicked.connect(self._on_queue_clicked)
+        buttons.addWidget(self.queue_btn)
+        self.start_btn = QPushButton("Avvia ora")
         self.start_btn.clicked.connect(self._on_start_clicked)
         buttons.addWidget(self.start_btn)
         root.addLayout(buttons)
@@ -349,6 +314,7 @@ class SostituisciTab(QWidget):
             return  # the same profile was only reloaded: what was analysed is still valid
         self._last_profile_key = key
         self.analyses = []
+        self.job_rows = {}
         for row in range(self.table.rowCount()):
             self.table.item(row, COL_STATUS).setText("Da analizzare")
             for col in (COL_INTRO, COL_OUTRO, COL_CUT_IN, COL_CUT_OUT, COL_CONF):
@@ -407,9 +373,6 @@ class SostituisciTab(QWidget):
 
     def shutdown(self):
         """Stops whatever is running (called when the window closes)."""
-        self.cancel_event.set()
-        self.pool.clear()
-        self.pool.waitForDone(20000)
         for worker in [self.analyze_worker, self.preview_worker, *self.retired_workers]:
             if worker is not None and worker.isRunning():
                 worker.requestInterruption()
@@ -419,8 +382,8 @@ class SostituisciTab(QWidget):
         idle = self.state == "idle"
         self.analyze_btn.setText("Annulla" if self.state == "analyzing" else "Analizza")
         self.analyze_btn.setEnabled(idle or self.state == "analyzing")
-        self.start_btn.setText("Stop" if self.state == "processing" else "Elabora")
-        self.start_btn.setEnabled(self.state == "processing" or (idle and any(a.ready for a in self.analyses)))
+        self.start_btn.setEnabled(idle and any(a.ready for a in self.analyses))
+        self.queue_btn.setEnabled(idle and any(a.ready for a in self.analyses))
         self.preview_btn.setEnabled(idle and any(a.ready for a in self.analyses))
         for w in (self.folder_edit, self.output_edit, self.enc_panel, self.card_check, self.profile_bar):
             w.setEnabled(idle)
@@ -457,6 +420,7 @@ class SostituisciTab(QWidget):
         """The tool's episodes become the library's selected videos."""
         if self.is_busy():
             return
+        self.job_rows = {}
         self._load_video_files(files, str(files[0].parent))
         self.folder_edit.setText(f"{len(files)} file dalla libreria")
 
@@ -482,6 +446,7 @@ class SostituisciTab(QWidget):
                 group.new_edit.setText(str(found[0]))
         self.episodes = episodes
         self.analyses = []
+        self.job_rows = {}
         self.table.setRowCount(0)
         for ep in episodes:
             self._add_row(ep)
@@ -530,6 +495,7 @@ class SostituisciTab(QWidget):
         if tools is None:
             return
         self.analyses = []
+        self.job_rows = {}
         for row in range(self.table.rowCount()):
             self.table.item(row, COL_STATUS).setText("In analisi...")
             self.table.item(row, COL_CHECK).setCheckState(Qt.Unchecked)
@@ -713,120 +679,57 @@ class SostituisciTab(QWidget):
         self._refresh_buttons()
         QMessageBox.warning(self, "Anteprima non riuscita", message)
 
-    # ------------------------------------------------------------------ processing
+    # ------------------------------------------------------------------ processing: the work goes to the queue
     def _on_start_clicked(self):
-        if self.state == "processing":
-            self._cancel_processing()
-        else:
-            self._start_processing()
+        self._enqueue(True)
 
-    def _start_processing(self):
+    def _on_queue_clicked(self):
+        self._enqueue(False)
+
+    def _enqueue(self, start_now: bool):
         rows = [r for r, a in enumerate(self.analyses)
                 if a.ready and self.table.item(r, COL_CHECK).checkState() == Qt.Checked]
         if not rows:
             QMessageBox.information(self, "Niente da fare", "Seleziona almeno un episodio nella tabella (casella a sinistra).")
             return
         news = self._new_paths_ok()
-        tools = self._tools()
-        if news is None or tools is None:
+        if news is None or self._tools() is None:
             return
         output_dir = Path(self.output_edit.text()) if self.output_edit.text() else self.episodes[0].parent / "sigle sostituite"
         if any(p.resolve().parent == output_dir.resolve() for p in self.episodes):
             QMessageBox.warning(self, "Cartella di output", "La cartella di output coincide con quella degli episodi: sceglierne un'altra.")
             return
-        reply = QMessageBox.question(
-            self, "Riepilogo prima di avviare",
-            f"Episodi da elaborare: {len(rows)}\nCartella di output: {output_dir}\n\n"
-            "Ogni episodio viene ricodificato una volta sola. Procedere?",
-            QMessageBox.Yes | QMessageBox.Cancel, QMessageBox.Yes,
-        )
-        if reply != QMessageBox.Yes:
-            return
         opts = self.enc_panel.options()
-        applog.log_batch_start(
-            "Sostituisci sigla",
-            f"codec {opts.codec}, velocità {opts.speed}, qualità {opts.quality} (CRF {opts.crf}, {opts.kbps} kbit/s), "
-            f"audio {opts.audio}, deinterlaccia {opts.deinterlace}, cartella di output {output_dir}",
-            len(rows), opts.parallel)
-        self.cancel_event = threading.Event()
-        self.pool.setMaxThreadCount(opts.parallel)
-        self.started = set()
-        self.job_rows = rows
-        self.total_count, self.finished_count = len(rows), 0
-        self.ok_count = self.skip_count = self.err_count = 0
-        self.progress.setValue(0)
-        self.info_label.setText("")
-        self.row_pct = {r: 0.0 for r in rows}
-        self._set_state("processing")
+        hw = self.enc_panel.hw_encoders
+        units = []
+        for row in rows:
+            a = self.analyses[row]
+            units.append(coda.Unit(a.episode.name, {
+                "episode": str(a.episode), "plan": coda.plan_to_dict(a.plan),
+                "new_intro": str(news[0]) if news[0] else "", "new_outro": str(news[1]) if news[1] else "",
+                "output_dir": str(output_dir), "opts": opts.to_dict(), "hw": hw},
+                weight=max(a.plan.keep_end - a.plan.keep_start, 1.0)))
+        job = coda.Job("sostituisci", f"Sostituisci sigla · {len(units)} episodi",
+                       f"Profilo: {self._profile().name} · {encoding.summary(opts)}", opts.parallel, units, str(output_dir))
         for row in rows:
             self.table.item(row, COL_STATUS).setText("In coda")
             self.table.cellWidget(row, COL_PROGRESS).setValue(0)
-            self.pool.start(ProcessTask(
-                row, tools[0], tools[1], self.analyses[row], news[0], news[1], output_dir,
-                opts, self.enc_panel.hw_encoders,
-                self.signals, self.cancel_event,
-            ))
+        self.win.queue.add_job(job, start_now)
+        self.job_rows[job.id] = rows
+        self.info_label.setText(f"Aggiunti alla coda: {len(rows)}")
 
-    def _cancel_processing(self):
-        self.cancel_event.set()
-        self.pool.clear()
-        # Tasks that never started are dropped by pool.clear() without ever reporting back.
-        for row in self.job_rows:
-            if row not in self.started:
-                self.table.item(row, COL_STATUS).setText("Annullato")
-                self.row_pct[row] = 1.0
-                self.finished_count += 1
-        self._update_global()
-        self._check_all_done()
-
-    def _on_status(self, row: int, text: str):
-        if row < self.table.rowCount():
-            self.started.add(row)
-            self.table.item(row, COL_STATUS).setText(text)
-
-    def _on_progress(self, row: int, pct: float):
+    def queue_unit_changed(self, job, idx: int):
+        rows = self.job_rows.get(job.id)
+        if not rows or idx >= len(rows) or rows[idx] >= self.table.rowCount():
+            return
+        row, u = rows[idx], job.units[idx]
         bar = self.table.cellWidget(row, COL_PROGRESS)
         if bar is not None:
-            bar.setValue(int(pct * 100))
-        self.row_pct[row] = pct
+            bar.setValue(int(u.pct * 100))
         item = self.table.item(row, COL_STATUS)
         if item is not None:
-            item.setText(f"In elaborazione {int(pct * 100)}%")
-        self._update_global()
+            item.setText(coda.unit_status_text(u))
 
-    def _update_global(self):
-        if self.total_count:
-            self.progress.setValue(int(sum(self.row_pct.values()) * 100 / self.total_count))
-
-    def _on_finished(self, row: int, result):
-        name_item = self.table.item(row, COL_NAME)
-        applog.log_result("Sostituisci sigla", name_item.text() if name_item else f"riga {row}", result)
-        self.finished_count += 1
-        self.row_pct[row] = 1.0
-        bar = self.table.cellWidget(row, COL_PROGRESS)
-        if bar is not None:
-            bar.setValue(100)
-        if result.skipped:
-            self.skip_count += 1
-            text = "Saltato (già presente)"
-        elif result.success:
-            self.ok_count += 1
-            text = "Completato" + (f" — {result.note}" if result.note else "")
-        elif result.error == "Annullato":
-            text = "Annullato"
-        else:
-            self.err_count += 1
-            text = f"Errore: {result.error}"
-        item = self.table.item(row, COL_STATUS)
-        if item is not None:
-            item.setText(text)
-        self._update_global()
-        self._check_all_done()
-
-    def _check_all_done(self):
-        if self.finished_count >= self.total_count:
-            self._set_state("idle")
-            self.info_label.setText(
-                f"Completati: {self.ok_count}  Saltati: {self.skip_count}  Falliti: {self.err_count}")
-            if not self.cancel_event.is_set():
-                self.queue_finished.emit()
+    def queue_job_finished(self, job):
+        if job.id in self.job_rows:
+            self.info_label.setText(f"Completati: {job.count('done')}  Saltati: {job.count('skipped')}  Falliti: {job.count('error')}")

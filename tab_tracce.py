@@ -16,6 +16,7 @@ from PySide6.QtWidgets import (
 )
 
 import applog
+import coda
 import dropwidgets
 import merger
 import tracce
@@ -44,32 +45,6 @@ class ReadWorker(QThread):
             result.append(tracce.read_tracks(self.ffprobe, path))
             self.progress.emit(i + 1, len(self.files))
         self.done.emit(result)
-
-
-class TaskSignals(QObject):
-    progress = Signal(int, float)
-    status = Signal(int, str)
-    finished = Signal(int, object)
-
-
-class TaskRunner(QRunnable):
-    def __init__(self, row: int, ffmpeg: str, ffprobe: str, source: FileTracks, plan: FileTracks, output_dir: Path,
-                 signals: TaskSignals, cancel_event: threading.Event):
-        super().__init__()
-        self.row = row
-        self.args = (ffmpeg, ffprobe, source, plan, output_dir)
-        self.signals, self.cancel_event = signals, cancel_event
-        self.setAutoDelete(True)
-
-    def run(self):
-        self.signals.status.emit(self.row, "In elaborazione")
-        try:
-            result = tracce.remux(*self.args, progress_cb=lambda p: self.signals.progress.emit(self.row, p),
-                                  cancel_event=self.cancel_event)
-        except Exception as exc:
-            applog.log_exception("Modifica tracce", exc)
-            result = merger.MergeResult(output_path=Path(), success=False, error=applog.describe_exception(exc))
-        self.signals.finished.emit(self.row, result)
 
 
 # ---------------------------------------------------------------------------- manual editor
@@ -259,29 +234,18 @@ class RuleRow(QWidget):
 
 # ---------------------------------------------------------------------------- the tab
 class TracceTab(QWidget):
-    queue_finished = Signal()
-
     def __init__(self, main_window):
         super().__init__()
         self.win = main_window
         self.sources: list[FileTracks] = []
         self.plans: list[FileTracks] = []
         self.manual: set[int] = set()
-        self.state = "idle"  # "idle" | "reading" | "processing"
+        self.state = "idle"  # "idle" | "reading"
         self.read_worker: ReadWorker | None = None
         self.retired_workers: list[QThread] = []
         self.rule_rows: list[RuleRow] = []
-        self.pool = QThreadPool()
-        self.signals = TaskSignals()
-        self.cancel_event = threading.Event()
-        self.started: set[int] = set()
-        self.job_rows: list[int] = []
-        self.row_pct: dict[int, float] = {}
-        self.total_count = self.finished_count = self.ok_count = self.skip_count = self.err_count = 0
+        self.job_rows: dict[int, list[int]] = {}  # queue job id -> the table row of each of its elements
         self._build_ui()
-        self.signals.progress.connect(self._on_progress)
-        self.signals.status.connect(self._on_status)
-        self.signals.finished.connect(self._on_finished)
 
     # ------------------------------------------------------------------ UI
     def _build_ui(self):
@@ -305,8 +269,6 @@ class TracceTab(QWidget):
         browse.setObjectName("secondary")
         browse.clicked.connect(self._browse_folder)
         top.addWidget(browse, 0, 2)
-        self.queue_btn = QPushButton("")  # kept only so the list of locked controls below stays valid
-        self.queue_btn.hide()
         top.addWidget(QLabel("Cartella output:"), 1, 0)
         self.output_edit = PathDropEdit("<cartella video>/tracce modificate")
         self.output_edit.paths_dropped.connect(self._on_output_dropped)
@@ -348,7 +310,11 @@ class TracceTab(QWidget):
         self.edit_btn.clicked.connect(self._edit_selected)
         buttons.addWidget(self.edit_btn)
         buttons.addStretch(1)
-        self.start_btn = QPushButton("Elabora")
+        self.queue_btn = QPushButton("Aggiungi alla coda")
+        self.queue_btn.setObjectName("secondary")
+        self.queue_btn.clicked.connect(self._on_queue_clicked)
+        buttons.addWidget(self.queue_btn)
+        self.start_btn = QPushButton("Avvia ora")
         self.start_btn.clicked.connect(self._on_start_clicked)
         buttons.addWidget(self.start_btn)
         root.addLayout(buttons)
@@ -392,9 +358,6 @@ class TracceTab(QWidget):
         return self.state != "idle"
 
     def shutdown(self):
-        self.cancel_event.set()
-        self.pool.clear()
-        self.pool.waitForDone(20000)
         for worker in [self.read_worker, *self.retired_workers]:
             if worker is not None and worker.isRunning():
                 worker.requestInterruption()
@@ -414,18 +377,15 @@ class TracceTab(QWidget):
 
     def _refresh_buttons(self):
         idle = self.state == "idle"
-        self.start_btn.setText("Stop" if self.state == "processing" else "Elabora")
-        self.start_btn.setEnabled(self.state == "processing" or (idle and bool(self.sources)))
+        self.start_btn.setEnabled(idle and bool(self.sources))
+        self.queue_btn.setEnabled(idle and bool(self.sources))
         self.apply_btn.setEnabled(idle and bool(self.sources))
         self.edit_btn.setEnabled(idle and bool(self.sources))
         self.add_rule_btn.setEnabled(idle)
-        for w in (self.folder_edit, self.output_edit, self.queue_btn, self.parallel_spin):
+        for w in (self.folder_edit, self.output_edit, self.parallel_spin):
             w.setEnabled(idle)
         for rr in self.rule_rows:
             rr.setEnabled(idle)
-        self.start_btn.setObjectName("danger" if self.state == "processing" else "")
-        self.start_btn.style().unpolish(self.start_btn)
-        self.start_btn.style().polish(self.start_btn)
 
     # ------------------------------------------------------------------ loading
     def _browse_folder(self):
@@ -447,6 +407,7 @@ class TracceTab(QWidget):
             return
         self.folder_edit.setText(f"{len(files)} file dalla libreria")
         self.output_edit.setText(str(files[0].parent / "tracce modificate"))
+        self.job_rows = {}
         self._read_files(list(files))
 
     def _on_output_dropped(self, paths: list):
@@ -459,6 +420,7 @@ class TracceTab(QWidget):
         if tools is None:
             return
         self.sources, self.plans, self.manual = [], [], set()
+        self.job_rows = {}
         self.table.setRowCount(0)
         self.progress.setValue(0)
         self.info_label.setText("Lettura delle tracce...")
@@ -573,103 +535,49 @@ class TracceTab(QWidget):
             self._fill_row(row)
             self.info_label.setText(f"Da modificare: {len(self._changed_rows())} su {len(self.sources)}.")
 
-    # ------------------------------------------------------------------ processing
+    # ------------------------------------------------------------------ processing: the work goes to the queue
     def _on_start_clicked(self):
-        if self.state == "processing":
-            self._cancel_processing()
-        else:
-            self._start_processing()
+        self._enqueue(True)
 
-    def _start_processing(self):
+    def _on_queue_clicked(self):
+        self._enqueue(False)
+
+    def _enqueue(self, start_now: bool):
         rows = [r for r in range(len(self.sources))
                 if self.table.item(r, COL_CHECK).checkState() == Qt.Checked and self._will_change(self.sources[r], self.plans[r])]
         if not rows:
             QMessageBox.information(self, "Niente da fare", "Nessun video da modificare: scrivi delle regole e premi «Applica le regole», oppure modifica a mano un video, poi spunta le righe.")
             return
-        tools = self._tools()
-        if tools is None:
+        if self._tools() is None:
             return
         output_dir = Path(self.output_edit.text() or (self.sources[0].path.parent / "tracce modificate"))
         if any(self.sources[r].path.resolve().parent == output_dir.resolve() for r in rows):
             QMessageBox.warning(self, "Cartella di output", "La cartella di output coincide con quella dei video: sceglierne un'altra.")
             return
-        reply = QMessageBox.question(
-            self, "Riepilogo prima di avviare",
-            f"Video da modificare: {len(rows)}\nCartella di output: {output_dir}\n\n"
-            "Si riscrive solo il contenitore (nessuna ricodifica); gli originali non vengono toccati. Procedere?",
-            QMessageBox.Yes | QMessageBox.Cancel, QMessageBox.Yes)
-        if reply != QMessageBox.Yes:
-            return
-        applog.log_batch_start("Modifica tracce", f"cartella di output {output_dir}", len(rows), self.parallel_spin.value())
-        self.cancel_event = threading.Event()
-        self.pool.setMaxThreadCount(self.parallel_spin.value())
-        self.started, self.job_rows = set(), rows
-        self.total_count, self.finished_count = len(rows), 0
-        self.ok_count = self.skip_count = self.err_count = 0
-        self.row_pct = {r: 0.0 for r in rows}
-        self.progress.setValue(0)
-        self.info_label.setText("")
-        self._set_state("processing")
+        units = [coda.Unit(self.sources[r].path.name, {
+            "source": coda.tracks_to_dict(self.sources[r]), "plan": coda.tracks_to_dict(self.plans[r]),
+            "output_dir": str(output_dir)}, weight=1.0) for r in rows]
+        job = coda.Job("tracce", f"Modifica tracce · {len(units)} video", "Si riscrive solo il contenitore (nessuna ricodifica)",
+                       self.parallel_spin.value(), units, str(output_dir))
         for row in rows:
             self.table.item(row, COL_STATUS).setText("In coda")
             self.table.cellWidget(row, COL_PROGRESS).setValue(0)
-            self.pool.start(TaskRunner(row, tools[0], tools[1], self.sources[row], self.plans[row], output_dir,
-                                       self.signals, self.cancel_event))
+        self.win.queue.add_job(job, start_now)
+        self.job_rows[job.id] = rows
+        self.info_label.setText(f"Aggiunti alla coda: {len(rows)}")
 
-    def _cancel_processing(self):
-        self.cancel_event.set()
-        self.pool.clear()
-        for row in self.job_rows:
-            if row not in self.started:
-                self.table.item(row, COL_STATUS).setText("Annullato")
-                self.row_pct[row] = 1.0
-                self.finished_count += 1
-        self._update_global()
-        self._check_all_done()
-
-    def _on_status(self, row: int, text: str):
-        self.started.add(row)
-        self.table.item(row, COL_STATUS).setText(text)
-
-    def _on_progress(self, row: int, pct: float):
+    def queue_unit_changed(self, job, idx: int):
+        rows = self.job_rows.get(job.id)
+        if not rows or idx >= len(rows) or rows[idx] >= self.table.rowCount():
+            return
+        row, u = rows[idx], job.units[idx]
         bar = self.table.cellWidget(row, COL_PROGRESS)
         if bar is not None:
-            bar.setValue(int(pct * 100))
-        self.row_pct[row] = pct
-        self.table.item(row, COL_STATUS).setText(f"In elaborazione {int(pct * 100)}%")
-        self._update_global()
-
-    def _update_global(self):
-        if self.total_count:
-            self.progress.setValue(int(sum(self.row_pct.values()) * 100 / self.total_count))
-
-    def _on_finished(self, row: int, result):
-        applog.log_result("Modifica tracce", self.sources[row].path.name if row < len(self.sources) else f"riga {row}", result)
-        self.finished_count += 1
-        self.row_pct[row] = 1.0
-        bar = self.table.cellWidget(row, COL_PROGRESS)
-        if bar is not None:
-            bar.setValue(100)
-        if result.skipped:
-            self.skip_count += 1
-            text = "Saltato (già presente)" if not result.note else f"Saltato — {result.note}"
-        elif result.success:
-            self.ok_count += 1
-            text = "Completato" + (f" — {result.note}" if result.note else "")
-        elif result.error == "Annullato":
-            text = "Annullato"
-        else:
-            self.err_count += 1
-            text = f"Errore: {result.error}"
+            bar.setValue(int(u.pct * 100))
         item = self.table.item(row, COL_STATUS)
         if item is not None:
-            item.setText(text)
-        self._update_global()
-        self._check_all_done()
+            item.setText(coda.unit_status_text(u))
 
-    def _check_all_done(self):
-        if self.finished_count >= self.total_count:
-            self._set_state("idle")
-            self.info_label.setText(f"Completati: {self.ok_count}  Saltati: {self.skip_count}  Falliti: {self.err_count}")
-            if not self.cancel_event.is_set():
-                self.queue_finished.emit()
+    def queue_job_finished(self, job):
+        if job.id in self.job_rows:
+            self.info_label.setText(f"Completati: {job.count('done')}  Saltati: {job.count('skipped')}  Falliti: {job.count('error')}")

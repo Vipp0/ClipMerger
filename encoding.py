@@ -150,3 +150,19 @@ def resolve_interlaced(opts: EncodingOptions, ffmpeg: str, path, info: merger.Pr
         return False
     import dividi
     return dividi.detect_interlaced(ffmpeg, path, info.interlaced, info.duration)[0]
+
+
+def summary(opts: EncodingOptions) -> str:
+    """A short line saying how a job encodes ("H.265 · Alta · veloce · mkv"), for the queue."""
+    codec = {v: label for label, v in CODECS}.get(opts.codec, opts.codec).replace("Come l'originale", "codec dell'originale")
+    quality = {k: label.split(" (")[0] for k, label, _ in QUALITY_LEVELS}
+    quality.update({"custom": f"CRF {opts.crf}", "cbr": f"{opts.kbps} kbit/s", "original": "bitrate dell'originale"})
+    speed = {v: label.split(" (")[0].lower() for label, v in SPEEDS}
+    parts = [codec, quality.get(opts.quality, opts.quality), f"velocità {speed.get(opts.speed, opts.speed)}"]
+    if opts.container:
+        parts.append(opts.container.lstrip("."))
+    if opts.tune_animation:
+        parts.append("tune animation")
+    if opts.two_pass:
+        parts.append("2 passaggi")
+    return " · ".join(parts)

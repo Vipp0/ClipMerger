@@ -22,7 +22,9 @@ import merger
 import profili
 import profili_ui
 import titoli
+import coda
 import dropwidgets
+import encoding
 from encoding import EncodingOptions
 from encoding_panel import EncodingPanel
 from dropwidgets import PathDropEdit, PathDropTable
@@ -113,39 +115,7 @@ class DownloadWorker(QThread):
             self.failed.emit(applog.describe_exception(exc))
 
 
-class ProcessSignals(QObject):
-    progress = Signal(int, float)
-    status = Signal(int, str)
-    finished = Signal(int, object)
-
-
-class ProcessTask(QRunnable):
-    def __init__(self, row: int, ffmpeg: str, ffprobe: str, src: Path, start: float, end: float, output: Path,
-                 opts: EncodingOptions, hw_encoders: dict, title: str, tail: tuple[float, float] | None, deinterlace: bool,
-                 bars: tuple[int, int] | None, signals: ProcessSignals, cancel_event: threading.Event):
-        super().__init__()
-        self.row = row
-        self.args = (ffmpeg, ffprobe, src, start, end, output, opts, hw_encoders, title)
-        self.tail, self.deinterlace, self.bars = tail, deinterlace, bars
-        self.signals, self.cancel_event = signals, cancel_event
-        self.setAutoDelete(True)
-
-    def run(self):
-        self.signals.status.emit(self.row, "In elaborazione")
-        try:
-            result = dividi.cut_piece(
-                *self.args, progress_cb=lambda pct: self.signals.progress.emit(self.row, pct),
-                cancel_event=self.cancel_event, tail=self.tail, deinterlace=self.deinterlace,
-                bars=self.bars)
-        except Exception as exc:
-            applog.log_exception("Dividi puntate", exc)
-            result = merger.MergeResult(output_path=Path(), success=False, error=applog.describe_exception(exc))
-        self.signals.finished.emit(self.row, result)
-
-
 class DividiTab(QWidget):
-    queue_finished = Signal()  # a run ended by itself (not stopped by the user)
-
     def __init__(self, main_window):
         super().__init__()
         self.win = main_window
@@ -154,7 +124,7 @@ class DividiTab(QWidget):
         self.file_notes: dict[Path, dividi.FileAnalysis] = {}
         self.catalogue: list[titoli.Episodio] = []
         self.season = 1
-        self.state = "idle"  # "idle" | "analyzing" | "processing"
+        self.state = "idle"  # "idle" | "analyzing"
         self.analyze_worker: AnalyzeWorker | None = None
         self.download_worker: DownloadWorker | None = None
         self.search_worker: SearchWorker | None = None
@@ -162,20 +132,10 @@ class DividiTab(QWidget):
         self.series_label = ""
         self._last_profile_key = "standard"
         self.retired_workers: list[QThread] = []
-        self.pool = QThreadPool()
-        self.signals = ProcessSignals()
-        self.cancel_event = threading.Event()
-        self.started: set[int] = set()
-        self.job_rows: list[int] = []
-        self.row_pct: dict[int, float] = {}
-        self.finished_count = self.total_count = 0
-        self.ok_count = self.skip_count = self.err_count = 0
+        self.job_rows: dict[int, list[int]] = {}  # queue job id -> the table row of each of its elements
         self._filling = False
         self._build_ui()
         self._load_settings()
-        self.signals.progress.connect(self._on_progress)
-        self.signals.status.connect(self._on_status)
-        self.signals.finished.connect(self._on_finished)
 
     # ------------------------------------------------------------------ UI
     def _build_ui(self):
@@ -309,7 +269,11 @@ class DividiTab(QWidget):
         self.analyze_btn.clicked.connect(self._on_analyze_clicked)
         buttons.addWidget(self.analyze_btn)
         buttons.addStretch(1)
-        self.start_btn = QPushButton("Avvia")
+        self.queue_btn = QPushButton("Aggiungi alla coda")
+        self.queue_btn.setObjectName("secondary")
+        self.queue_btn.clicked.connect(self._on_queue_clicked)
+        buttons.addWidget(self.queue_btn)
+        self.start_btn = QPushButton("Avvia ora")
         self.start_btn.clicked.connect(self._on_start_clicked)
         buttons.addWidget(self.start_btn)
         root.addLayout(buttons)
@@ -440,6 +404,7 @@ class DividiTab(QWidget):
         self._last_profile_key = key
         if self.entries and not self.is_busy():
             self.entries = []
+            self.job_rows = {}
             self.table.setRowCount(0)
             self.info_label.setText("Profilo cambiato: premi Analizza.")
         self._refresh_buttons()
@@ -561,9 +526,6 @@ class DividiTab(QWidget):
     def shutdown(self):
         """Stops whatever is running (called when the window closes)."""
         self._save_settings()
-        self.cancel_event.set()
-        self.pool.clear()
-        self.pool.waitForDone(20000)
         for worker in [self.analyze_worker, self.download_worker, self.search_worker, *self.retired_workers]:
             if worker is not None and worker.isRunning():
                 worker.requestInterruption()
@@ -573,8 +535,9 @@ class DividiTab(QWidget):
         idle = self.state == "idle"
         self.analyze_btn.setText("Annulla" if self.state == "analyzing" else "Analizza")
         self.analyze_btn.setEnabled(idle or self.state == "analyzing")
-        self.start_btn.setText("Stop" if self.state == "processing" else "Avvia")
-        self.start_btn.setEnabled(self.state == "processing" or (idle and any(p is not None for _, p, _ in self.entries)))
+        ready = idle and any(p is not None for _, p, _ in self.entries)
+        self.start_btn.setEnabled(ready)
+        self.queue_btn.setEnabled(ready)
         for w in (self.folder_edit, self.output_edit, self.profile_bar, self.series_edit, self.search_btn,
                   self.season_spin, self.key_edit, self.list_btn, self.enc_panel, self.ending_combo,
                   self.prologue_combo, self.bars_check, self.style_combo, self.name_edit):
@@ -609,6 +572,7 @@ class DividiTab(QWidget):
         """The tool's files become the library's selected videos."""
         if self.is_busy():
             return
+        self.job_rows = {}
         self._set_files(files, str(files[0].parent))
         self.folder_edit.setText(f"{len(files)} file dalla libreria")
 
@@ -625,6 +589,7 @@ class DividiTab(QWidget):
         if season is not None:
             self.season_spin.setValue(season)
         self.entries = []
+        self.job_rows = {}
         self.table.setRowCount(0)
         self._refresh_buttons()
         self.info_label.setText(f"{len(files)} file. Premi Analizza per trovare le puntate.")
@@ -683,6 +648,7 @@ class DividiTab(QWidget):
         self._save_settings()
         self.season = season
         self.entries = []
+        self.job_rows = {}
         self.table.setRowCount(0)
         self.progress.setValue(0)
         self.info_label.setText("Analisi in corso: ci vuole circa mezzo minuto per file...")
@@ -723,6 +689,7 @@ class DividiTab(QWidget):
         self.analyze_worker = None
         self.catalogue = catalogue
         self.entries = []
+        self.job_rows = {}
         self.file_notes = {fa.path: fa for fa in analyses}
         for fa in analyses:
             if fa.error or not fa.pieces:
@@ -898,12 +865,12 @@ class DividiTab(QWidget):
             self.table.item(row, COL_DUR).setText(fmt_time(piece.duration))
         self._filling = False
 
-    # ------------------------------------------------------------------ processing
+    # ------------------------------------------------------------------ processing: the work goes to the queue
     def _on_start_clicked(self):
-        if self.state == "processing":
-            self._cancel_processing()
-        else:
-            self._start_processing()
+        self._enqueue(True)
+
+    def _on_queue_clicked(self):
+        self._enqueue(False)
 
     def _output_names(self, rows: list[int]) -> dict[int, str]:
         names: dict[int, str] = {}
@@ -917,14 +884,13 @@ class DividiTab(QWidget):
             names[row] = stem if seen[stem.lower()] == 1 else f"{stem} ({seen[stem.lower()]})"
         return names
 
-    def _start_processing(self):
+    def _enqueue(self, start_now: bool):
         rows = [r for r, (_, p, _) in enumerate(self.entries)
                 if p is not None and self.table.item(r, COL_CHECK).checkState() == Qt.Checked]
         if not rows:
             QMessageBox.information(self, "Niente da fare", "Seleziona almeno una puntata nella tabella (casella a sinistra).")
             return
-        tools = self._tools()
-        if tools is None:
+        if self._tools() is None:
             return
         first = self.entries[rows[0]][0]
         output_dir = Path(self.output_edit.text() or (first.parent / "puntate divise"))
@@ -932,103 +898,42 @@ class DividiTab(QWidget):
             QMessageBox.warning(self, "Cartella di output", "La cartella di output coincide con quella dei file: sceglierne un'altra.")
             return
         names = self._output_names(rows)
-        reply = QMessageBox.question(
-            self, "Riepilogo prima di avviare",
-            f"Puntate da scrivere: {len(rows)}\nCartella di output: {output_dir}\n\n"
-            "Ogni puntata viene ricodificata una volta sola; i file originali non vengono toccati. Procedere?",
-            QMessageBox.Yes | QMessageBox.Cancel, QMessageBox.Yes)
-        if reply != QMessageBox.Yes:
-            return
         self._save_settings()
         opts = self.enc_panel.options()
-        applog.log_batch_start(
-            "Dividi puntate",
-            f"codec {opts.codec}, velocità {opts.speed}, qualità {opts.quality} (CRF {opts.crf}, {opts.kbps} kbit/s), "
-            f"fine {self.ending_combo.currentData()}, deinterlaccia {opts.deinterlace}, prologo {self.prologue_combo.currentData()}, "
-            f"bordi verdi {'neri' if self.bars_check.isChecked() else 'lasciati'}, cartella di output {output_dir}",
-            len(rows), opts.parallel)
-        self.cancel_event = threading.Event()
-        self.pool.setMaxThreadCount(opts.parallel)
-        self.started = set()
-        self.job_rows = rows
-        self.total_count, self.finished_count = len(rows), 0
-        self.ok_count = self.skip_count = self.err_count = 0
-        self.progress.setValue(0)
-        self.info_label.setText("")
-        self.row_pct = {r: 0.0 for r in rows}
-        self._set_state("processing")
+        hw = self.enc_panel.hw_encoders
         mode = opts.deinterlace
+        credits = self.ending_combo.currentData() == "credits"
+        units = []
         for row in rows:
             path, piece, _ = self.entries[row]
+            units.append(coda.Unit(names[row], {
+                "src": str(path), "start": piece.start, "end": piece.end, "output": str(output_dir / (names[row] + path.suffix)),
+                "opts": opts.to_dict(), "hw": hw, "title": names[row],
+                "tail": list(piece.tail) if (credits and piece.tail) else None,
+                "deinterlace": mode == "always" or (mode == "auto" and piece.interlaced),
+                "bars": list(piece.bars) if (self.bars_check.isChecked() and piece.bars) else None},
+                weight=max(piece.end - piece.start, 1.0)))
+        job = coda.Job("dividi", f"Dividi puntate · {len(units)} pezzi",
+                       f"Profilo: {self._profile().name} · {encoding.summary(opts)}", opts.parallel, units, str(output_dir))
+        for row in rows:
             self.table.item(row, COL_STATUS).setText("In coda")
             self.table.cellWidget(row, COL_PROGRESS).setValue(0)
-            self.pool.start(ProcessTask(
-                row, tools[0], tools[1], path, piece.start, piece.end, output_dir / (names[row] + path.suffix),
-                opts, self.enc_panel.hw_encoders,
-                names[row], piece.tail if self.ending_combo.currentData() == "credits" else None,
-                mode == "always" or (mode == "auto" and piece.interlaced),
-                piece.bars if self.bars_check.isChecked() else None,
-                self.signals, self.cancel_event))
+        self.win.queue.add_job(job, start_now)
+        self.job_rows[job.id] = rows
+        self.info_label.setText(f"Aggiunti alla coda: {len(rows)}")
 
-    def _cancel_processing(self):
-        self.cancel_event.set()
-        self.pool.clear()
-        # Tasks that never started are dropped by pool.clear() without ever reporting back.
-        for row in self.job_rows:
-            if row not in self.started:
-                self.table.item(row, COL_STATUS).setText("Annullato")
-                self.row_pct[row] = 1.0
-                self.finished_count += 1
-        self._update_global()
-        self._check_all_done()
-
-    def _on_status(self, row: int, text: str):
-        if row < self.table.rowCount():
-            self.started.add(row)
-            self.table.item(row, COL_STATUS).setText(text)
-
-    def _on_progress(self, row: int, pct: float):
+    def queue_unit_changed(self, job, idx: int):
+        rows = self.job_rows.get(job.id)
+        if not rows or idx >= len(rows) or rows[idx] >= self.table.rowCount():
+            return
+        row, u = rows[idx], job.units[idx]
         bar = self.table.cellWidget(row, COL_PROGRESS)
         if bar is not None:
-            bar.setValue(int(pct * 100))
-        self.row_pct[row] = pct
+            bar.setValue(int(u.pct * 100))
         item = self.table.item(row, COL_STATUS)
         if item is not None:
-            item.setText(f"In elaborazione {int(pct * 100)}%")
-        self._update_global()
+            item.setText(coda.unit_status_text(u))
 
-    def _update_global(self):
-        if self.total_count:
-            self.progress.setValue(int(sum(self.row_pct.values()) * 100 / self.total_count))
-
-    def _on_finished(self, row: int, result):
-        title_item = self.table.item(row, COL_TITLE)
-        applog.log_result("Dividi puntate", title_item.text() if title_item else f"riga {row}", result)
-        self.finished_count += 1
-        self.row_pct[row] = 1.0
-        bar = self.table.cellWidget(row, COL_PROGRESS)
-        if bar is not None:
-            bar.setValue(100)
-        if result.skipped:
-            self.skip_count += 1
-            text = "Saltata (già presente)"
-        elif result.success:
-            self.ok_count += 1
-            text = "Completata" + (f" — {result.note}" if result.note else "")
-        elif result.error == "Annullato":
-            text = "Annullata"
-        else:
-            self.err_count += 1
-            text = f"Errore: {result.error}"
-        item = self.table.item(row, COL_STATUS)
-        if item is not None:
-            item.setText(text)
-        self._update_global()
-        self._check_all_done()
-
-    def _check_all_done(self):
-        if self.finished_count >= self.total_count:
-            self._set_state("idle")
-            self.info_label.setText(f"Completate: {self.ok_count}  Saltate: {self.skip_count}  Fallite: {self.err_count}")
-            if not self.cancel_event.is_set():
-                self.queue_finished.emit()
+    def queue_job_finished(self, job):
+        if job.id in self.job_rows:
+            self.info_label.setText(f"Completate: {job.count('done')}  Saltate: {job.count('skipped')}  Fallite: {job.count('error')}")
