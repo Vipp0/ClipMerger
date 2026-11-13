@@ -1,11 +1,13 @@
 """Scheda «Dividi puntate»: taglia un file che contiene tante puntate/sketch in file separati.
 
-Primo profilo: «Sketch senza sigle» (Camera Café). Ogni sketch comincia con lo stesso identico filmato
-(un bicchiere che fa apparire il titolo): lo si riconosce confrontando i fotogrammi con un campione, si
-taglia sullo stacco netto che lo precede, e il titolo scritto sullo schermo (letto con l'OCR di Windows e
-confrontato con la lista di TMDB) dà il nome al file. Niente sigle: si scartano l'apertura e i titoli di coda.
+Due modi di trovare i punti di taglio:
+- «nero» (profilo Standard): si taglia a metà dei fotogrammi neri che separano un pezzo dall'altro;
+- «campione» (profili creati dall'utente): ogni pezzo comincia con lo stesso identico filmato (un breve stacco
+  grafico che si ripete): lo si riconosce confrontando i fotogrammi con un campione salvato nel profilo e si taglia
+  sullo stacco netto che lo precede. Se il titolo compare scritto sullo schermo, lo si legge (OCR di Windows) e lo
+  si confronta con la lista di TMDB per dare il nome al file.
 
-Uso da riga di comando (solo per fare un campione per un nuovo profilo):
+Uso da riga di comando (per fare a mano il campione di un profilo):
     python dividi.py campione video.mkv INIZIO DURATA uscita.npz
 """
 from __future__ import annotations
@@ -25,6 +27,7 @@ import numpy as np
 import applog
 import merger
 import ocr_windows
+import profili
 import titoli
 import utils
 from utils import CREATE_NO_WINDOW
@@ -50,23 +53,59 @@ class DividiError(Exception):
     pass
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, eq=False)
 class Profile:
+    """How a file is cut into pieces. «Standard» is built in; the others are made by the user (see profili.py)."""
     key: str
     name: str
-    sample: str                 # file in assets/profili
-    lead: float                 # seconds between the hard cut and the sharp cup (expected)
+    description: str = ""
+    method: str = "black"       # "black": cut in the black between pieces; "sample": find a jingle that opens each piece
+    black_min: float = 0.12     # black method: shortest black stretch that counts, seconds
+    min_piece: float = 30.0     # black method: shortest piece, seconds (closer cuts are ignored)
+    sample: str = ""            # sample method: the sample's file name in the profile folder
+    lead: float = 0.30          # sample method: seconds between the hard cut and the sharp jingle (expected)
+    read_titles: bool = False   # sample method: the piece's title is written on the screen
     caption_from: float = 6.0   # the on-screen title appears this long after the cut ...
     caption_len: float = 8.0    # ... and is looked for during this long
-    series_id: int | None = None
-    series_name: str = ""
-    credits: bool = True        # the file ends with orange closing credits to leave out
+    credits: bool = False       # the file ends with orange closing credits to leave out
+    settings: dict = field(default_factory=dict)  # what the tab looked like when saved (series, quality, names...)
+    builtin: bool = False
+
+    def to_dict(self) -> dict:
+        return {"nome": self.name, "descrizione": self.description, "metodo": self.method,
+                "nero_minimo": self.black_min, "pezzo_minimo": self.min_piece, "campione": self.sample,
+                "secondi_prima_del_filmato": self.lead, "titolo_sullo_schermo": self.read_titles,
+                "titolo_dopo": self.caption_from, "titolo_per": self.caption_len,
+                "titoli_di_coda_arancioni": self.credits, "impostazioni": self.settings}
+
+    @staticmethod
+    def from_dict(key: str, d: dict) -> "Profile":
+        def num(name: str, default: float, low: float = 0.0) -> float:
+            try:
+                return max(low, float(d.get(name, default)))
+            except (TypeError, ValueError):
+                return default
+        settings = d.get("impostazioni")
+        method = "sample" if d.get("metodo") == "sample" else "black"
+        return Profile(key, str(d.get("nome", key)), str(d.get("descrizione", "")), method,
+                       num("nero_minimo", 0.12, 0.02), num("pezzo_minimo", 30.0, 1.0), str(d.get("campione", "")),
+                       num("secondi_prima_del_filmato", 0.30), bool(d.get("titolo_sullo_schermo", False)),
+                       num("titolo_dopo", 6.0), num("titolo_per", 8.0, 1.0), bool(d.get("titoli_di_coda_arancioni", False)),
+                       settings if isinstance(settings, dict) else {})
 
 
-PROFILES = {
-    "camera_cafe": Profile("camera_cafe", "Sketch senza sigle (Camera Café)", "camera_cafe.npz", 0.30,
-                           series_id=63809, series_name="Camera Café"),
-}
+STANDARD = Profile("standard", "Standard",
+                   "Taglia a metà dei fotogrammi neri tra un pezzo e l'altro. I pezzi si chiamano «Parte 1», «Parte 2»...: "
+                   "puoi scrivere i titoli a mano nella tabella.", builtin=True)
+PROFILES = {"standard": STANDARD}  # the built-in one only
+
+
+def load_profiles() -> dict[str, Profile]:
+    """«Standard» first, then the user's profiles by name."""
+    found = dict(PROFILES)
+    for key, data in profili.all_dicts("dividi").items():
+        found[key] = Profile.from_dict(key, data)
+    return found
 
 
 @dataclass
@@ -121,7 +160,7 @@ def _norm(strips: np.ndarray) -> np.ndarray:
 
 
 def load_sample(profile: Profile) -> np.ndarray:
-    path = Path(utils.resource_path(f"assets/profili/{profile.sample}"))
+    path = profili.folder("dividi") / profile.sample
     try:
         with np.load(path) as data:
             return _norm(data["strips"])
@@ -166,6 +205,51 @@ def make_sample(ffmpeg: str, video: Path, start: float, duration: float, out: Pa
     out.parent.mkdir(parents=True, exist_ok=True)
     np.savez_compressed(out, strips=_strip(frames).copy())
     return len(frames)
+
+
+_BLACK_RE = re.compile(r"black_start:([\d.]+)\s+black_end:([\d.]+)")
+_TIME_RE = re.compile(r"time=(\d+):(\d+):([\d.]+)")
+
+
+def black_stretches(ffmpeg: str, path: Path, black_min: float, duration: float, progress=None, cancelled=None
+                    ) -> list[tuple[float, float]]:
+    """Every stretch of fully black picture lasting at least black_min seconds: (start, end)."""
+    cmd = [ffmpeg, "-hide_banner", "-nostdin", "-i", str(path), "-an", "-sn", "-vf",
+           f"scale=160:-2:flags=fast_bilinear,blackdetect=d={black_min:.3f}:pix_th=0.10", "-f", "null", "-"]
+    proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True, encoding="utf-8",
+                            errors="replace", creationflags=CREATE_NO_WINDOW)
+    found: list[tuple[float, float]] = []
+    try:
+        for line in proc.stderr:  # ffmpeg ends its progress lines with a carriage return: each is one line here
+            if cancelled is not None and cancelled():
+                raise Annullato()
+            m = _BLACK_RE.search(line)
+            if m:
+                found.append((float(m.group(1)), float(m.group(2))))
+                continue
+            t = _TIME_RE.search(line)
+            if t and progress and duration > 0:
+                progress(min(1.0, (int(t.group(1)) * 3600 + int(t.group(2)) * 60 + float(t.group(3))) / duration))
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+        proc.wait()
+    return found
+
+
+def black_cuts(stretches: list[tuple[float, float]], duration: float, min_piece: float) -> list[float]:
+    """The cut points: the middle of each black stretch, leaving out the ones too close to each other or to the
+    ends of the file (so no piece is shorter than min_piece)."""
+    cuts: list[float] = []
+    last = 0.0
+    for start, end in stretches:
+        mid = round((start + end) / 2, 3)
+        if end <= 1.0 or start >= duration - 1.0:
+            continue  # the black at the very start/end of the file is not a separator
+        if mid - last >= min_piece and duration - mid >= min_piece:
+            cuts.append(mid)
+            last = mid
+    return cuts
 
 
 def find_cups(ffmpeg: str, path: Path, sample: np.ndarray, duration: float, progress=None, cancelled=None
@@ -359,18 +443,35 @@ def analizza_file(ffmpeg: str, ffprobe: str, path: Path, profile: Profile, sampl
     info = merger.probe(ffprobe, path)
     res.duration = info.duration
     res.interlaced, res.interlace_note = detect_interlaced(ffmpeg, path, info.interlaced, info.duration)
+    if profile.method == "black":
+        if progress:
+            progress(0.0, f"{path.name}: cerco i fotogrammi neri")
+        stretches = black_stretches(
+            ffmpeg, path, profile.black_min, res.duration,
+            progress=(lambda f: progress(f * 0.9, f"{path.name}: cerco i fotogrammi neri")) if progress else None,
+            cancelled=cancelled)
+        bounds = [0.0] + black_cuts(stretches, res.duration, profile.min_piece) + [res.duration]
+        applog.log.info("Dividi: %s -> %d neri, %d pezzi", path.name, len(stretches), len(bounds) - 1)
+        for k in range(len(bounds) - 1):
+            res.pieces.append(Piece(start=bounds[k], end=bounds[k + 1], cup_cut=bounds[k], title=f"Parte {first_no + k}",
+                                    score=1.0, interlaced=res.interlaced))
+        for piece in res.pieces:
+            piece.bars = detect_bars(ffmpeg, path, piece.start, piece.end, info.width)
+        if progress:
+            progress(1.0, f"{path.name}: fatto")
+        return res
     if progress:
-        progress(0.0, f"{path.name}: cerco i bicchieri")
+        progress(0.0, f"{path.name}: cerco il filmato di stacco")
     cups = find_cups(ffmpeg, path, sample, res.duration,
-                     progress=(lambda f: progress(f * 0.8, f"{path.name}: cerco i bicchieri")) if progress else None,
+                     progress=(lambda f: progress(f * 0.8, f"{path.name}: cerco il filmato di stacco")) if progress else None,
                      cancelled=cancelled)
     long_cups = [c for c in cups if c[1] - c[0] >= LONG_CUP]
-    applog.log.info("Dividi: %s -> %d bicchieri lunghi, %d brevi", path.name, len(long_cups), len(cups) - len(long_cups))
+    applog.log.info("Dividi: %s -> %d stacchi lunghi, %d brevi", path.name, len(long_cups), len(cups) - len(long_cups))
     if long_cups and long_cups[0][0] <= OPENING_MAX_START:
         res.opening_end = _snap(ffmpeg, path, long_cups[0][1], 0.5)  # the opening ends on a hard cut too
         long_cups = long_cups[1:]
     if not long_cups:
-        res.error = "Nessun bicchiere trovato: il profilo non riconosce questo file."
+        res.error = "Il filmato del profilo non compare in questo file: il profilo non lo riconosce."
         return res
     if profile.credits:
         res.credits_start = credits_start(ffmpeg, path, res.duration)
@@ -400,9 +501,13 @@ def analizza_file(ffmpeg: str, ffprobe: str, path: Path, profile: Profile, sampl
 
     for piece in res.pieces:
         piece.bars = detect_bars(ffmpeg, path, piece.start, piece.end, info.width)
-    if progress:
-        progress(0.9, f"{path.name}: leggo i titoli")
-    read_titles(ffmpeg, path, res.pieces, first_no, profile, work, catalogue, used, cancelled)
+    if profile.read_titles:
+        if progress:
+            progress(0.9, f"{path.name}: leggo i titoli")
+        read_titles(ffmpeg, path, res.pieces, first_no, profile, work, catalogue, used, cancelled)
+    else:
+        for k, piece in enumerate(res.pieces):
+            piece.title, piece.score = f"Parte {first_no + k}", 1.0
     if progress:
         progress(1.0, f"{path.name}: fatto")
     return res
@@ -412,7 +517,7 @@ def analizza(files: list[Path], profile: Profile, catalogue: list[titoli.Episodi
              work: Path, progress=None, cancelled=None) -> list[FileAnalysis]:
     shutil.rmtree(work, ignore_errors=True)
     work.mkdir(parents=True, exist_ok=True)
-    sample = load_sample(profile)
+    sample = load_sample(profile) if profile.method == "sample" else None
     out: list[FileAnalysis] = []
     used: set[int] = set()
     first_no = 1

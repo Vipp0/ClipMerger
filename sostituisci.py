@@ -11,12 +11,13 @@ import argparse
 import re
 import subprocess
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import numpy as np
 
 import merger
+import profili
 import trova_sigla
 import utils
 from utils import CREATE_NO_WINDOW
@@ -29,26 +30,48 @@ class SostituisciError(Exception):
     pass
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, eq=False)
 class Profile:
-    """How the old sigle of a series are built, when that is not the usual "opening, then the episode"."""
+    """How the old sigle of a series are built, when that is not the usual "opening, then the episode".
+    «Standard» is built in; the others are made by the user (see profili.py)."""
     key: str
     name: str
-    description: str
+    description: str = ""
     title_card_in_intro: bool = False  # the episode's title card is shown INSIDE the old opening: it is kept, silent, after the new one
     end_lookback: float = 0.0  # the old closing's music starts later than its picture: look this many seconds back for the picture's cut
     edge_after: float = 0.3  # the black that ends the old opening may begin this long after the music has ended
+    settings: dict = field(default_factory=dict)  # what the tab looked like when the profile was saved (new sigle, quality...)
+    builtin: bool = False
+
+    def to_dict(self) -> dict:
+        return {"nome": self.name, "descrizione": self.description, "scheda_nella_sigla": self.title_card_in_intro,
+                "indietro_titoli_di_coda": self.end_lookback, "tolleranza_nero": self.edge_after,
+                "impostazioni": self.settings}
+
+    @staticmethod
+    def from_dict(key: str, d: dict) -> "Profile":
+        def num(name: str, default: float) -> float:
+            try:
+                return max(0.0, float(d.get(name, default)))
+            except (TypeError, ValueError):
+                return default
+        settings = d.get("impostazioni")
+        return Profile(key, str(d.get("nome", key)), str(d.get("descrizione", "")), bool(d.get("scheda_nella_sigla", False)),
+                       num("indietro_titoli_di_coda", 0.0), num("tolleranza_nero", 0.3),
+                       settings if isinstance(settings, dict) else {})
 
 
-PROFILES = {
-    "standard": Profile("standard", "Standard", "Una sigla iniziale e/o finale da sostituire; il resto dell'episodio resta com'è."),
-    "alice": Profile(
-        "alice", "Alice nel paese delle meraviglie",
-        "Il titolo inglese dell'episodio compare dentro la vecchia sigla iniziale (scheda rossa di 5 secondi): viene "
-        "tenuto, senza musica, subito dopo la nuova sigla. L'inizio dei vecchi titoli di coda si cerca nell'immagine, "
-        "perché la loro musica parte alcuni secondi dopo.",
-        title_card_in_intro=True, end_lookback=12.0, edge_after=0.8),
-}
+STANDARD = Profile("standard", "Standard", "Una sigla iniziale e/o finale da sostituire; il resto dell'episodio resta com'è.",
+                   builtin=True)
+PROFILES = {"standard": STANDARD}  # the built-in one only
+
+
+def load_profiles() -> dict[str, Profile]:
+    """«Standard» first, then the user's profiles by name."""
+    found = dict(PROFILES)
+    for key, data in profili.all_dicts("sostituisci").items():
+        found[key] = Profile.from_dict(key, data)
+    return found
 
 
 @dataclass
@@ -159,7 +182,7 @@ def _inset(start: float, end: float, cap: float) -> float:
 def plan_cuts(
     ffmpeg: str, episode: Path, duration: float,
     intro: trova_sigla.Detection | None, outro: trova_sigla.Detection | None,
-    keep_card: bool = True, profile: Profile = PROFILES["standard"],
+    keep_card: bool = True, profile: Profile = STANDARD,
 ) -> CutPlan:
     """Turns the audio detections into picture cut points, snapping to the black frames the sigle
     are bracketed with. After the opening there is often a title card (episode name) that is
@@ -284,7 +307,7 @@ class EpisodeAnalysis:
     outro: trova_sigla.Detection | None = None
     plan: CutPlan | None = None
     error: str | None = None
-    profile: Profile = PROFILES["standard"]
+    profile: Profile = STANDARD
 
     def _sides(self) -> list[trova_sigla.Detection | None]:
         return ([self.intro] if self.want_intro else []) + ([self.outro] if self.want_outro else [])
@@ -327,7 +350,7 @@ class EpisodeAnalysis:
 
 def analizza(
     episodes: list[Path], intro_cfg, outro_cfg, ffmpeg: str, ffprobe: str, progress=None, cancelled=None,
-    keep_card: bool = True, profile: Profile = PROFILES["standard"],
+    keep_card: bool = True, profile: Profile = STANDARD,
 ) -> list[EpisodeAnalysis]:
     """Finds the old sigle in every episode and decides the cut points. `intro_cfg`/`outro_cfg`:
     None (leave that sigla alone), "impara" (learn it from the episodes) or the Path of a sample

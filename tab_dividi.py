@@ -3,6 +3,7 @@ col nome «1x012 Titolo». Due tempi: "Analizza" trova i tagli e legge i titoli 
 (si può correggere tutto), "Avvia" scrive i file nuovi: niente viene scritto prima che l'utente veda la tabella."""
 from __future__ import annotations
 
+import json
 import re
 import tempfile
 import threading
@@ -18,16 +19,19 @@ from PySide6.QtWidgets import (
 import applog
 import dividi
 import merger
+import profili
+import profili_ui
 import titoli
 import dropwidgets
 from dropwidgets import PathDropEdit, PathDropTable
+from profili_ui import ProfileBar, SeriesPickDialog
 from tab_sostituisci import fmt_time, parse_time
 from utils import list_video_files
 
 PRESETS = [("Veloce", "fast"), ("Bilanciato", "medium"), ("Qualità", "slow")]
 CODECS = [("Come l'originale", "original"), ("H.265 (file più piccoli)", "h265")]
 DEINTERLACE = [("Automatico (solo se il video è interlacciato)", "auto"), ("Sempre", "always"), ("Mai", "never")]
-PROLOGUES = [("Unito alla prima puntata", "attach"), ("Scartato (la prima puntata parte dal bicchiere)", "drop")]
+PROLOGUES = [("Unito alla prima puntata", "attach"), ("Scartato (la prima puntata parte dal suo stacco)", "drop")]
 ENDINGS = [("Pulita: finisce con la scena, senza la transizione", "clean"),
            ("Con la transizione e i titoli di coda (circa 8 secondi)", "credits")]
 COL_CHECK, COL_FILE, COL_START, COL_END, COL_DUR, COL_NUM, COL_TITLE, COL_STATUS, COL_SHOT, COL_PROGRESS = range(10)
@@ -53,10 +57,12 @@ class AnalyzeWorker(QThread):
     def run(self):
         ffmpeg, ffprobe, files, profile, series_id, season, key = self.args
         try:
-            catalogue = titoli.cached_season(series_id, season)
+            catalogue = (titoli.cached_season(series_id, season) if series_id else None)
             if catalogue is None:
-                self.progress.emit(0.0, "Scarico la lista dei titoli da TMDB...")
-                catalogue = titoli.download_season(series_id, season, key)
+                catalogue = []
+                if series_id and profile.method == "sample" and profile.read_titles:  # the list is needed to name the pieces
+                    self.progress.emit(0.0, "Scarico la lista dei titoli da TMDB...")
+                    catalogue = titoli.download_season(series_id, season, key)
             result = dividi.analizza(
                 files, profile, catalogue, ffmpeg, ffprobe, WORK_DIR,
                 progress=lambda f, text: self.progress.emit(f, text), cancelled=self.isInterruptionRequested)
@@ -70,6 +76,24 @@ class AnalyzeWorker(QThread):
             self.failed.emit(applog.describe_exception(exc))
             return
         self.done.emit(result, catalogue)
+
+
+class SearchWorker(QThread):
+    done = Signal(list)
+    failed = Signal(str)
+
+    def __init__(self, query: str, key: str):
+        super().__init__()
+        self.args = (query, key)
+
+    def run(self):
+        try:
+            self.done.emit(titoli.search_series(*self.args))
+        except titoli.TitoliError as exc:
+            self.failed.emit(str(exc))
+        except Exception as exc:
+            applog.log_exception("Dividi puntate (ricerca serie)", exc)
+            self.failed.emit(applog.describe_exception(exc))
 
 
 class DownloadWorker(QThread):
@@ -134,6 +158,10 @@ class DividiTab(QWidget):
         self.state = "idle"  # "idle" | "analyzing" | "processing"
         self.analyze_worker: AnalyzeWorker | None = None
         self.download_worker: DownloadWorker | None = None
+        self.search_worker: SearchWorker | None = None
+        self.series_id: int | None = None  # the series chosen on TMDB (never shown: the title and details are)
+        self.series_label = ""
+        self._last_profile_key = "standard"
         self.retired_workers: list[QThread] = []
         self.pool = QThreadPool()
         self.signals = ProcessSignals()
@@ -185,42 +213,48 @@ class DividiTab(QWidget):
         prof = QGridLayout()
         prof.setSpacing(8)
         prof.addWidget(QLabel("Profilo:"), 0, 0)
-        self.profile_combo = QComboBox()
-        for key, profile in dividi.PROFILES.items():
-            self.profile_combo.addItem(profile.name, key)
-        prof.addWidget(self.profile_combo, 0, 1, 1, 5)
-        info = QLabel(
-            "Ogni puntata comincia con lo stesso filmato (qui il bicchiere di Camera Café) e il suo titolo compare "
-            "sullo schermo. Si taglia lì, si scartano l'apertura iniziale e i titoli di coda, e il primo pezzo "
-            "tiene anche il breve inizio che precede il primo titolo. Nessuna sigla viene aggiunta.")
-        info.setWordWrap(True)
-        prof.addWidget(info, 1, 0, 1, 6)
-        prof.addWidget(QLabel("Serie TMDB (numero):"), 2, 0)
-        self.series_spin = QSpinBox()
-        self.series_spin.setRange(1, 99999999)
-        self.series_spin.setToolTip("Il numero che si vede nell'indirizzo della pagina su themoviedb.org (Camera Café: 63809).")
-        prof.addWidget(self.series_spin, 2, 1)
-        prof.addWidget(QLabel("Stagione:"), 2, 2)
+        self.profile_bar = ProfileBar("dividi", dividi.load_profiles, self._new_profile, self._edit_profile,
+                                      self._update_profile)
+        self.profile_bar.selected.connect(self._profile_changed)
+        prof.addWidget(self.profile_bar, 0, 1, 1, 5)
+        self.info = QLabel(dividi.STANDARD.description)
+        self.info.setWordWrap(True)
+        prof.addWidget(self.info, 1, 0, 1, 6)
+        prof.addWidget(QLabel("Serie:"), 2, 0)
+        self.series_edit = QLineEdit()
+        self.series_edit.setPlaceholderText("scrivi il titolo della serie e premi Cerca (facoltativo)")
+        self.series_edit.setToolTip(
+            "Il titolo della serie, anche in parte: TMDB la cerca per te. Se ce ne sono più di una con quel titolo "
+            "ti mostro anno, paese e lingua per scegliere. Serve per i titoli e i numeri delle puntate.")
+        self.series_edit.textEdited.connect(self._series_text_edited)
+        self.series_edit.returnPressed.connect(self._search_series)
+        prof.addWidget(self.series_edit, 2, 1, 1, 3)
+        self.search_btn = QPushButton("Cerca")
+        self.search_btn.setObjectName("secondary")
+        self.search_btn.clicked.connect(self._search_series)
+        prof.addWidget(self.search_btn, 2, 4)
+        self.series_info = QLabel("")
+        prof.addWidget(self.series_info, 2, 5)
+        prof.addWidget(QLabel("Stagione:"), 3, 0)
         self.season_spin = QSpinBox()
         self.season_spin.setRange(1, 99)
         self.season_spin.valueChanged.connect(self._refresh_list_status)
-        self.series_spin.valueChanged.connect(self._refresh_list_status)
-        prof.addWidget(self.season_spin, 2, 3)
-        prof.addWidget(QLabel("Chiave TMDB:"), 2, 4)
+        prof.addWidget(self.season_spin, 3, 1)
+        prof.addWidget(QLabel("Chiave TMDB:"), 3, 2)
         self.key_edit = QLineEdit()
         self.key_edit.setEchoMode(QLineEdit.Password)
-        self.key_edit.setPlaceholderText("serve solo per scaricare una lista nuova")
+        self.key_edit.setPlaceholderText("serve solo per cercare e scaricare")
         self.key_edit.setToolTip(
             "La tua chiave personale di TMDB (themoviedb.org → Impostazioni → API). Resta su questo PC, "
             "nelle impostazioni del programma. Una volta scaricata la lista di una stagione non serve più.")
         self.key_edit.editingFinished.connect(self._save_settings)
-        prof.addWidget(self.key_edit, 2, 5)
+        prof.addWidget(self.key_edit, 3, 3)
         self.list_btn = QPushButton("Scarica la lista")
         self.list_btn.setObjectName("secondary")
         self.list_btn.clicked.connect(self._download_list)
-        prof.addWidget(self.list_btn, 3, 3)
+        prof.addWidget(self.list_btn, 3, 4)
         self.list_label = QLabel("")
-        prof.addWidget(self.list_label, 3, 4, 1, 2)
+        prof.addWidget(self.list_label, 3, 5)
         prof.addWidget(QLabel("Nome dei file:"), 4, 0)
         self.style_combo = QComboBox()
         for key, label in titoli.NAME_STYLES:
@@ -268,7 +302,7 @@ class DividiTab(QWidget):
         for label, value in ENDINGS:
             self.ending_combo.addItem(label, value)
         self.ending_combo.setToolTip(
-            "Il file originale finisce con l'effetto del televisore che si spegne e i titoli di coda arancioni. "
+            "Se il file originale finisce con una transizione e dei titoli di coda (riconosciuti dal profilo), "
             "«Con la transizione e i titoli di coda» li mette alla fine di ogni puntata, come accade all'ultima.")
         enc.addWidget(self.ending_combo, 1, 1, 1, 3)
         enc.addWidget(QLabel("Deinterlaccia:"), 1, 4)
@@ -286,15 +320,15 @@ class DividiTab(QWidget):
         for label, value in PROLOGUES:
             self.prologue_combo.addItem(label, value)
         self.prologue_combo.setToolTip(
-            "Ogni file comincia con una breve scenetta senza titolo (il «prologo»), prima del primo bicchiere. "
-            "Può restare attaccata alla prima puntata oppure essere scartata.")
+            "Se ogni file comincia con una breve scenetta senza titolo (il «prologo»), prima del primo stacco, "
+            "può restare attaccata alla prima puntata oppure essere scartata.")
         self.prologue_combo.currentIndexChanged.connect(self._apply_prologue_choice)
         enc.addWidget(self.prologue_combo, 2, 1, 1, 3)
         self.bars_check = QCheckBox("Rendi neri i bordi verdi ai lati")
         self.bars_check.setChecked(True)
         self.bars_check.setToolTip(
-            "In alcuni sketch (es. «Foto a sorpresa», «Il look») le bande ai lati dell'immagine sono verdi nel file "
-            "originale invece che nere. Con questa casella diventano nere, senza toccare l'immagine.")
+            "In alcuni pezzi le bande ai lati dell'immagine sono verdi nel file originale invece che nere. "
+            "Con questa casella diventano nere, senza toccare l'immagine.")
         enc.addWidget(self.bars_check, 2, 4, 1, 4)
         note = QLabel(
             "Ogni pezzo viene ricodificato una sola volta (il taglio è preciso al fotogramma), con codifica software, "
@@ -355,33 +389,187 @@ class DividiTab(QWidget):
     # ------------------------------------------------------------------ settings, helpers
     def _load_settings(self):
         qs = self.win.qsettings
-        self.series_spin.setValue(int(qs.value("dividi/serie", dividi.PROFILES["camera_cafe"].series_id or 1)))
+        try:
+            self.series_id = int(qs.value("dividi/serie", 0)) or None
+        except (TypeError, ValueError):
+            self.series_id = None
+        self.series_label = str(qs.value("dividi/serie_etichetta", "")) if self.series_id else ""
+        self.series_edit.setText(str(qs.value("dividi/serie_testo", "")) if self.series_id else "")
         self.season_spin.setValue(int(qs.value("dividi/stagione", 1)))
         self.key_edit.setText(str(qs.value("dividi/chiave", "")))
-        self.name_edit.setText(str(qs.value("dividi/nome_serie", "")) or self._default_series_name())
+        self.name_edit.setText(str(qs.value("dividi/nome_serie", "")))
         index = self.style_combo.findData(str(qs.value("dividi/stile", "filebot")))
         self.style_combo.setCurrentIndex(max(index, 0))
         self._refresh_list_status()
 
     def _save_settings(self):
         qs = self.win.qsettings
-        qs.setValue("dividi/serie", self.series_spin.value())
+        qs.setValue("dividi/serie", self.series_id or 0)
+        qs.setValue("dividi/serie_testo", self.series_edit.text().strip())
+        qs.setValue("dividi/serie_etichetta", self.series_label)
         qs.setValue("dividi/stagione", self.season_spin.value())
         qs.setValue("dividi/chiave", self.key_edit.text().strip())
         qs.setValue("dividi/nome_serie", self.name_edit.text().strip())
         qs.setValue("dividi/stile", self.style_combo.currentData())
 
-    def _default_series_name(self) -> str:
-        return titoli.cached_series_name(self.series_spin.value()) or self._profile().series_name
-
     def _profile(self) -> dividi.Profile:
-        return dividi.PROFILES[self.profile_combo.currentData()]
+        return self.profile_bar.current() or dividi.STANDARD
+
+    # ------------------------------------------------------------------ profiles: what they remember
+    def collect_settings(self) -> dict:
+        """The tab as it is now (series, quality, names...), to be saved in a profile."""
+        return {"serie": {"id": self.series_id or 0, "nome": self.name_edit.text().strip(),
+                          "testo": self.series_edit.text().strip(), "etichetta": self.series_label},
+                "qualita": self.quality_combo.currentData(), "preset": self.preset_combo.currentData(),
+                "codec": self.codec_combo.currentData(), "paralleli": self.parallel_spin.value(),
+                "fine": self.ending_combo.currentData(), "deinterlaccia": self.deint_combo.currentData(),
+                "prologo": self.prologue_combo.currentData(), "bordi": self.bars_check.isChecked(),
+                "stile": self.style_combo.currentData()}
+
+    def apply_settings(self, d: dict) -> None:
+        """Puts a profile's saved settings in the tab (only what the profile has: the rest stays as it is)."""
+        if not isinstance(d, dict) or not d:
+            return
+        serie = d.get("serie")
+        if isinstance(serie, dict):
+            try:
+                self.series_id = int(serie.get("id") or 0) or None
+            except (TypeError, ValueError):
+                self.series_id = None
+            self.series_label = str(serie.get("etichetta", "")) if self.series_id else ""
+            self.series_edit.setText(str(serie.get("testo", "")) if self.series_id else "")
+            self.name_edit.setText(str(serie.get("nome", "")))
+            self._refresh_list_status()
+        for combo, name in ((self.quality_combo, "qualita"), (self.preset_combo, "preset"), (self.codec_combo, "codec"),
+                            (self.ending_combo, "fine"), (self.deint_combo, "deinterlaccia"),
+                            (self.prologue_combo, "prologo"), (self.style_combo, "stile")):
+            if name in d:
+                i = combo.findData(d[name])
+                if i >= 0:
+                    combo.setCurrentIndex(i)
+        if "bordi" in d:
+            self.bars_check.setChecked(bool(d["bordi"]))
+        if "paralleli" in d:
+            try:
+                self.parallel_spin.setValue(int(d["paralleli"]))
+            except (TypeError, ValueError):
+                pass
+
+    def _profile_changed(self, key: str = ""):
+        profile = self._profile()
+        self.info.setText(profile.description or ("Un tuo profilo." if not profile.builtin else ""))
+        self.apply_settings(profile.settings)
+        if key == self._last_profile_key:
+            return  # only reloaded (after an edit): what was analysed is still valid
+        self._last_profile_key = key
+        if self.entries and not self.is_busy():
+            self.entries = []
+            self.table.setRowCount(0)
+            self.info_label.setText("Profilo cambiato: premi Analizza.")
+        self._refresh_buttons()
+
+    def _new_profile(self) -> str | None:
+        tools = self._tools()
+        return profili_ui.edit_dividi(self, None, tools[0], self.collect_settings()) if tools else None
+
+    def _edit_profile(self, key: str) -> bool:
+        profile = self.profile_bar.profiles.get(key)
+        tools = self._tools()
+        return bool(profile and not profile.builtin and tools
+                    and profili_ui.edit_dividi(self, profile, tools[0], self.collect_settings()) is not None)
+
+    def _update_profile(self, key: str) -> bool:
+        profile = self.profile_bar.profiles.get(key)
+        if profile is None or profile.builtin:
+            return False
+        data = profile.to_dict()
+        data["impostazioni"] = self.collect_settings()
+        try:
+            profili.save("dividi", data, key)
+        except profili.ProfiliError as exc:
+            QMessageBox.warning(self, "Profilo non aggiornato", str(exc))
+            return False
+        return True
+
+    # ------------------------------------------------------------------ the series, found by its title
+    def _series_text_edited(self, text: str):
+        """The title was changed by hand: the series chosen before no longer matches until Cerca confirms it."""
+        if self.series_id is not None:
+            self.series_id, self.series_label = None, ""
+            self._refresh_list_status()
+
+    def _choices(self) -> dict:
+        try:
+            data = json.loads(str(self.win.qsettings.value("dividi/scelte", "{}")))
+            return data if isinstance(data, dict) else {}
+        except ValueError:
+            return {}
+
+    def _search_series(self):
+        if self.is_busy() or self.search_worker is not None:
+            return
+        text = self.series_edit.text().strip()
+        if not text:
+            QMessageBox.information(self, "Titolo mancante", "Scrivi il titolo della serie, poi premi Cerca.")
+            return
+        key = self._key()
+        if not key:
+            QMessageBox.information(self, "Chiave mancante", "Per cercare la serie serve la tua chiave di TMDB: scrivila nel campo «Chiave TMDB».")
+            return
+        self._save_settings()
+        self.search_btn.setEnabled(False)
+        self.series_info.setText("Cerco...")
+        worker = SearchWorker(text, key)
+        worker.done.connect(lambda results: self._after_search(text, results))
+        worker.failed.connect(self._search_failed)
+        self.search_worker = worker
+        worker.start()
+
+    def _search_failed(self, message: str):
+        self.search_worker = None
+        self.search_btn.setEnabled(self.state == "idle")
+        self.series_info.setText("")
+        QMessageBox.warning(self, "Serie non cercata", message)
+
+    def _after_search(self, query: str, results: list):
+        self.search_worker = None
+        self.search_btn.setEnabled(self.state == "idle")
+        self.series_info.setText("")
+        if not results:
+            QMessageBox.information(self, "Nessuna serie", f"TMDB non conosce nessuna serie che si chiami «{query}». Prova con meno parole.")
+            return
+        chosen = results[0]
+        if len(results) > 1:
+            dlg = SeriesPickDialog(self, results, query, preselect=self._choices().get(titoli.normalize(query)))
+            if dlg.exec() != QDialog.Accepted or dlg.chosen() is None:
+                self._refresh_list_status()
+                return
+            chosen = dlg.chosen()
+        self._pick_series(chosen, query)
+
+    def _pick_series(self, serie: titoli.Serie, query: str):
+        self.series_id, self.series_label = serie.id, serie.label()
+        self.series_edit.setText(serie.name)
+        self.name_edit.setText(serie.name)
+        choices = self._choices()
+        choices[titoli.normalize(query)] = serie.id
+        self.win.qsettings.setValue("dividi/scelte", json.dumps(choices))
+        self._save_settings()
+        self._refresh_list_status()
+        if titoli.cached_season(serie.id, self.season_spin.value()) is None and self._key():
+            self._download_list()  # the list of the season is what the titles are checked against
 
     def _key(self) -> str:
         return self.key_edit.text().strip() or titoli.key_from_file()
 
     def _refresh_list_status(self):
-        cached = titoli.cached_season(self.series_spin.value(), self.season_spin.value())
+        self.series_info.setText(f"✔ {self.series_label}" if self.series_id and self.series_label else
+                                 ("✔ serie scelta" if self.series_id else ""))
+        self.series_info.setToolTip(self.series_label)
+        if not self.series_id:
+            self.list_label.setText("Nessuna serie scelta")
+            return
+        cached = titoli.cached_season(self.series_id, self.season_spin.value())
         self.list_label.setText(f"Lista in memoria: {len(cached)} titoli" if cached else "Nessuna lista: serve la chiave")
 
     def _tools(self) -> tuple[str, str] | None:
@@ -400,7 +588,7 @@ class DividiTab(QWidget):
         self.cancel_event.set()
         self.pool.clear()
         self.pool.waitForDone(20000)
-        for worker in [self.analyze_worker, self.download_worker, *self.retired_workers]:
+        for worker in [self.analyze_worker, self.download_worker, self.search_worker, *self.retired_workers]:
             if worker is not None and worker.isRunning():
                 worker.requestInterruption()
                 worker.wait(5000)
@@ -411,8 +599,8 @@ class DividiTab(QWidget):
         self.analyze_btn.setEnabled(idle or self.state == "analyzing")
         self.start_btn.setText("Stop" if self.state == "processing" else "Avvia")
         self.start_btn.setEnabled(self.state == "processing" or (idle and any(p is not None for _, p, _ in self.entries)))
-        for w in (self.folder_edit, self.output_edit, self.profile_combo, self.series_spin, self.season_spin, self.key_edit,
-                  self.list_btn, self.quality_combo, self.preset_combo, self.codec_combo, self.ending_combo,
+        for w in (self.folder_edit, self.output_edit, self.profile_bar, self.series_edit, self.search_btn,
+                  self.season_spin, self.key_edit, self.list_btn, self.quality_combo, self.preset_combo, self.codec_combo, self.ending_combo,
                   self.deint_combo, self.prologue_combo, self.bars_check, self.style_combo, self.name_edit,
                   self.parallel_spin):
             w.setEnabled(idle)
@@ -481,6 +669,9 @@ class DividiTab(QWidget):
 
     # ------------------------------------------------------------------ TMDB list
     def _download_list(self):
+        if not self.series_id:
+            QMessageBox.information(self, "Serie mancante", "Scegli prima la serie: scrivi il titolo e premi Cerca.")
+            return
         key = self._key()
         if not key:
             QMessageBox.information(self, "Chiave mancante", "Scrivi nel campo la tua chiave di TMDB, poi premi di nuovo.")
@@ -488,7 +679,7 @@ class DividiTab(QWidget):
         self._save_settings()
         self.list_btn.setEnabled(False)
         self.list_label.setText("Scarico...")
-        worker = DownloadWorker(self.series_spin.value(), self.season_spin.value(), key)
+        worker = DownloadWorker(self.series_id, self.season_spin.value(), key)
         worker.done.connect(lambda eps: self._after_download(f"Lista scaricata: {len(eps)} titoli"))
         worker.failed.connect(lambda msg: (self._after_download(""), QMessageBox.warning(self, "Lista non scaricata", msg)))
         self.download_worker = worker
@@ -497,8 +688,8 @@ class DividiTab(QWidget):
     def _after_download(self, text: str):
         self.list_btn.setEnabled(self.state == "idle")
         self._refresh_list_status()
-        name = titoli.cached_series_name(self.series_spin.value())
-        if name and text:
+        name = titoli.cached_series_name(self.series_id) if self.series_id else ""
+        if name and text and not self.name_edit.text().strip():
             self.name_edit.setText(name)
         if text:
             self.list_label.setText(text)
@@ -511,13 +702,19 @@ class DividiTab(QWidget):
         if not self.files:
             QMessageBox.warning(self, "Dati mancanti", "Seleziona prima una cartella o dei file.")
             return
-        series, season = self.series_spin.value(), self.season_spin.value()
-        if titoli.cached_season(series, season) is None and not self._key():
-            QMessageBox.warning(
-                self, "Lista dei titoli mancante",
-                "Per questa serie e stagione non c'è ancora la lista dei titoli: scrivi la tua chiave di TMDB nel campo "
-                "apposito e riprova (la lista si scarica una volta sola).")
-            return
+        series, season = self.series_id, self.season_spin.value()
+        profile = self._profile()
+        if profile.method == "sample" and profile.read_titles:  # the titles are read from the picture and checked against TMDB
+            if not series:
+                QMessageBox.warning(self, "Serie mancante", "Questo profilo legge i titoli dallo schermo: scegli prima la serie "
+                                    "(scrivi il titolo nel campo «Serie» e premi Cerca).")
+                return
+            if titoli.cached_season(series, season) is None and not self._key():
+                QMessageBox.warning(
+                    self, "Lista dei titoli mancante",
+                    "Per questa serie e stagione non c'è ancora la lista dei titoli: scrivi la tua chiave di TMDB nel campo "
+                    "apposito e riprova (la lista si scarica una volta sola).")
+                return
         tools = self._tools()
         if tools is None:
             return
@@ -527,7 +724,7 @@ class DividiTab(QWidget):
         self.table.setRowCount(0)
         self.progress.setValue(0)
         self.info_label.setText("Analisi in corso: ci vuole circa mezzo minuto per file...")
-        worker = AnalyzeWorker(tools[0], tools[1], list(self.files), self._profile(), series, season, self._key())
+        worker = AnalyzeWorker(tools[0], tools[1], list(self.files), profile, series, season, self._key())
         worker.progress.connect(self._on_analysis_progress)
         worker.done.connect(self._on_analysis_done)
         worker.failed.connect(self._on_analysis_failed)

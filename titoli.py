@@ -12,7 +12,9 @@ import re
 import sys
 import unicodedata
 import urllib.error
+import urllib.parse
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -113,6 +115,105 @@ def download_season(series_id: int, season: int, key: str) -> list[Episodio]:
     return episodes
 
 
+# ---------------------------------------------------------------------------- finding a series by its title
+COUNTRIES = {
+    "IT": "Italia", "FR": "Francia", "ES": "Spagna", "DE": "Germania", "GB": "Regno Unito", "US": "Stati Uniti",
+    "CA": "Canada", "JP": "Giappone", "KR": "Corea del Sud", "CN": "Cina", "BR": "Brasile", "MX": "Messico",
+    "AR": "Argentina", "AU": "Australia", "PL": "Polonia", "GR": "Grecia", "PT": "Portogallo", "NL": "Paesi Bassi",
+    "BE": "Belgio", "SE": "Svezia", "NO": "Norvegia", "DK": "Danimarca", "FI": "Finlandia", "RU": "Russia",
+    "TR": "Turchia", "IN": "India", "CH": "Svizzera", "AT": "Austria", "IE": "Irlanda", "CZ": "Cechia", "HU": "Ungheria",
+    "RO": "Romania", "IL": "Israele", "TW": "Taiwan", "HK": "Hong Kong", "NZ": "Nuova Zelanda", "ZA": "Sudafrica",
+}
+LANGUAGES = {
+    "it": "italiano", "fr": "francese", "es": "spagnolo", "de": "tedesco", "en": "inglese", "ja": "giapponese",
+    "ko": "coreano", "zh": "cinese", "pt": "portoghese", "nl": "olandese", "sv": "svedese", "no": "norvegese",
+    "da": "danese", "fi": "finlandese", "ru": "russo", "tr": "turco", "hi": "hindi", "pl": "polacco", "el": "greco",
+    "cs": "ceco", "hu": "ungherese", "ro": "rumeno", "he": "ebraico",
+}
+
+
+@dataclass
+class Serie:
+    id: int
+    name: str                 # the title in Italian when TMDB has one
+    original_name: str = ""
+    year: str = ""
+    countries: tuple = ()
+    language: str = ""
+    overview: str = ""
+    seasons: int | None = None
+    episodes: int | None = None
+
+    @property
+    def country_text(self) -> str:
+        return ", ".join(COUNTRIES.get(c, c) for c in self.countries)
+
+    @property
+    def language_text(self) -> str:
+        return LANGUAGES.get(self.language, self.language)
+
+    def label(self) -> str:
+        """«Nome della serie · 2003 · Italia · 5 stagioni», to show what was chosen."""
+        parts = [self.name, self.year, self.country_text]
+        if self.seasons:
+            parts.append(f"{self.seasons} {'stagione' if self.seasons == 1 else 'stagioni'}")
+        return " · ".join(p for p in parts if p)
+
+
+def _get_json(url: str) -> dict:
+    req = urllib.request.Request(url, headers={"Accept": "application/json", "User-Agent": "ClipMerger"})
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            return json.load(resp)
+    except urllib.error.HTTPError as exc:
+        if exc.code == 401:
+            raise TitoliError("TMDB non accetta la chiave (controlla di averla copiata tutta).") from exc
+        raise TitoliError(f"TMDB ha risposto con un errore ({exc.code}).") from exc
+    except (urllib.error.URLError, OSError, ValueError) as exc:
+        raise TitoliError("Impossibile contattare TMDB: controlla la connessione a internet.") from exc
+
+
+def search_series(query: str, key: str, limit: int = 10) -> list[Serie]:
+    """The series TMDB finds for a title, best first, with enough detail to tell namesakes apart (year, country,
+    language, number of seasons and episodes). Never writes the key anywhere."""
+    key, query = key.strip(), query.strip()
+    if not key:
+        raise TitoliError("Manca la chiave di TMDB: scrivila nel campo qui accanto.")
+    if not query:
+        raise TitoliError("Scrivi il titolo della serie.")
+    data = _get_json(f"{API}/search/tv?language=it-IT&query={urllib.parse.quote(query)}&api_key={key}")
+    found = []
+    for r in data.get("results", [])[:limit]:
+        found.append(Serie(
+            int(r["id"]), str(r.get("name") or r.get("original_name") or "").strip(), str(r.get("original_name") or "").strip(),
+            str(r.get("first_air_date") or "")[:4], tuple(r.get("origin_country") or ()), str(r.get("original_language") or ""),
+            str(r.get("overview") or "").strip()))
+
+    def details(s: Serie) -> None:  # seasons and episodes are not in the search result: one small request each
+        try:
+            d = _get_json(f"{API}/tv/{s.id}?language=it-IT&api_key={key}")
+            s.seasons = int(d.get("number_of_seasons") or 0) or None
+            s.episodes = int(d.get("number_of_episodes") or 0) or None
+        except (TitoliError, ValueError, TypeError):
+            pass
+
+    with ThreadPoolExecutor(max_workers=5) as pool:
+        list(pool.map(details, found))
+    return found
+
+
+def series_by_id(series_id: int, key: str) -> Serie | None:
+    """One series by its number (used to show the name of a profile's series); None when TMDB does not answer."""
+    try:
+        r = _get_json(f"{API}/tv/{series_id}?language=it-IT&api_key={key.strip()}")
+    except TitoliError:
+        return None
+    return Serie(int(r["id"]), str(r.get("name") or "").strip(), str(r.get("original_name") or "").strip(),
+                 str(r.get("first_air_date") or "")[:4], tuple(r.get("origin_country") or ()),
+                 str(r.get("original_language") or ""), str(r.get("overview") or "").strip(),
+                 int(r.get("number_of_seasons") or 0) or None, int(r.get("number_of_episodes") or 0) or None)
+
+
 # ---------------------------------------------------------------------------- matching
 def normalize(text: str) -> str:
     text = unicodedata.normalize("NFKD", text).encode("ascii", "ignore").decode().upper()
@@ -194,7 +295,7 @@ NAME_STYLES = [
 
 
 def file_stem(season: int, number: int | None, title: str, series: str = "", style: str = "filebot") -> str:
-    """The file name without extension: "Camera Café - S01E318 - La patente" in the default style. The episode
+    """The file name without extension: "Serie - S01E318 - Titolo" in the default style. The episode
     number has at least three digits, so that files sort properly in a season of hundreds of episodes."""
     clean = lambda t: re.sub(r"\s+", " ", _FORBIDDEN.sub("", t)).strip(" .")
     title, series = clean(title), clean(series)

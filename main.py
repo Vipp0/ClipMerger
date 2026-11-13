@@ -37,7 +37,7 @@ from dropwidgets import PathDropEdit
 
 APP_TITLE = "ClipMerger"
 AT_END_SECONDS = 10  # countdown before closing the program when the queue is done
-APP_VERSION = "0.7.0"
+APP_VERSION = "0.8.0"
 GITHUB_LATEST_RELEASE_API = "https://api.github.com/repos/Vipp0/ClipMerger/releases/latest"
 GITHUB_RELEASES_PAGE = "https://github.com/Vipp0/ClipMerger/releases/latest"
 

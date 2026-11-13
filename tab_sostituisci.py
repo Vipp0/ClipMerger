@@ -18,9 +18,11 @@ from PySide6.QtWidgets import (
 import applog
 import dropwidgets
 import merger
+import profili_ui
 import sostituisci
 import utils
 from dropwidgets import PathDropEdit, PathDropTable
+from profili_ui import ProfileBar
 from sostituisci import EpisodeAnalysis
 
 PRESETS = [("Veloce", "fast"), ("Bilanciato", "medium"), ("Qualità", "slow")]
@@ -63,7 +65,7 @@ class AnalyzeWorker(QThread):
     failed = Signal(str)
 
     def __init__(self, ffmpeg: str, ffprobe: str, episodes: list[Path], intro_cfg, outro_cfg, keep_card: bool = True,
-                 profile: sostituisci.Profile = sostituisci.PROFILES["standard"]):
+                 profile: sostituisci.Profile = sostituisci.STANDARD):
         super().__init__()
         self.ffmpeg, self.ffprobe = ffmpeg, ffprobe
         self.episodes, self.intro_cfg, self.outro_cfg = episodes, intro_cfg, outro_cfg
@@ -186,6 +188,20 @@ class SigleGroup(QGroupBox):
         if path:
             target.setText(path)
 
+    def settings(self) -> dict:
+        """What this group holds, to be saved in a profile."""
+        return {"attiva": self.isChecked(), "nuova": self.new_edit.text(), "come": self.how_combo.currentData(),
+                "vecchia": self.old_edit.text()}
+
+    def apply_settings(self, d: dict) -> None:
+        if not isinstance(d, dict):
+            return
+        self.setChecked(bool(d.get("attiva", True)))
+        self.new_edit.setText(str(d.get("nuova", "")))
+        index = self.how_combo.findData(d.get("come", "impara"))
+        self.how_combo.setCurrentIndex(max(index, 0))
+        self.old_edit.setText(str(d.get("vecchia", "")))
+
     def active(self) -> bool:
         return self.isChecked()
 
@@ -250,12 +266,12 @@ class SostituisciTab(QWidget):
         browse_out.clicked.connect(self._browse_output)
         top.addWidget(browse_out, 1, 2)
         top.addWidget(QLabel("Profilo:"), 2, 0)
-        self.profile_combo = QComboBox()
-        for key, profile in sostituisci.PROFILES.items():
-            self.profile_combo.addItem(profile.name, key)
-        self.profile_combo.currentIndexChanged.connect(self._profile_changed)
-        top.addWidget(self.profile_combo, 2, 1)
-        self.profile_label = QLabel(sostituisci.PROFILES["standard"].description)
+        self._last_profile_key = "standard"
+        self.profile_bar = ProfileBar("sostituisci", sostituisci.load_profiles, self._new_profile, self._edit_profile,
+                                      self._update_profile)
+        self.profile_bar.selected.connect(self._profile_changed)
+        top.addWidget(self.profile_bar, 2, 1)
+        self.profile_label = QLabel(sostituisci.STANDARD.description)
         self.profile_label.setWordWrap(True)
         top.addWidget(self.profile_label, 3, 1, 1, 2)
         top_box = QGroupBox("Episodi")
@@ -358,10 +374,15 @@ class SostituisciTab(QWidget):
 
     # ------------------------------------------------------------------ helpers
     def _profile(self) -> sostituisci.Profile:
-        return sostituisci.PROFILES[self.profile_combo.currentData()]
+        return self.profile_bar.current() or sostituisci.STANDARD
 
-    def _profile_changed(self):
-        self.profile_label.setText(self._profile().description)
+    def _profile_changed(self, key: str = ""):
+        profile = self._profile()
+        self.profile_label.setText(profile.description or ("Un tuo profilo." if not profile.builtin else ""))
+        self.apply_settings(profile.settings)
+        if key == self._last_profile_key and self.analyses:
+            return  # the same profile was only reloaded: what was analysed is still valid
+        self._last_profile_key = key
         self.analyses = []
         for row in range(self.table.rowCount()):
             self.table.item(row, COL_STATUS).setText("Da analizzare")
@@ -369,6 +390,55 @@ class SostituisciTab(QWidget):
                 self.table.item(row, col).setText("")
             self.table.item(row, COL_CHECK).setCheckState(Qt.Unchecked)
         self._refresh_buttons()
+
+    # ------------------------------------------------------------------ profiles: what they remember
+    def collect_settings(self) -> dict:
+        """The tab as it is now (new sigle, quality, audio...), to be saved in a profile."""
+        return {"iniziale": self.intro_group.settings(), "finale": self.outro_group.settings(),
+                "scheda": self.card_check.isChecked(), "qualita": self.quality_combo.currentData(),
+                "preset": self.preset_combo.currentData(), "paralleli": self.parallel_spin.value(),
+                "audio": self.audio_combo.currentData()}
+
+    def apply_settings(self, d: dict) -> None:
+        """Puts a profile's saved settings in the tab (only what the profile has: the rest stays as it is)."""
+        if not isinstance(d, dict) or not d:
+            return
+        if "iniziale" in d:
+            self.intro_group.apply_settings(d["iniziale"])
+        if "finale" in d:
+            self.outro_group.apply_settings(d["finale"])
+        if "scheda" in d:
+            self.card_check.setChecked(bool(d["scheda"]))
+        for combo, name in ((self.quality_combo, "qualita"), (self.preset_combo, "preset"), (self.audio_combo, "audio")):
+            if name in d:
+                i = combo.findData(d[name])
+                if i >= 0:
+                    combo.setCurrentIndex(i)
+        if "paralleli" in d:
+            try:
+                self.parallel_spin.setValue(int(d["paralleli"]))
+            except (TypeError, ValueError):
+                pass
+
+    def _new_profile(self) -> str | None:
+        return profili_ui.edit_sostituisci(self, None, self.collect_settings())
+
+    def _edit_profile(self, key: str) -> bool:
+        profile = self.profile_bar.profiles.get(key)
+        return profile is not None and not profile.builtin and profili_ui.edit_sostituisci(self, profile, self.collect_settings()) is not None
+
+    def _update_profile(self, key: str) -> bool:
+        profile = self.profile_bar.profiles.get(key)
+        if profile is None or profile.builtin:
+            return False
+        data = profile.to_dict()
+        data["impostazioni"] = self.collect_settings()
+        try:
+            profili_ui.profili.save("sostituisci", data, key)
+        except profili_ui.profili.ProfiliError as exc:
+            QMessageBox.warning(self, "Profilo non aggiornato", str(exc))
+            return False
+        return True
 
     def _tools(self) -> tuple[str, str] | None:
         status = self.win.ffmpeg_status
@@ -398,7 +468,7 @@ class SostituisciTab(QWidget):
         self.start_btn.setEnabled(self.state == "processing" or (idle and any(a.ready for a in self.analyses)))
         self.preview_btn.setEnabled(idle and any(a.ready for a in self.analyses))
         for w in (self.folder_edit, self.output_edit, self.quality_combo, self.preset_combo, self.parallel_spin,
-                  self.audio_combo, self.card_check, self.profile_combo):
+                  self.audio_combo, self.card_check, self.profile_bar):
             w.setEnabled(idle)
         self.table.setEditTriggers(
             (QAbstractItemView.DoubleClicked | QAbstractItemView.EditKeyPressed) if idle
