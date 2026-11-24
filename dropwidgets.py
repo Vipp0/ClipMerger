@@ -90,6 +90,16 @@ class PathDropEdit(QLineEdit):
             self.paths_dropped.emit(paths)
 
 
+def tune_list(view: QAbstractItemView, min_rows: int = 0) -> None:
+    """A list that scrolls smoothly (pixel by pixel: one wheel notch moves about a row and a half, instead of three
+    whole rows at a time) and, with `min_rows`, is always tall enough to show that many rows."""
+    view.setVerticalScrollMode(QAbstractItemView.ScrollPerPixel)
+    view.verticalScrollBar().setSingleStep(12)
+    if min_rows and isinstance(view, QTableWidget):
+        head = max(view.horizontalHeader().sizeHint().height(), 34)
+        view.setMinimumHeight(head + min_rows * view.verticalHeader().defaultSectionSize() + 2 * view.frameWidth())
+
+
 class PathDropTable(QTableWidget):
     """A table in which files and folders can be dropped: it only reports them (`paths_dropped`)."""
 

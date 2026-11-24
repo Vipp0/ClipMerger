@@ -332,7 +332,7 @@ class TracceTab(QWidget):
         self.table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.table.setSelectionMode(QAbstractItemView.SingleSelection)
-        self.table.setMinimumHeight(150)
+        dropwidgets.tune_list(self.table, 10)
         self.table.cellDoubleClicked.connect(lambda row, _col: self._edit_row(row))
         self.table.setToolTip("Una sigla con * è la traccia predefinita, (f) è un sottotitolo forzato. Doppio clic su una riga per modificare a mano.")
         root.addWidget(self.table, stretch=1)

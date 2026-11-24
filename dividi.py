@@ -5,19 +5,24 @@ Due modi di trovare i punti di taglio:
 - «campione» (profili creati dall'utente): ogni pezzo comincia con lo stesso identico filmato (un breve stacco
   grafico che si ripete): lo si riconosce confrontando i fotogrammi con un campione salvato nel profilo e si taglia
   sullo stacco netto che lo precede. Se il titolo compare scritto sullo schermo, lo si legge (OCR di Windows) e lo
-  si confronta con la lista di TMDB per dare il nome al file.
+  si confronta con la lista di TMDB per dare il nome al file;
+- «titoli» (profili creati dall'utente): senza campione. Ogni pezzo ha il titolo scritto sullo schermo accanto a un
+  piccolo logo: si cerca il logo, si risale allo stacco grafico (cornice scura, centro luminoso) che lo precede e si
+  taglia lì; apertura e finale del file si riconoscono dal buio.
 
 Uso da riga di comando (per fare a mano il campione di un profilo):
     python dividi.py campione video.mkv INIZIO DURATA uscita.npz
 """
 from __future__ import annotations
 
+import base64
 import re
 import shutil
 import subprocess
 import sys
 import tempfile
 import time
+import zlib
 from dataclasses import dataclass, field
 from functools import lru_cache
 from pathlib import Path
@@ -43,6 +48,22 @@ SNAP_RADIUS = 0.8               # the hard cut is looked for this close to where
 SCENE_THRESHOLD = 0.25
 MIN_PIECE = 20.0                # a shorter piece than this is flagged
 CAPTION_FPS = 2.5
+# titles method
+MIN_CUP = 1.0                   # shortest stretch taken for the graphic animation, seconds
+LONG_CUP_TITLES = 3.0           # an animation this long (or longer) is preferred as the one that opens a piece
+CUP_BEFORE_TITLE = 15.0         # the animation begins at most this long before its title's logo appears
+MIN_PIECE_GAP = 90.0            # a title without its animation only starts a piece this long after the previous one began
+LOGO_FPS = 5
+LOGO_BOX = (0.66, 0.80, 0.76, 0.93)  # where the title's small logo sits: x0, x1, y0, y1 as fractions of the frame
+LOGO_SIZE = (96, 72)                 # the logo's region is looked at as an image of this size (width, height)
+# the logo's shape: where it is white / orange (bit-packed, compressed, base64); a frame shows the title when its
+# own white/orange pixels in that region overlap this shape well
+_LOGO_WHITE = "eNpjYKAnYCSGfQCJ/QfBZv7D9ADBZqhvgLM56v8jxDn+/4CzGf7/hxjGjsLmQWYzwtk/GI7D2R8Y7JHY8khsfmxsNqB1//9DXMQCdDaMzYPKZtBHYjPYI7EZkdhQwEEEGxkIUIk9CqgJAKaqOTw="
+_LOGO_ORANGE = "eNpjYBgFZALGg0icA0jsBgSTGUmciUEAzmZHUo6TfQC7Ocji/MhsBuxsdhx6GRwQTJ4D2NncB0bjmSIAAD11Clw="
+LOGO_MATCH = 0.3                     # overlap (intersection over union) from which the logo is taken as present
+DARK = 35.0                     # mean grey level below which a frame counts as dark (the file's ending)
+BRIGHT = 70.0                   # ... and above which it counts as picture (the pieces themselves)
+TAIL_BRIGHT = 2.0               # the last stretch of picture this long (or longer) is the end of the last piece
 _SCENE_RE = re.compile(r"pts_time:([\d.]+)\s*\n.*?lavfi\.scene_score=([\d.]+)")
 
 
@@ -60,7 +81,8 @@ class Profile:
     key: str
     name: str
     description: str = ""
-    method: str = "black"       # "black": cut in the black between pieces; "sample": find a jingle that opens each piece
+    method: str = "black"       # "black": cut in the black between pieces; "sample": find a jingle that opens each piece;
+                                # "titles": find the title's logo and the animation before it
     black_min: float = 0.12     # black method: shortest black stretch that counts, seconds
     min_piece: float = 30.0     # black method: shortest piece, seconds (closer cuts are ignored)
     sample: str = ""            # sample method: the sample's file name in the profile folder
@@ -71,6 +93,11 @@ class Profile:
     credits: bool = False       # the file ends with orange closing credits to leave out
     settings: dict = field(default_factory=dict)  # what the tab looked like when saved (series, quality, names...)
     builtin: bool = False
+
+    @property
+    def reads_titles(self) -> bool:
+        """The piece titles are read from the picture (and checked against the series' list)."""
+        return self.method == "titles" or (self.method == "sample" and self.read_titles)
 
     def to_dict(self) -> dict:
         return {"nome": self.name, "descrizione": self.description, "metodo": self.method,
@@ -87,7 +114,7 @@ class Profile:
             except (TypeError, ValueError):
                 return default
         settings = d.get("impostazioni")
-        method = "sample" if d.get("metodo") == "sample" else "black"
+        method = d.get("metodo") if d.get("metodo") in ("sample", "titles") else "black"
         return Profile(key, str(d.get("nome", key)), str(d.get("descrizione", "")), method,
                        num("nero_minimo", 0.12, 0.02), num("pezzo_minimo", 30.0, 1.0), str(d.get("campione", "")),
                        num("secondi_prima_del_filmato", 0.30), bool(d.get("titolo_sullo_schermo", False)),
@@ -119,6 +146,7 @@ class Piece:
     read_lines: list[str] = field(default_factory=list)
     thumb: Path | None = None
     number: int | None = None
+    season: int = 0             # the season of the chosen episode (0 when none / not known)
     title: str = ""
     score: float = 0.0
     ambiguous: bool = False
@@ -126,6 +154,7 @@ class Piece:
     bars: tuple[int, int] | None = None  # green side bars: black out columns < first and >= second
     prologue_start: float | None = None  # first piece of a file: where its short untitled opening bit begins
     tail: tuple[float, float] | None = None  # the file's own ending (TV switching off + closing credits): (start, end)
+    caption: tuple[float, float] | None = None  # titles method: (start, length) of the stretch where the title is on screen
 
     @property
     def duration(self) -> float:
@@ -397,13 +426,15 @@ def _yellow_mask_filter() -> str:
     return f"format=gbrp,geq=g='{expr}':b='{expr}':r='{expr}',format=rgb24"
 
 
-def _caption_frames(ffmpeg: str, path: Path, piece_no: int, cut: float, profile: Profile, folder: Path) -> None:
-    """Writes the frames where the title may be (normal, and with only the yellow lettering kept) as pictures."""
-    start = cut + profile.caption_from
+def _caption_frames(ffmpeg: str, path: Path, piece_no: int, cut: float, profile: Profile, folder: Path,
+                    window: tuple[float, float] | None = None) -> None:
+    """Writes the frames where the title may be (normal, and with only the yellow lettering kept) as pictures.
+    `window` = (start, length) when it is known exactly; else it is looked for after the cut as the profile says."""
+    start, length = window if window else (cut + profile.caption_from, profile.caption_len)
     flt = ("[0:v]fps=%s,crop=iw:ih*0.30:0:ih*0.70,scale=iw*2:-1:flags=lanczos,split[a][b];[b]%s[m]"
-           % (CAPTION_FPS, _yellow_mask_filter()))
+           % (CAPTION_FPS * 2 if window else CAPTION_FPS, _yellow_mask_filter()))  # a known window is read more densely
     subprocess.run(
-        [ffmpeg, "-v", "error", "-y", "-nostdin", "-ss", f"{start:.3f}", "-t", f"{profile.caption_len:.2f}",
+        [ffmpeg, "-v", "error", "-y", "-nostdin", "-ss", f"{max(start, 0.0):.3f}", "-t", f"{length:.2f}",
          "-i", str(path), "-an", "-sn", "-filter_complex", flt,
          "-map", "[a]", str(folder / f"p{piece_no:03d}_%02d.png"),
          "-map", "[m]", str(folder / f"p{piece_no:03d}_%02dm.png")],
@@ -416,7 +447,7 @@ def read_titles(ffmpeg: str, path: Path, pieces: list[Piece], first_no: int, pro
     for k, piece in enumerate(pieces):
         if cancelled is not None and cancelled():
             raise Annullato()
-        _caption_frames(ffmpeg, path, first_no + k, piece.cup_cut, profile, folder)
+        _caption_frames(ffmpeg, path, first_no + k, piece.cup_cut, profile, folder, piece.caption)
     texts = ocr_windows.read_folder(folder)
     for k, piece in enumerate(pieces):
         prefix = f"p{first_no + k:03d}_"
@@ -425,6 +456,7 @@ def read_titles(ffmpeg: str, path: Path, pieces: list[Piece], first_no: int, pro
         shots = sorted(folder.glob(f"{prefix}[0-9][0-9].png"))
         match = titoli.best_match(lines, catalogue, used)
         piece.number, piece.title, piece.score, piece.ambiguous = match.number, match.title, match.score, match.ambiguous
+        piece.season = match.season
 
         def shows_title(shot: Path) -> float:  # how well this frame's lettering fits the chosen title (else: how much there is)
             read = texts.get(shot.stem, [])
@@ -432,7 +464,138 @@ def read_titles(ffmpeg: str, path: Path, pieces: list[Piece], first_no: int, pro
             return fit * 1000 + len(" ".join(read))
         piece.thumb = max(shots, key=shows_title) if shots else None
         if piece.number is not None:
-            used.add(piece.number)
+            used.add((piece.season, piece.number))
+
+
+# ---------------------------------------------------------------------------- titles method
+def _runs(flags: np.ndarray, rate: float, min_len: float, join: float = 0.0) -> list[tuple[float, float]]:
+    """Stretches (start, end) in seconds where `flags` is true; gaps shorter than `join` seconds are bridged."""
+    out: list[list[int]] = []
+    i, n = 0, len(flags)
+    while i < n:
+        if flags[i]:
+            j = i
+            while j + 1 < n and flags[j + 1]:
+                j += 1
+            if out and (i - out[-1][1] - 1) / rate <= join:
+                out[-1][1] = j
+            else:
+                out.append([i, j])
+            i = j + 1
+        else:
+            i += 1
+    return [(a / rate, (b + 1) / rate) for a, b in out if (b + 1 - a) / rate >= min_len]
+
+
+def scan_titles(ffmpeg: str, path: Path, duration: float, progress=None, cancelled=None):
+    """One look at the whole file: (animations, brightness, logos).
+    animations: stretches where the picture has a dark frame at its sides and a bright centre (the graphic that opens
+    every piece, in any of its versions, and also the opening of the file); brightness: mean grey level of every frame
+    at FPS; logos: stretches where the title's small logo (white with orange lettering) is at the lower right."""
+    means: list[np.ndarray] = []
+    side: list[np.ndarray] = []
+    x = lambda a: int(a * W)
+    y = lambda a: int(a * H)
+    for first, frames in _gray_chunks(ffmpeg, path, cancelled=cancelled):
+        f = frames.reshape(-1, H, W).astype(np.float32)
+        left = f[:, y(0.10):y(0.70), x(0.15):x(0.185)].mean(axis=(1, 2))
+        right = f[:, y(0.10):y(0.70), x(0.815):x(0.85)].mean(axis=(1, 2))
+        centre = f[:, y(0.25):y(0.60), x(0.38):x(0.62)].mean(axis=(1, 2))
+        side.append((left < 60) & (right < 60) & (centre > 70))
+        means.append(f.mean(axis=(1, 2)))
+        if progress:
+            progress(min(1.0, (first + len(frames)) / FPS / max(duration, 1.0)))
+    brightness = np.concatenate(means) if means else np.zeros(0)
+    cups = _runs(np.concatenate(side) if side else np.zeros(0, dtype=bool), FPS, MIN_CUP, join=0.2)
+
+    x0, x1, y0, y1 = LOGO_BOX
+    rw, rh = LOGO_SIZE
+    proc = subprocess.run(
+        [ffmpeg, "-v", "error", "-nostdin", "-i", str(path), "-an", "-sn", "-vf",
+         f"fps={LOGO_FPS},crop=iw*{x1 - x0}:ih*{y1 - y0}:iw*{x0}:ih*{y0},scale={rw}:{rh},format=rgb24",
+         "-f", "rawvideo", "-"], capture_output=True, creationflags=CREATE_NO_WINDOW)
+    n = len(proc.stdout) // (rw * rh * 3)
+    px = np.frombuffer(proc.stdout[: n * rw * rh * 3], dtype=np.uint8).reshape(n, rw * rh, 3).astype(np.int32)
+    r, g, b = px[:, :, 0], px[:, :, 1], px[:, :, 2]
+    orange = (r > 190) & (g > 80) & (g < 175) & (b < 80) & (r - g > 50)
+    white = (r > 205) & (g > 205) & (b > 190)
+
+    def shape(b64: str) -> np.ndarray:
+        bits = np.unpackbits(np.frombuffer(zlib.decompress(base64.b64decode(b64)), dtype=np.uint8))
+        return bits[: rw * rh].astype(bool).reshape(1, rh * rw)
+    tw, to = shape(_LOGO_WHITE), shape(_LOGO_ORANGE)
+    inter = (white & tw).sum(axis=1) + (orange & to).sum(axis=1)
+    union = (white | tw).sum(axis=1) + (orange | to).sum(axis=1)
+    logos = _runs(inter / np.maximum(union, 1) >= LOGO_MATCH, LOGO_FPS, 1.6, join=1.9)
+    return cups, brightness, logos
+
+
+def _opening_end(ffmpeg: str, path: Path, cups, brightness: np.ndarray, logos) -> float:
+    """Where the programme's opening ends: the last graphic animation in the first seconds that no title follows
+    (an animation that does have a title after it opens a piece), then, if the screen goes dark right after it (the
+    lettering on black), up to the first picture. 0 when the file does not begin with an opening."""
+    early = [c for c in cups if c[0] <= OPENING_MAX_START and not any(c[0] <= lg[0] <= c[0] + CUP_BEFORE_TITLE for lg in logos)]
+    if not early:
+        return 0.0
+    end = early[-1][1]
+    j = int(end * FPS)
+    while j < len(brightness) and j / FPS < end + 1.5 and brightness[j] >= DARK:
+        j += 1
+    if j < len(brightness) and brightness[j] < DARK:  # the dark screen follows: wait for the picture
+        while j < len(brightness) and brightness[j] < BRIGHT * 0.7 and j / FPS < end + 30.0:
+            j += 1
+        end = j / FPS
+    return _snap(ffmpeg, path, end, 0.5)
+
+
+def _ending_start(ffmpeg: str, path: Path, brightness: np.ndarray, duration: float) -> float | None:
+    """Where the file's own ending (lettering on black, credits) begins: after the last stretch of real picture."""
+    bright = brightness > BRIGHT
+    lasts = _runs(bright, FPS, TAIL_BRIGHT, join=0.5)
+    if not lasts:
+        return None
+    end = lasts[-1][1]
+    if not (3.0 <= duration - end <= 120.0):
+        return None
+    return _snap(ffmpeg, path, end, 0.5)
+
+
+def _titles_pieces(ffmpeg: str, path: Path, res: "FileAnalysis", cups, brightness, logos, orange_credits: bool) -> None:
+    res.opening_end = _opening_end(ffmpeg, path, cups, brightness, logos)
+    if orange_credits:  # closing credits on an orange background, with the television switching off before them
+        found = credits_start(ffmpeg, path, res.duration)
+        if found:
+            res.credits_start = _snap(ffmpeg, path, found, 0.5)
+            res.tail_start = tv_off_start(ffmpeg, path, res.credits_start) or res.credits_start
+    if res.tail_start is None:  # lettering and credits on black (also when orange ones were asked for but not there)
+        res.tail_start = _ending_start(ffmpeg, path, brightness, res.duration)
+    end_of_file = res.tail_start or res.duration
+    starts: list[tuple[float, bool, float, tuple[float, float]]] = []  # (cut, snapped, cup seen at, title window)
+    taken: set[int] = set()
+    for lg in logos:
+        near = [(k, c) for k, c in enumerate(cups) if k not in taken and c[0] >= res.opening_end - 0.5
+                and lg[0] - CUP_BEFORE_TITLE <= c[0] and c[1] <= lg[0] + 0.5]
+        long_ones = [kc for kc in near if kc[1][1] - kc[1][0] >= LONG_CUP_TITLES]
+        pick = (long_ones or near or [None])[-1]
+        window = (lg[0] - 1.0, lg[1] - lg[0] + 2.0)  # the lettering can come a little before / go on after the logo
+        if pick is None:
+            if starts and lg[0] - starts[-1][0] < MIN_PIECE_GAP:
+                continue  # a title this soon after the last piece began is not a new piece
+            starts.append((max(lg[0] - 8.0, res.opening_end), False, 0.0, window))
+            continue
+        taken.add(pick[0])
+        seen = pick[1][0]
+        cut = scene_cut_near(ffmpeg, path, seen, SNAP_RADIUS)
+        starts.append((round(cut, 3) if cut is not None else seen, cut is not None, seen, window))
+    if not starts:
+        res.error = "Non trovo nessun titolo con il suo logo in questo file: il profilo non lo riconosce."
+        return
+    bounds = [res.opening_end] + [s[0] for s in starts[1:]] + [end_of_file]
+    for i, (cut, ok, seen, window) in enumerate(starts):
+        res.pieces.append(Piece(
+            start=bounds[i], end=max(bounds[i + 1], bounds[i] + 0.1), cup_cut=cut, cup_found=seen, snapped=ok,
+            prologue_start=bounds[i] if i == 0 and bounds[i] < cut - 1.0 else None, interlaced=res.interlaced,
+            tail=(res.tail_start, res.duration) if res.tail_start else None, caption=window))
 
 
 # ---------------------------------------------------------------------------- analysis of one file
@@ -458,6 +621,24 @@ def analizza_file(ffmpeg: str, ffprobe: str, path: Path, profile: Profile, sampl
                                     score=1.0, interlaced=res.interlaced))
         for piece in res.pieces:
             piece.bars = detect_bars(ffmpeg, path, piece.start, piece.end, info.width)
+        if progress:
+            progress(1.0, f"{path.name}: fatto")
+        return res
+    if profile.method == "titles":
+        if progress:
+            progress(0.0, f"{path.name}: cerco i titoli e gli stacchi")
+        cups_t, brightness, logos = scan_titles(
+            ffmpeg, path, res.duration, progress=(lambda f: progress(f * 0.7, f"{path.name}: cerco i titoli e gli stacchi")) if progress else None,
+            cancelled=cancelled)
+        applog.log.info("Dividi: %s -> %d stacchi, %d titoli", path.name, len(cups_t), len(logos))
+        _titles_pieces(ffmpeg, path, res, cups_t, brightness, logos, profile.credits)
+        if res.error:
+            return res
+        for piece in res.pieces:
+            piece.bars = detect_bars(ffmpeg, path, piece.start, piece.end, info.width)
+        if progress:
+            progress(0.8, f"{path.name}: leggo i titoli")
+        read_titles(ffmpeg, path, res.pieces, first_no, profile, work, catalogue, used, cancelled)
         if progress:
             progress(1.0, f"{path.name}: fatto")
         return res

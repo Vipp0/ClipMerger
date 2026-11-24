@@ -109,6 +109,8 @@ class LibraryPage(QWidget):
         self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.table.setSelectionMode(QAbstractItemView.ExtendedSelection)
         self.table.verticalHeader().hide()
+        self.table.setVerticalScrollMode(QAbstractItemView.ScrollPerPixel)
+        self.table.verticalScrollBar().setSingleStep(12)
         self.table.itemChanged.connect(self._on_item_changed)
         root.addWidget(self.table, 1)
 

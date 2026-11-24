@@ -290,7 +290,8 @@ class DividiProfileDialog(QDialog):
         self.method_combo = QComboBox()
         self.method_combo.addItem("Taglia sul nero tra un pezzo e l'altro", "black")
         self.method_combo.addItem("Riconosce un filmato che si ripete all'inizio di ogni pezzo", "sample")
-        self.method_combo.setCurrentIndex(1 if profile and profile.method == "sample" else 0)
+        self.method_combo.addItem("Riconosce il titolo scritto sullo schermo (col suo logo) e lo stacco che lo precede", "titles")
+        self.method_combo.setCurrentIndex(max(self.method_combo.findData(profile.method if profile else "black"), 0))
         self.method_combo.currentIndexChanged.connect(self._method_changed)
         form.addRow("Punti di taglio:", self.method_combo)
         layout.addLayout(form)
@@ -358,10 +359,21 @@ class DividiProfileDialog(QDialog):
         self.titles_check.toggled.connect(lambda on: (self.cap_from.setEnabled(on), self.cap_len.setEnabled(on)))
         self.cap_from.setEnabled(self.titles_check.isChecked())
         self.cap_len.setEnabled(self.titles_check.isChecked())
+        layout.addWidget(self.sample_box)
+
+        self.titles_box = QGroupBox("Titolo con il suo logo")
+        t = QVBoxLayout(self.titles_box)
+        label = QLabel(
+            "Ogni pezzo ha il titolo scritto sullo schermo accanto a un piccolo logo: il programma cerca quel logo, risale "
+            "allo stacco grafico che lo precede e taglia lì, poi legge il titolo e lo confronta con la lista di TMDB. "
+            "L'apertura (prima del primo stacco) e il finale con i titoli di coda su fondo nero si riconoscono da soli.")
+        label.setWordWrap(True)
+        t.addWidget(label)
+        layout.addWidget(self.titles_box)
+
         self.credits_check = QCheckBox("Il file finisce con titoli di coda su fondo arancione (e l'effetto del televisore che si spegne): non farli entrare nell'ultimo pezzo")
         self.credits_check.setChecked(bool(profile and profile.credits))
-        s.addWidget(self.credits_check)
-        layout.addWidget(self.sample_box)
+        layout.addWidget(self.credits_check)
 
         self.settings_check = QCheckBox(
             "Salva anche le impostazioni attuali della scheda (serie TMDB, qualità, nome dei file...), così il profilo le richiama")
@@ -371,9 +383,11 @@ class DividiProfileDialog(QDialog):
         self._method_changed()
 
     def _method_changed(self) -> None:
-        sample = self.method_combo.currentData() == "sample"
-        self.sample_box.setVisible(sample)
-        self.black_box.setVisible(not sample)
+        method = self.method_combo.currentData()
+        self.sample_box.setVisible(method == "sample")
+        self.titles_box.setVisible(method == "titles")
+        self.credits_check.setVisible(method != "black")
+        self.black_box.setVisible(method == "black")
         self.adjustSize()
 
     def _video_dropped(self, paths: list) -> None:
@@ -451,15 +465,17 @@ def edit_dividi(parent, profile, ffmpeg: str, current_settings: dict) -> str | N
     dlg = DividiProfileDialog(parent, profile, ffmpeg, with_settings=profile is None)
     if dlg.exec() != QDialog.Accepted:
         return None
-    sample_mode = dlg.method_combo.currentData() == "sample"
+    mode = dlg.method_combo.currentData()
+    sample_mode = mode == "sample"
     key = profile.key if profile else profili.new_key("dividi", dlg.name_edit.text().strip())
     data = {"nome": dlg.name_edit.text().strip(), "descrizione": dlg.desc_edit.text().strip(),
-            "metodo": "sample" if sample_mode else "black",
+            "metodo": mode,
             "nero_minimo": dlg.black_min.value(), "pezzo_minimo": dlg.min_piece.value(),
             "campione": profile.sample if profile else "",
-            "secondi_prima_del_filmato": dlg.lead.value(), "titolo_sullo_schermo": dlg.titles_check.isChecked() and sample_mode,
+            "secondi_prima_del_filmato": dlg.lead.value(),
+            "titolo_sullo_schermo": mode == "titles" or (dlg.titles_check.isChecked() and sample_mode),
             "titolo_dopo": dlg.cap_from.value(), "titolo_per": dlg.cap_len.value(),
-            "titoli_di_coda_arancioni": dlg.credits_check.isChecked() and sample_mode}
+            "titoli_di_coda_arancioni": dlg.credits_check.isChecked() and mode != "black"}
     data["impostazioni"] = current_settings if dlg.settings_check.isChecked() else (profile.settings if profile else {})
     video = dlg.video_edit.text().strip()
     if sample_mode and video:

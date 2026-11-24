@@ -34,7 +34,7 @@ from utils import list_video_files
 
 PROLOGUES = [("Unito alla prima puntata", "attach"), ("Scartato (la prima puntata parte dal suo stacco)", "drop")]
 ENDINGS = [("Pulita: finisce con la scena, senza la transizione", "clean"),
-           ("Con la transizione e i titoli di coda (circa 8 secondi)", "credits")]
+           ("Con la transizione e i titoli di coda", "credits")]
 COL_CHECK, COL_FILE, COL_START, COL_END, COL_DUR, COL_NUM, COL_TITLE, COL_STATUS, COL_SHOT, COL_PROGRESS = range(10)
 COL_EDITABLE = (COL_START, COL_END, COL_NUM, COL_TITLE)
 WORK_DIR = Path(tempfile.gettempdir()) / "ClipMerger_dividi"
@@ -58,12 +58,12 @@ class AnalyzeWorker(QThread):
     def run(self):
         ffmpeg, ffprobe, files, profile, series_id, season, key = self.args
         try:
-            catalogue = (titoli.cached_season(series_id, season) if series_id else None)
+            catalogue = (titoli.cached_catalogue(series_id, season) if series_id else None)
             if catalogue is None:
                 catalogue = []
-                if series_id and profile.method == "sample" and profile.read_titles:  # the list is needed to name the pieces
+                if series_id and profile.reads_titles:  # the list is needed to name the pieces
                     self.progress.emit(0.0, "Scarico la lista dei titoli da TMDB...")
-                    catalogue = titoli.download_season(series_id, season, key)
+                    catalogue = titoli.download_catalogue(series_id, season, key)
             result = dividi.analizza(
                 files, profile, catalogue, ffmpeg, ffprobe, WORK_DIR,
                 progress=lambda f, text: self.progress.emit(f, text), cancelled=self.isInterruptionRequested)
@@ -107,7 +107,7 @@ class DownloadWorker(QThread):
 
     def run(self):
         try:
-            self.done.emit(titoli.download_season(*self.args))
+            self.done.emit(titoli.download_catalogue(*self.args))
         except titoli.TitoliError as exc:
             self.failed.emit(str(exc))
         except Exception as exc:
@@ -195,7 +195,10 @@ class DividiTab(QWidget):
         prof.addWidget(self.series_info, 2, 5)
         prof.addWidget(QLabel("Stagione:"), 3, 0)
         self.season_spin = QSpinBox()
-        self.season_spin.setRange(1, 99)
+        self.season_spin.setRange(0, 99)
+        self.season_spin.setSpecialValueText("tutte")
+        self.season_spin.setToolTip("«tutte»: i titoli si cercano in tutte le stagioni della serie, e ogni puntata prende "
+                                    "stagione e numero dalla lista dove si trova il suo titolo.")
         self.season_spin.valueChanged.connect(self._refresh_list_status)
         prof.addWidget(self.season_spin, 3, 1)
         prof.addWidget(QLabel("Chiave TMDB:"), 3, 2)
@@ -301,7 +304,7 @@ class DividiTab(QWidget):
             "Doppio clic su Inizio, Fine, N° o Titolo per correggere a mano (i tempi come minuti:secondi, es. 4:51.3). "
             "Se scrivi un titolo che è nella lista di TMDB, il numero si aggiorna da solo. "
             "Doppio clic sull'immagine per vederla ingrandita.")
-        self.table.setMinimumHeight(200)
+        dropwidgets.tune_list(self.table, 8)
         root.addWidget(self.table, stretch=1)
 
         bottom = QHBoxLayout()
@@ -497,7 +500,7 @@ class DividiTab(QWidget):
         self.win.qsettings.setValue("dividi/scelte", json.dumps(choices))
         self._save_settings()
         self._refresh_list_status()
-        if titoli.cached_season(serie.id, self.season_spin.value()) is None and self._key():
+        if titoli.cached_catalogue(serie.id, self.season_spin.value()) is None and self._key():
             self._download_list()  # the list of the season is what the titles are checked against
 
     def _key(self) -> str:
@@ -510,8 +513,15 @@ class DividiTab(QWidget):
         if not self.series_id:
             self.list_label.setText("Nessuna serie scelta")
             return
-        cached = titoli.cached_season(self.series_id, self.season_spin.value())
-        self.list_label.setText(f"Lista in memoria: {len(cached)} titoli" if cached else "Nessuna lista: serve la chiave")
+        season = self.season_spin.value()
+        cached = titoli.cached_catalogue(self.series_id, season)
+        if not cached:
+            self.list_label.setText("Nessuna lista: serve la chiave")
+        elif season == 0:
+            have = ", ".join(str(s) for s in titoli.cached_seasons(self.series_id))
+            self.list_label.setText(f"Liste in memoria: stagioni {have} ({len(cached)} titoli)")
+        else:
+            self.list_label.setText(f"Lista in memoria: {len(cached)} titoli")
 
     def _tools(self) -> tuple[str, str] | None:
         status = self.win.ffmpeg_status
@@ -585,9 +595,11 @@ class DividiTab(QWidget):
         self.files = files
         self.folder_edit.setText(folder if len(files) != 1 else str(files[0]))
         self.output_edit.setText(str(Path(folder) / "puntate divise"))
-        season = titoli.season_from_names([f.name for f in files])
-        if season is not None:
-            self.season_spin.setValue(season)
+        seasons = titoli.seasons_in_names([f.name for f in files])
+        if len(seasons) == 1:
+            self.season_spin.setValue(next(iter(seasons)))
+        elif len(seasons) > 1:  # several seasons among the files: the titles are looked for in all of them
+            self.season_spin.setValue(0)
         self.entries = []
         self.job_rows = {}
         self.table.setRowCount(0)
@@ -631,12 +643,12 @@ class DividiTab(QWidget):
             return
         series, season = self.series_id, self.season_spin.value()
         profile = self._profile()
-        if profile.method == "sample" and profile.read_titles:  # the titles are read from the picture and checked against TMDB
+        if profile.reads_titles:  # the titles are read from the picture and checked against TMDB
             if not series:
                 QMessageBox.warning(self, "Serie mancante", "Questo profilo legge i titoli dallo schermo: scegli prima la serie "
                                     "(scrivi il titolo nel campo «Serie» e premi Cerca).")
                 return
-            if titoli.cached_season(series, season) is None and not self._key():
+            if titoli.cached_catalogue(series, season) is None and not self._key():
                 QMessageBox.warning(
                     self, "Lista dei titoli mancante",
                     "Per questa serie e stagione non c'è ancora la lista dei titoli: scrivi la tua chiave di TMDB nel campo "
@@ -744,7 +756,7 @@ class DividiTab(QWidget):
         self.table.setItem(row, COL_START, self._editable_item(fmt_time(piece.start)))
         self.table.setItem(row, COL_END, self._editable_item(fmt_time(piece.end)))
         self.table.setItem(row, COL_DUR, self._ro_item(fmt_time(piece.duration)))
-        self.table.setItem(row, COL_NUM, self._editable_item("" if piece.number is None else str(piece.number)))
+        self.table.setItem(row, COL_NUM, self._editable_item(self._num_text(piece)))
         self.table.setItem(row, COL_TITLE, self._editable_item(piece.title))
         self.table.setItem(row, COL_STATUS, self._ro_item(self._status_text(piece)))
         shot = self._ro_item("")
@@ -760,13 +772,26 @@ class DividiTab(QWidget):
         self.table.setCellWidget(row, COL_PROGRESS, bar)
         self._paint_row(row, piece)
 
+    def _num_text(self, piece: dividi.Piece) -> str:
+        """The episode number; with the lists of several seasons loaded it comes with its season (S02E232)."""
+        if piece.number is None:
+            return ""
+        if piece.season and len({e.season for e in self.catalogue}) > 1:
+            return f"S{piece.season:02d}E{piece.number}"
+        return str(piece.number)
+
+    def _only_season(self) -> int:
+        """The season a bare number refers to: the only one in the loaded lists, else the one chosen (0 = none)."""
+        seasons = {e.season for e in self.catalogue}
+        return next(iter(seasons)) if len(seasons) == 1 else self.season
+
     @staticmethod
     def _status_text(piece: dividi.Piece) -> str:
         if piece.sure:
             return "Sicura" + (" (bordi verdi)" if piece.bars else "")
         reasons = []
         if piece.ambiguous:
-            reasons.append("stesso titolo con più numeri in TMDB")
+            reasons.append("stesso titolo con più numeri o stagioni in TMDB")
         elif piece.score < titoli.SURE:
             reasons.append("titolo incerto" if piece.title else "titolo non letto")
         if not piece.snapped:
@@ -808,24 +833,28 @@ class DividiTab(QWidget):
                 self.table.item(row, COL_DUR).setText(fmt_time(piece.duration))
             elif item.column() == COL_NUM:
                 text = item.text().strip()
+                m = re.fullmatch(r"(?:[Ss]?(\d{1,2})\s*[EeXx]\s*)?(\d+)", text) if text else None
                 if text == "":
                     piece.number = None
-                elif text.isdigit():
-                    piece.number = int(text)
-                    ep = next((e for e in self.catalogue if e.number == piece.number), None)
-                    if ep is not None and not piece.title:
-                        piece.title = ep.title
-                        self.table.item(row, COL_TITLE).setText(ep.title)
-                else:
-                    item.setText("" if piece.number is None else str(piece.number))
+                elif m is not None:
+                    season = int(m.group(1)) if m.group(1) else (piece.season or self._only_season())
+                    if season:
+                        piece.number, piece.season = int(m.group(2)), season
+                        ep = next((e for e in self.catalogue if e.season == season and e.number == piece.number), None)
+                        if ep is not None and not piece.title:
+                            piece.title = ep.title
+                            self.table.item(row, COL_TITLE).setText(ep.title)
+                    else:
+                        self.info_label.setText("Con più stagioni scrivi anche la stagione, ad esempio S02E232.")
+                item.setText(self._num_text(piece))
                 self._mark_manual(row, piece, title_checked=True)
             else:  # title
                 piece.title = item.text().strip()
                 ep = titoli.find_by_title(piece.title, self.catalogue)
                 if ep is not None:
-                    piece.number, piece.title = ep.number, ep.title
+                    piece.number, piece.season, piece.title = ep.number, ep.season, ep.title
                     item.setText(ep.title)
-                    self.table.item(row, COL_NUM).setText(str(ep.number))
+                    self.table.item(row, COL_NUM).setText(self._num_text(piece))
                 self._mark_manual(row, piece, title_checked=True)
         finally:
             self._filling = False
@@ -877,7 +906,7 @@ class DividiTab(QWidget):
         seen: dict[str, int] = {}
         for row in rows:
             piece = self.entries[row][1]
-            stem = titoli.file_stem(self.season, piece.number, piece.title, self.name_edit.text(), self.style_combo.currentData())
+            stem = titoli.file_stem(piece.season or self.season or 1, piece.number, piece.title, self.name_edit.text(), self.style_combo.currentData())
             if stem == "senza titolo":
                 stem = f"{short_name(self.entries[row][0])} puntata {row + 1}"
             seen[stem.lower()] = seen.get(stem.lower(), 0) + 1

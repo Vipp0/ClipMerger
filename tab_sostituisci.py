@@ -290,7 +290,7 @@ class SostituisciTab(QWidget):
         self.table.setToolTip(
             "Doppio clic su «Tiene da» o «Tiene fino a» per correggere a mano i punti di taglio (es. 1:00.7); "
             "doppio clic sul resto della riga per i dettagli.")
-        self.table.setMinimumHeight(150)
+        dropwidgets.tune_list(self.table, 10)
         root.addWidget(self.table, stretch=1)
 
         bottom = QHBoxLayout()

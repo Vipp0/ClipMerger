@@ -64,6 +64,8 @@ class QueuePage(QWidget):
         self.tree.setColumnCount(4)
         self.tree.setHeaderLabels(["Lavoro", "Dettagli", "Stato", "Avanzamento"])
         self.tree.setRootIsDecorated(True)
+        self.tree.setVerticalScrollMode(QAbstractItemView.ScrollPerPixel)
+        self.tree.verticalScrollBar().setSingleStep(12)
         self.tree.setSelectionMode(QAbstractItemView.SingleSelection)
         self.tree.setEditTriggers(QAbstractItemView.NoEditTriggers)
         header = self.tree.header()

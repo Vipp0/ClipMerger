@@ -30,10 +30,15 @@ class TitoliError(Exception):
     pass
 
 
+class SeasonNotFound(TitoliError):
+    """TMDB has no such season (it is how the end of a series' seasons shows up)."""
+
+
 @dataclass(frozen=True)
 class Episodio:
     number: int
     title: str
+    season: int = 0  # the season it belongs to (0 when not known)
 
 
 def cache_dir() -> Path:
@@ -61,9 +66,28 @@ def cached_season(series_id: int, season: int) -> list[Episodio] | None:
     f = _cache_file(series_id, season)
     try:
         data = json.loads(f.read_text(encoding="utf-8"))
-        return [Episodio(int(n), str(t)) for n, t in data["episodi"]]
+        return [Episodio(int(n), str(t), season) for n, t in data["episodi"]]
     except (OSError, ValueError, KeyError, TypeError):
         return None
+
+
+def cached_seasons(series_id: int) -> dict[int, list[Episodio]]:
+    """Every season of the series whose list is kept on this PC: {season: episodes}, in season order."""
+    found: dict[int, list[Episodio]] = {}
+    for f in cache_dir().glob(f"serie_{series_id}_stagione_*.json"):
+        m = re.search(r"_stagione_(\d+)\.json$", f.name)
+        eps = cached_season(series_id, int(m.group(1))) if m else None
+        if eps:
+            found[int(m.group(1))] = eps
+    return dict(sorted(found.items()))
+
+
+def cached_catalogue(series_id: int, season: int) -> list[Episodio] | None:
+    """The kept list of one season, or (season 0 = «tutte») of every season there is; None when there is none."""
+    if season:
+        return cached_season(series_id, season)
+    every = [e for eps in cached_seasons(series_id).values() for e in eps]
+    return every or None
 
 
 def cached_series_name(series_id: int) -> str:
@@ -92,7 +116,7 @@ def download_season(series_id: int, season: int, key: str) -> list[Episodio]:
         if exc.code == 401:
             raise TitoliError("TMDB non accetta la chiave (controlla di averla copiata tutta).") from exc
         if exc.code == 404:
-            raise TitoliError(f"TMDB non trova la serie {series_id}, stagione {season}.") from exc
+            raise SeasonNotFound(f"TMDB non trova la serie {series_id}, stagione {season}.") from exc
         raise TitoliError(f"TMDB ha risposto con un errore ({exc.code}).") from exc
     except (urllib.error.URLError, OSError, ValueError) as exc:
         raise TitoliError("Impossibile contattare TMDB: controlla la connessione a internet.") from exc
@@ -104,7 +128,7 @@ def download_season(series_id: int, season: int, key: str) -> list[Episodio]:
             series_name = str(json.load(resp).get("name") or "").strip()
     except (urllib.error.URLError, OSError, ValueError):
         pass
-    episodes = [Episodio(int(e["episode_number"]), str(e.get("name") or "").strip()) for e in data.get("episodes", [])]
+    episodes = [Episodio(int(e["episode_number"]), str(e.get("name") or "").strip(), season) for e in data.get("episodes", [])]
     episodes = [e for e in episodes if e.title]
     if not episodes:
         raise TitoliError(f"TMDB non ha episodi per la serie {series_id}, stagione {season}.")
@@ -113,6 +137,28 @@ def download_season(series_id: int, season: int, key: str) -> list[Episodio]:
                     "episodi": [[e.number, e.title] for e in episodes]}, ensure_ascii=False), encoding="utf-8")
     applog.log.info("Lista TMDB scaricata: serie %s stagione %s, %d episodi", series_id, season, len(episodes))
     return episodes
+
+
+def download_all(series_id: int, key: str, max_seasons: int = 60) -> list[Episodio]:
+    """The lists of every season of the series: those already kept are read from the copy, the others are
+    downloaded one after the other until TMDB has no more."""
+    every: list[Episodio] = []
+    for season in range(1, max_seasons + 1):
+        eps = cached_season(series_id, season)
+        if eps is None:
+            try:
+                eps = download_season(series_id, season, key)
+            except SeasonNotFound:
+                break
+        every.extend(eps)
+    if not every:
+        raise TitoliError("TMDB non ha liste di episodi per questa serie.")
+    return every
+
+
+def download_catalogue(series_id: int, season: int, key: str) -> list[Episodio]:
+    """One season's list, or (season 0 = «tutte») every season's."""
+    return download_season(series_id, season, key) if season else download_all(series_id, key)
 
 
 # ---------------------------------------------------------------------------- finding a series by its title
@@ -246,14 +292,15 @@ class Proposta:
     number: int | None
     title: str
     score: float           # 0..1 similarity with the chosen catalogue title (0 when nothing fits)
-    ambiguous: bool = False  # the same title exists under more than one number
+    ambiguous: bool = False  # the same title exists under more than one number (or season)
+    season: int = 0          # the season of the chosen episode (0 when none)
 
     @property
     def sure(self) -> bool:
         return self.score >= SURE and not self.ambiguous
 
 
-def best_match(lines: list[str], catalogue: list[Episodio], used: set[int] | None = None) -> Proposta:
+def best_match(lines: list[str], catalogue: list[Episodio], used: set[tuple[int, int]] | None = None) -> Proposta:
     """Picks the catalogue episode that the read text lines fit best. `lines` are every text read from the
     caption (one entry per line of every frame); consecutive pairs are tried too (two-line titles)."""
     lines = [l for l in lines if l and l.strip()]
@@ -270,11 +317,11 @@ def best_match(lines: list[str], catalogue: list[Episodio], used: set[int] | Non
         raw = max(lines, key=len, default="").strip()
         return Proposta(None, raw.title() if raw else "", 0.0)
     same = [e for e in catalogue if normalize(e.title) == normalize(best_title)]
-    if len(same) > 1:  # the same title under more than one number: take the first not yet used
-        free = [e for e in same if used is None or e.number not in used]
+    if len(same) > 1:  # the same title under more than one number or season: take the first not yet used
+        free = [e for e in same if used is None or (e.season, e.number) not in used]
         chosen = (free or same)[0]
-        return Proposta(chosen.number, chosen.title, best_score, ambiguous=True)
-    return Proposta(same[0].number, same[0].title, best_score)
+        return Proposta(chosen.number, chosen.title, best_score, ambiguous=True, season=chosen.season)
+    return Proposta(same[0].number, same[0].title, best_score, season=same[0].season)
 
 
 def find_by_title(text: str, catalogue: list[Episodio]) -> Episodio | None:
@@ -307,7 +354,12 @@ def file_stem(season: int, number: int | None, title: str, series: str = "", sty
     return f"{series} - {code} - {title}".strip(" -")
 
 
+def seasons_in_names(names: list[str]) -> set[int]:
+    """The seasons written in the file names (S01E05...)."""
+    return {int(m.group(1)) for n in names if (m := re.search(r"[Ss](\d{1,2})[Ee]\d", n))}
+
+
 def season_from_names(names: list[str]) -> int | None:
     """The season written in the file names (S01E05...), when all of them agree."""
-    found = {int(m.group(1)) for n in names if (m := re.search(r"[Ss](\d{1,2})[Ee]\d", n))}
+    found = seasons_in_names(names)
     return found.pop() if len(found) == 1 else None

@@ -46,7 +46,7 @@ from tab_libreria import LibraryPage
 
 APP_TITLE = "ClipMerger"
 AT_END_SECONDS = 10  # countdown before closing the program when the queue is done
-APP_VERSION = "0.12.1"
+APP_VERSION = "0.13.0"
 GITHUB_LATEST_RELEASE_API = "https://api.github.com/repos/Vipp0/ClipMerger/releases/latest"
 GITHUB_RELEASES_PAGE = "https://github.com/Vipp0/ClipMerger/releases/latest"
 
@@ -385,6 +385,7 @@ class MainWindow(QMainWindow):
 
         # Queue table
         self.table = DropTableWidget()
+        dropwidgets.tune_list(self.table, 10)
         root.addWidget(self.table, stretch=1)
 
         # Bottom bar
@@ -1116,6 +1117,8 @@ def main():
     # The native Windows 11 style ignores QSS background-color on some container
     # widgets (QGroupBox in particular); Fusion always honors the stylesheet.
     app.setStyle("Fusion")
+    wheel_guard = style.WheelGuard(app)  # kept alive by its parent, the application
+    app.installEventFilter(wheel_guard)
     window = MainWindow()
     window.show()
     sys.exit(app.exec())

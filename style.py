@@ -5,10 +5,10 @@ from __future__ import annotations
 import tempfile
 from pathlib import Path
 
-from PySide6.QtCore import QRectF, QSize, Qt
+from PySide6.QtCore import QEvent, QObject, QRectF, QSize, Qt
 from PySide6.QtGui import QColor, QIcon, QPainter, QPixmap
 from PySide6.QtSvg import QSvgRenderer
-from PySide6.QtWidgets import QHBoxLayout, QLabel, QVBoxLayout, QWidget
+from PySide6.QtWidgets import QAbstractSpinBox, QComboBox, QHBoxLayout, QLabel, QSlider, QVBoxLayout, QWidget
 
 import utils
 
@@ -67,6 +67,17 @@ def png_for_stylesheet(theme: str, name: str, color: str, size: int = 16) -> str
     return path.as_posix()
 
 
+class WheelGuard(QObject):
+    """Installed on the application: the mouse wheel over a menu, a number box or a slider does not change it, it
+    scrolls the page instead (scrolling used to change settings by accident)."""
+
+    def eventFilter(self, obj, event):
+        if event.type() == QEvent.Wheel and isinstance(obj, (QComboBox, QAbstractSpinBox, QSlider)):
+            event.ignore()  # not accepted: Qt hands it on to the parent, i.e. the scrolling page
+            return True
+        return False
+
+
 class PageHeader(QWidget):
     """The top of every page: its name, one line saying what it is for, and (on the right) its main buttons."""
 
@@ -82,7 +93,8 @@ class PageHeader(QWidget):
         self.subtitle = QLabel(subtitle)
         self.subtitle.setObjectName("pageSubtitle")
         self.subtitle.setWordWrap(True)
-        self.subtitle.setVisible(bool(subtitle))
+        if not subtitle:  # never setVisible(True) here: the label has no parent yet and would flash up as a window
+            self.subtitle.setVisible(False)
         texts.addWidget(self.subtitle)
         row.addLayout(texts, 1)
         self.actions = QHBoxLayout()
